@@ -31,11 +31,13 @@ to mock in tests.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol, Sequence
+from urllib.parse import urlparse
 
 import httpx
 
@@ -114,7 +116,9 @@ class LLMMessage:
     content: str
 
     def __post_init__(self) -> None:
-        if self.role not in _ALLOWED_ROLES:
+        # Validate role is a string first: a non-string (e.g. a list) must raise
+        # LLMRequestError, not a TypeError from an unhashable set membership test.
+        if not isinstance(self.role, str) or self.role not in _ALLOWED_ROLES:
             raise LLMRequestError(
                 "message role must be one of system, user, assistant"
             )
@@ -125,10 +129,20 @@ class LLMMessage:
         return {"role": self.role, "content": self.content}
 
 
+_USAGE_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+    "reasoning_tokens",
+)
+
+
 @dataclass(frozen=True)
 class LLMUsage:
     """Token accounting for one completion. Any field may be ``None`` if the
-    provider does not report it."""
+    provider does not report it; otherwise it must be a non-negative integer."""
 
     prompt_tokens: int | None
     completion_tokens: int | None
@@ -136,6 +150,16 @@ class LLMUsage:
     prompt_cache_hit_tokens: int | None
     prompt_cache_miss_tokens: int | None
     reasoning_tokens: int | None
+
+    def __post_init__(self) -> None:
+        for name in _USAGE_FIELDS:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise LLMResponseError(
+                    f"usage.{name} must be a non-negative integer or null"
+                )
 
     @staticmethod
     def empty() -> "LLMUsage":
@@ -154,6 +178,20 @@ class LLMCompletion:
     finish_reason: str
     usage: LLMUsage
     attempt_count: int
+
+    def __post_init__(self) -> None:
+        for name in ("content", "provider", "model", "finish_reason"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise LLMResponseError(f"LLMCompletion.{name} must be a non-empty string")
+        if (
+            isinstance(self.attempt_count, bool)
+            or not isinstance(self.attempt_count, int)
+            or self.attempt_count < 1
+        ):
+            raise LLMResponseError("LLMCompletion.attempt_count must be a positive integer")
+        if not isinstance(self.usage, LLMUsage):
+            raise LLMResponseError("LLMCompletion.usage must be an LLMUsage")
 
 
 # --------------------------------------------------------------------------- #
@@ -220,13 +258,44 @@ def parse_strict_json_object(text: str) -> dict[str, Any]:
     trimmed = text.strip()
     if not trimmed:
         raise LLMResponseError("strict JSON content was empty")
+
+    parsed: Any = _STRICT_PARSE_FAILED
     try:
-        parsed = json.loads(trimmed)
-    except json.JSONDecodeError as error:
-        raise LLMResponseError("content was not a single valid JSON document") from error
+        # parse_constant rejects NaN/Infinity/-Infinity; the object hook rejects
+        # duplicate keys at every nesting level (including objects inside arrays).
+        parsed = json.loads(
+            trimmed,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except LLMResponseError:
+        # Raised by the hooks with a safe, fixed message — never carries raw text.
+        raise
+    except (json.JSONDecodeError, ValueError):
+        parsed = _STRICT_PARSE_FAILED
+    # Raise outside the except block so the original JSONDecodeError (whose ``.doc``
+    # holds the full raw text) never reaches __cause__ or __context__.
+    if parsed is _STRICT_PARSE_FAILED:
+        raise LLMResponseError("content was not a single valid JSON document")
     if not isinstance(parsed, dict):
         raise LLMResponseError("strict JSON top level must be an object")
     return parsed
+
+
+_STRICT_PARSE_FAILED = object()
+
+
+def _reject_json_constant(_constant: str) -> Any:
+    raise LLMResponseError("strict JSON must not contain NaN or Infinity")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise LLMResponseError("strict JSON must not contain duplicate keys")
+        seen.add(key)
+    return dict(pairs)
 
 
 def _first_json_span(text: str) -> str | None:
@@ -338,6 +407,49 @@ def _validate_request(
 # --------------------------------------------------------------------------- #
 
 
+def _validate_client_config(
+    *,
+    base_url: str,
+    model: str,
+    provider: str,
+    default_temperature: float,
+    default_max_tokens: int,
+    timeout_seconds: float,
+    max_retries: int,
+) -> None:
+    if not isinstance(provider, str) or not provider.strip():
+        raise LLMConfigurationError("provider must be a non-empty string")
+    if not isinstance(model, str) or not model.strip():
+        raise LLMConfigurationError("model must be a non-empty string")
+    if not isinstance(base_url, str):
+        raise LLMConfigurationError("base_url must be a string")
+    parsed = urlparse(base_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise LLMConfigurationError("base_url must be a valid http/https URL")
+    if isinstance(default_temperature, bool) or not isinstance(
+        default_temperature, (int, float)
+    ):
+        raise LLMConfigurationError("default_temperature must be a number")
+    if not math.isfinite(float(default_temperature)) or not 0.0 <= float(
+        default_temperature
+    ) <= 2.0:
+        raise LLMConfigurationError("default_temperature must be finite within [0, 2]")
+    if isinstance(default_max_tokens, bool) or not isinstance(default_max_tokens, int):
+        raise LLMConfigurationError("default_max_tokens must be an integer")
+    if default_max_tokens <= 0:
+        raise LLMConfigurationError("default_max_tokens must be positive")
+    if isinstance(timeout_seconds, bool) or not isinstance(
+        timeout_seconds, (int, float)
+    ):
+        raise LLMConfigurationError("timeout_seconds must be a number")
+    if not math.isfinite(float(timeout_seconds)) or float(timeout_seconds) <= 0:
+        raise LLMConfigurationError("timeout_seconds must be positive")
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+        raise LLMConfigurationError("max_retries must be an integer")
+    if max_retries < 0:
+        raise LLMConfigurationError("max_retries must be non-negative")
+
+
 class OpenAICompatibleClient:
     """LLM client speaking the OpenAI ``/chat/completions`` HTTP contract."""
 
@@ -356,6 +468,15 @@ class OpenAICompatibleClient:
     ) -> None:
         if not api_key.strip():
             raise LLMConfigurationError("LLM API key is not configured")
+        _validate_client_config(
+            base_url=base_url,
+            model=model,
+            provider=provider,
+            default_temperature=default_temperature,
+            default_max_tokens=default_max_tokens,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+        )
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
@@ -505,10 +626,15 @@ def _build_completion(
     attempt_count: int,
     response_format_json: bool,
 ) -> LLMCompletion:
+    body: Any = _STRICT_PARSE_FAILED
     try:
         body = response.json()
-    except (ValueError, json.JSONDecodeError) as error:
-        raise LLMResponseError("LLM response body was not valid JSON") from error
+    except (ValueError, json.JSONDecodeError):
+        body = _STRICT_PARSE_FAILED
+    # Raise outside the except block so the raw response body (carried on the
+    # JSONDecodeError's ``.doc``) never reaches __cause__ or __context__.
+    if body is _STRICT_PARSE_FAILED:
+        raise LLMResponseError("LLM response body was not valid JSON")
 
     if not isinstance(body, dict):
         raise LLMResponseError("LLM response body was not a JSON object")
@@ -563,8 +689,15 @@ def _build_completion(
     system_fingerprint = body.get("system_fingerprint")
     if system_fingerprint is not None and not isinstance(system_fingerprint, str):
         raise LLMResponseError("LLM system_fingerprint had an invalid type")
-    model = body.get("model")
-    resolved_model = model if isinstance(model, str) and model else fallback_model
+    # model may be absent (fall back to the requested model), but if present it
+    # must be a real non-empty string — never silently fall back on a bad value.
+    if body.get("model") is None:
+        resolved_model = fallback_model
+    else:
+        model = body["model"]
+        if not isinstance(model, str) or not model.strip():
+            raise LLMResponseError("LLM response model had an invalid value")
+        resolved_model = model
 
     usage = _parse_usage(body.get("usage"))
 
@@ -599,6 +732,8 @@ def _parse_usage(raw: Any) -> LLMUsage:
 
     reasoning_tokens: int | None = None
     details = raw.get("completion_tokens_details")
+    if details is not None and not isinstance(details, dict):
+        raise LLMResponseError("usage.completion_tokens_details must be an object")
     if isinstance(details, dict) and "reasoning_tokens" in details:
         reasoning_tokens = _usage_int(details, "reasoning_tokens")
     elif "reasoning_tokens" in raw:
@@ -677,6 +812,8 @@ class MockLLMClient:
         *,
         handler: MockHandler | None = None,
         repeat_last: bool = False,
+        default_temperature: float = 0.2,
+        default_max_tokens: int = 8192,
     ) -> None:
         if responses is None and handler is None:
             raise ValueError("MockLLMClient needs either responses or a handler")
@@ -685,6 +822,8 @@ class MockLLMClient:
         self._responses = list(responses) if responses is not None else None
         self._handler = handler
         self._repeat_last = repeat_last
+        self._default_temperature = default_temperature
+        self._default_max_tokens = default_max_tokens
         self._cursor = 0
         self.calls: list[MockCall] = []
 
@@ -696,7 +835,18 @@ class MockLLMClient:
         max_tokens: int | None = None,
         response_format_json: bool = False,
     ) -> LLMCompletion:
+        # Reuse the real client's local request contract so an Agent test can
+        # never pass on the mock while failing the real client before its HTTP call.
+        _validate_request(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            default_temperature=self._default_temperature,
+            default_max_tokens=self._default_max_tokens,
+            response_format_json=response_format_json,
+        )
         recorded = list(messages)
+        # Record the caller's original arguments, not the resolved defaults.
         self.calls.append(
             MockCall(
                 messages=tuple(recorded),
@@ -708,7 +858,7 @@ class MockLLMClient:
 
         if self._handler is not None:
             result = self._handler(recorded)
-            if asyncio.iscoroutine(result):
+            if inspect.isawaitable(result):
                 result = await result
             return _coerce_completion(result)
 

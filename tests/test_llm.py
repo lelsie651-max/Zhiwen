@@ -16,6 +16,7 @@ from app.services.llm import (
     LLMRequestError,
     LLMResponseError,
     LLMTransportError,
+    LLMUsage,
     MockLLMClient,
     OpenAICompatibleClient,
     build_llm_client,
@@ -471,3 +472,171 @@ def test_mock_handler_bad_return_type_rejected():
     client = MockLLMClient(handler=lambda messages: 123)
     with pytest.raises(LLMResponseError):
         _run(client.complete([LLMMessage("user", "x")]))
+
+
+# --------------------------------------------------------------------------- #
+# Round 4: strict boundaries + mock contract alignment
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("content", ['{"score": NaN}', '{"score": Infinity}', '{"score": -Infinity}'])
+def test_strict_json_rejects_non_standard_numbers(content):
+    with pytest.raises(LLMResponseError):
+        parse_strict_json_object(content)
+
+
+def test_strict_json_rejects_duplicate_keys_top_level():
+    with pytest.raises(LLMResponseError):
+        parse_strict_json_object('{"name": "old", "name": "new"}')
+
+
+def test_strict_json_rejects_duplicate_keys_nested_and_in_array():
+    with pytest.raises(LLMResponseError):
+        parse_strict_json_object('{"outer": {"k": 1, "k": 2}}')
+    with pytest.raises(LLMResponseError):
+        parse_strict_json_object('{"items": [{"k": 1, "k": 2}]}')
+
+
+def test_strict_json_error_has_no_raw_text_cause():
+    secret = "TOP_SECRET_MODEL_OUTPUT_12345 not json"
+    try:
+        parse_strict_json_object(secret)
+    except LLMResponseError as exc:
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+        assert secret not in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected LLMResponseError")
+
+
+def test_non_json_200_body_error_has_no_raw_body_cause():
+    secret_body = "RAW_UPSTREAM_BODY_SECRET_9876 <<not json>>"
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=secret_body)
+
+    client = _client(responder)
+    try:
+        _run(client.complete([LLMMessage("user", "go")]))
+    except LLMResponseError as exc:
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+        assert secret_body not in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected LLMResponseError")
+
+
+def test_mock_rejects_json_mode_without_json_hint():
+    client = MockLLMClient(["{}"])
+    with pytest.raises(LLMRequestError):
+        _run(
+            client.complete(
+                [LLMMessage("user", "no hint here")], response_format_json=True
+            )
+        )
+    # The failed call must not be recorded as a successful invocation result.
+    assert client.calls == []
+
+
+def test_mock_rejects_invalid_temperature_and_max_tokens():
+    client = MockLLMClient(["{}"], repeat_last=True)
+    with pytest.raises(LLMRequestError):
+        _run(client.complete([LLMMessage("user", "hi")], temperature=9))
+    with pytest.raises(LLMRequestError):
+        _run(client.complete([LLMMessage("user", "hi")], max_tokens=0))
+
+
+def test_mock_rejects_empty_messages():
+    client = MockLLMClient(["{}"])
+    with pytest.raises(LLMRequestError):
+        _run(client.complete([]))
+
+
+def test_message_non_string_role_raises_request_error():
+    with pytest.raises(LLMRequestError):
+        LLMMessage([], "hello")  # type: ignore[arg-type]
+
+
+def test_usage_rejects_negative_and_bool():
+    with pytest.raises(LLMResponseError):
+        LLMUsage(-100, None, None, None, None, None)
+    with pytest.raises(LLMResponseError):
+        LLMUsage(True, None, None, None, None, None)
+
+
+def test_parse_usage_rejects_negative_via_response():
+    usage = {"prompt_tokens": -5}
+    client = _client(lambda r: httpx.Response(200, json=_chat_body(usage=usage)))
+    with pytest.raises(LLMResponseError):
+        _run(client.complete([LLMMessage("user", "go")]))
+
+
+def test_non_object_completion_tokens_details_rejected():
+    usage = {"prompt_tokens": 1, "completion_tokens_details": "nope"}
+    client = _client(lambda r: httpx.Response(200, json=_chat_body(usage=usage)))
+    with pytest.raises(LLMResponseError):
+        _run(client.complete([LLMMessage("user", "go")]))
+
+
+def test_response_model_present_but_invalid_is_rejected():
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_chat_body(model=""))
+
+    client = _client(responder)
+    with pytest.raises(LLMResponseError):
+        _run(client.complete([LLMMessage("user", "go")]))
+
+
+def test_response_model_absent_falls_back_to_requested():
+    body = {
+        "id": "resp-1",
+        "system_fingerprint": "fp",
+        "choices": [{"finish_reason": "stop", "message": {"content": '{"ok": 1}'}}],
+    }
+    client = _client(lambda r: httpx.Response(200, json=body))
+    completion = _run(client.complete([LLMMessage("user", "go")]))
+    assert completion.model == "deepseek-v4-flash"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"provider": "  "},
+        {"model": ""},
+        {"base_url": "not-a-url"},
+        {"base_url": "ftp://x"},
+        {"default_temperature": 9.0},
+        {"default_temperature": True},
+        {"default_max_tokens": 0},
+        {"default_max_tokens": True},
+        {"timeout_seconds": 0},
+        {"max_retries": -1},
+        {"max_retries": True},
+    ],
+)
+def test_invalid_client_defaults_rejected(kwargs):
+    base = dict(
+        api_key="sk-test",
+        base_url="https://api.deepseek.com",
+        model="deepseek-v4-flash",
+        provider="deepseek",
+    )
+    base.update(kwargs)
+    with pytest.raises(LLMConfigurationError):
+        OpenAICompatibleClient(**base)
+
+
+def test_mock_supports_custom_awaitable_handler():
+    class _Awaitable:
+        def __await__(self):
+            async def _inner():
+                return make_stub_completion("awaited-ok")
+
+            return _inner().__await__()
+
+    def handler(messages):
+        return _Awaitable()
+
+    client = MockLLMClient(handler=handler)
+    out = _run(client.complete([LLMMessage("user", "x")]))
+    assert out.content == "awaited-ok"
