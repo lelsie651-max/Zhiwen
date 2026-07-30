@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     upload_chunk_bytes: int = Field(default=1048576, gt=0)
     processing_stale_minutes: int = Field(default=30, gt=0)
 
+    # LLM (OpenAI-compatible) settings. Works with DeepSeek official API,
+    # Alibaba Cloud Bailian (DashScope compatible-mode), or any compatible host.
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.deepseek.com/v1"
+    llm_model: str = "deepseek-chat"
+    llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    llm_max_retries: int = Field(default=2, ge=0, le=10)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -36,6 +45,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() in {"production", "prod"}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def llm_configured(self) -> bool:
+        return bool(self.llm_api_key.strip())
 
     @computed_field  # type: ignore[prop-decorator]
     @property
