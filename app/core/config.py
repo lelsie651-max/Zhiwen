@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
-from pydantic import Field, computed_field, model_validator
+from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,9 +23,11 @@ class Settings(BaseSettings):
 
     # LLM (OpenAI-compatible) settings. Works with DeepSeek official API,
     # Alibaba Cloud Bailian (DashScope compatible-mode), or any compatible host.
-    llm_api_key: str = ""
-    llm_base_url: str = "https://api.deepseek.com/v1"
-    llm_model: str = "deepseek-chat"
+    llm_provider: str = "deepseek"
+    llm_api_key: SecretStr = SecretStr("")
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_model: str = "deepseek-v4-flash"
+    llm_max_output_tokens: int = Field(default=8192, gt=0)
     llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     llm_timeout_seconds: float = Field(default=60.0, gt=0)
     llm_max_retries: int = Field(default=2, ge=0, le=10)
@@ -49,7 +52,24 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def llm_configured(self) -> bool:
-        return bool(self.llm_api_key.strip())
+        return bool(self.llm_api_key.get_secret_value().strip())
+
+    @field_validator("llm_provider", "llm_model")
+    @classmethod
+    def validate_non_blank_llm_identifier(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("value must not be blank")
+        return stripped
+
+    @field_validator("llm_base_url")
+    @classmethod
+    def validate_llm_base_url(cls, value: str) -> str:
+        stripped = value.strip().rstrip("/")
+        parsed = urlparse(stripped)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("LLM base URL must be a valid http/https URL")
+        return stripped
 
     @computed_field  # type: ignore[prop-decorator]
     @property
