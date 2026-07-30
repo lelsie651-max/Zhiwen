@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block title %}{{ product_name }}{% endblock %}
+
+{% block body %}
+  <main class="page-shell">
+    <section class="hero-card">
+      <p class="eyebrow">Dynamic Knowledge Base</p>
+      <h1>{{ product_name }}</h1>
+      <p class="tagline">{{ tagline }}</p>
+
+      <div class="upload-frame" aria-disabled="true">
+        <label for="upload" class="upload-label">虚线上传框</label>
+        <input id="upload" type="file" disabled />
+        <p>当前仅展示界面占位，上传功能暂不可用。</p>
+      </div>
+
+      <div class="status-banner" role="status">
+        <strong>{{ status_message }}</strong>
+        <span>基础工程与页面骨架已就位，业务功能将在后续迭代接入。</span>
+      </div>
+    </section>
+  </main>
+{% endblock %}

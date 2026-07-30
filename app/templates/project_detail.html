@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.name }}{% endblock %}
+
+{% block body %}
+  <main class="page-shell page-shell--narrow">
+    <section class="hero-card workspace-card">
+      <p class="eyebrow">Project Workspace</p>
+      <h1>{{ project.name }}</h1>
+      <p class="tagline">{{ project.description or "当前还没有项目描述。" }}</p>
+
+      <div class="detail-grid">
+        <div class="detail-item">
+          <span>Slug</span>
+          <strong>{{ project.slug }}</strong>
+        </div>
+        <div class="detail-item">
+          <span>可见性</span>
+          <strong>{{ project.visibility }}</strong>
+        </div>
+        <div class="detail-item">
+          <span>文档数</span>
+          <strong>{{ document_summaries|length }}</strong>
+        </div>
+      </div>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>文档上传</h2>
+            <p>上传新文档或补充修订版，并立即落下技术预检结果。</p>
+          </div>
+          {% if can_upload %}
+            <a href="/projects/{{ project.slug }}/documents/upload" class="primary-button">上传文档</a>
+          {% endif %}
+        </div>
+
+        {% if not can_upload %}
+          <div class="status-banner" role="status">
+            <strong>当前身份不可上传</strong>
+            <span>只有 owner 和 editor 可以提交新文档或修订版。</span>
+          </div>
+        {% endif %}
+      </section>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>文档列表</h2>
+            <p>展示当前项目中的逻辑文档与最近一次上传修订。</p>
+          </div>
+        </div>
+
+        {% if document_summaries %}
+          <div class="project-list">
+            {% for item in document_summaries %}
+              <article class="project-card">
+                <strong>{{ item.document.title }}</strong>
+                <span>{{ item.document.description or "暂无描述" }}</span>
+                <p>
+                  状态：{{ item.document.status }}
+                  {% if item.latest_revision %}
+                    · 最近修订：r{{ item.latest_revision.revision_no }} / {{ item.latest_revision.status }}
+                  {% else %}
+                    · 还没有修订记录
+                  {% endif %}
+                </p>
+                {% if item.latest_revision %}
+                  <a
+                    href="/projects/{{ project.slug }}/documents/{{ item.document.id }}/revisions/{{ item.latest_revision.id }}"
+                    class="inline-link"
+                  >查看最近修订</a>
+                {% endif %}
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state">
+            <strong>还没有文档</strong>
+            <span>从上传页面提交第一个文档后，这里会显示文档与修订记录。</span>
+          </div>
+        {% endif %}
+      </section>
+
+      <a href="/app" class="inline-link">返回工作区</a>
+    </section>
+  </main>
+{% endblock %}

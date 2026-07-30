@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}上传文档 - {{ project.name }}{% endblock %}
+
+{% block body %}
+  <main class="page-shell page-shell--narrow">
+    <section class="hero-card workspace-card">
+      <p class="eyebrow">Document Upload</p>
+      <h1>{{ project.name }}</h1>
+      <p class="tagline">选择上传新文档或已有文档的修订版，系统会先执行技术预检并记录结果。</p>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>上传表单</h2>
+            <p>本轮只执行文件接收、技术预检和结果落库，不解析正文语义。</p>
+          </div>
+        </div>
+
+        <form
+          method="post"
+          action="/projects/{{ project.slug }}/documents/upload"
+          enctype="multipart/form-data"
+          class="form-grid"
+        >
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+
+          <label class="form-field">
+            <span>上传意图</span>
+            <select name="upload_intent">
+              <option value="new_document" {% if upload_form.upload_intent == "new_document" %}selected{% endif %}>new_document</option>
+              <option value="revision" {% if upload_form.upload_intent == "revision" %}selected{% endif %}>revision</option>
+            </select>
+            {% if errors.upload_intent %}<small class="field-error">{{ errors.upload_intent }}</small>{% endif %}
+          </label>
+
+          <label class="form-field">
+            <span>标题</span>
+            <input type="text" name="title" value="{{ upload_form.title }}" />
+            {% if errors.title %}<small class="field-error">{{ errors.title }}</small>{% endif %}
+          </label>
+
+          <label class="form-field">
+            <span>描述</span>
+            <textarea name="description" rows="4">{{ upload_form.description }}</textarea>
+            {% if errors.description %}<small class="field-error">{{ errors.description }}</small>{% endif %}
+          </label>
+
+          <div class="form-row">
+            <label class="form-field">
+              <span>logical_order_kind</span>
+              <input type="text" name="logical_order_kind" value="{{ upload_form.logical_order_kind }}" />
+              {% if errors.logical_order_kind %}<small class="field-error">{{ errors.logical_order_kind }}</small>{% endif %}
+            </label>
+
+            <label class="form-field">
+              <span>logical_order_value</span>
+              <input type="text" name="logical_order_value" value="{{ upload_form.logical_order_value }}" />
+              {% if errors.logical_order_value %}<small class="field-error">{{ errors.logical_order_value }}</small>{% endif %}
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label class="form-field">
+              <span>logical_order_index</span>
+              <input type="text" name="logical_order_index" value="{{ upload_form.logical_order_index }}" />
+              {% if errors.logical_order_index %}<small class="field-error">{{ errors.logical_order_index }}</small>{% endif %}
+            </label>
+
+            <label class="form-field">
+              <span>document_id</span>
+              <select name="document_id">
+                <option value="">请选择已有文档</option>
+                {% for document in documents %}
+                  <option value="{{ document.id }}" {% if upload_form.document_id == document.id|string %}selected{% endif %}>
+                    {{ document.title }}
+                  </option>
+                {% endfor %}
+              </select>
+              {% if errors.document_id %}<small class="field-error">{{ errors.document_id }}</small>{% endif %}
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label class="form-field">
+              <span>effective_from</span>
+              <input type="text" name="effective_from" value="{{ upload_form.effective_from }}" placeholder="2026-08-01T09:00:00+08:00" />
+              {% if errors.effective_from %}<small class="field-error">{{ errors.effective_from }}</small>{% endif %}
+            </label>
+
+            <label class="form-field">
+              <span>effective_to</span>
+              <input type="text" name="effective_to" value="{{ upload_form.effective_to }}" placeholder="2026-08-02T09:00:00+08:00" />
+              {% if errors.effective_to %}<small class="field-error">{{ errors.effective_to }}</small>{% endif %}
+            </label>
+          </div>
+
+          <label class="form-field">
+            <span>文件</span>
+            <input type="file" name="file" required />
+            {% if errors.file %}<small class="field-error">{{ errors.file }}</small>{% endif %}
+          </label>
+
+          {% if errors.form %}<p class="field-error">{{ errors.form }}</p>{% endif %}
+
+          <div class="inline-actions">
+            <button type="submit" class="primary-button">提交上传</button>
+            <a href="/projects/{{ project.slug }}" class="secondary-button">返回项目</a>
+          </div>
+        </form>
+      </section>
+    </section>
+  </main>
+{% endblock %}

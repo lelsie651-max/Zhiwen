@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}首次身份设置{% endblock %}
+
+{% block body %}
+  <main class="page-shell page-shell--narrow">
+    <section class="hero-card workspace-card">
+      <p class="eyebrow">First Identity Setup</p>
+      <h1>设置你的织文身份</h1>
+      <p class="tagline">首次进入后台前，需要先确定 handle 和显示名称。当前不会创建密码，也不会接入完整登录系统。</p>
+
+      <form method="post" action="/setup" class="form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <label class="form-field">
+          <span>Handle</span>
+          <input type="text" name="handle" value="{{ form.handle }}" required />
+          {% if errors.handle %}<small class="field-error">{{ errors.handle }}</small>{% endif %}
+        </label>
+
+        <label class="form-field">
+          <span>显示名称</span>
+          <input type="text" name="display_name" value="{{ form.display_name }}" required />
+          {% if errors.display_name %}<small class="field-error">{{ errors.display_name }}</small>{% endif %}
+        </label>
+
+        <label class="form-field">
+          <span>邮箱</span>
+          <input type="email" name="email" value="{{ form.email }}" />
+          {% if errors.email %}<small class="field-error">{{ errors.email }}</small>{% endif %}
+        </label>
+
+        <div class="form-row">
+          <label class="form-field">
+            <span>Locale</span>
+            <input type="text" name="locale" value="{{ form.locale }}" required />
+            {% if errors.locale %}<small class="field-error">{{ errors.locale }}</small>{% endif %}
+          </label>
+
+          <label class="form-field">
+            <span>Timezone</span>
+            <input type="text" name="timezone" value="{{ form.timezone }}" required />
+            {% if errors.timezone %}<small class="field-error">{{ errors.timezone }}</small>{% endif %}
+          </label>
+        </div>
+
+        {% if errors.form %}<p class="field-error">{{ errors.form }}</p>{% endif %}
+
+        <button type="submit" class="primary-button">保存并进入工作区</button>
+      </form>
+    </section>
+  </main>
+{% endblock %}

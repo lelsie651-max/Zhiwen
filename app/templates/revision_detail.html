@@ -1,0 +1,290 @@
+{% extends "base.html" %}
+
+{% block title %}{{ document.title }} · 修订详情{% endblock %}
+
+{% block body %}
+  <main class="page-shell page-shell--narrow">
+    <section class="hero-card workspace-card">
+      <p class="eyebrow">Revision Detail</p>
+      <h1>{{ document.title }}</h1>
+      <p class="tagline">{{ document.description or "当前文档没有描述。" }}</p>
+
+      {% if processing_notice_message %}
+        <div class="status-banner" role="status">
+          <strong>处理提示</strong>
+          <span>{{ processing_notice_message }}</span>
+        </div>
+      {% endif %}
+
+      <div class="detail-grid">
+        <div class="detail-item">
+          <span>文件名</span>
+          <strong>{{ revision.original_filename }}</strong>
+        </div>
+        <div class="detail-item">
+          <span>修订号</span>
+          <strong>r{{ revision.revision_no }}</strong>
+        </div>
+        <div class="detail-item">
+          <span>处理状态</span>
+          <strong>{{ revision.status }}</strong>
+        </div>
+        <div class="detail-item">
+          <span>资料权威性</span>
+          <strong>{{ revision.source_authority }}</strong>
+        </div>
+        <div class="detail-item">
+          <span>SHA-256</span>
+          <strong>{{ sha256_short }}...</strong>
+        </div>
+        <div class="detail-item">
+          <span>文件大小</span>
+          <strong>{{ revision.file_size_bytes }} bytes</strong>
+        </div>
+        <div class="detail-item">
+          <span>上传者</span>
+          <strong>{{ revision.uploaded_by.display_name }} · {{ revision.uploaded_at }}</strong>
+        </div>
+      </div>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>处理操作</h2>
+            <p>只展示安全操作入口，不暴露租约、存储路径或原始异常。</p>
+          </div>
+        </div>
+
+        {% if can_manage_processing %}
+          <div class="inline-actions">
+            {% if show_admission_actions %}
+              <form
+                method="post"
+                action="/projects/{{ project.slug }}/documents/{{ document.id }}/revisions/{{ revision.id }}/admission"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <input type="hidden" name="decision" value="continue_formal" />
+                <button type="submit" class="primary-button">作为正式资料继续</button>
+              </form>
+              <form
+                method="post"
+                action="/projects/{{ project.slug }}/documents/{{ document.id }}/revisions/{{ revision.id }}/admission"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <input type="hidden" name="decision" value="continue_reference" />
+                <button type="submit" class="secondary-button">作为参考资料继续</button>
+              </form>
+              <form
+                method="post"
+                action="/projects/{{ project.slug }}/documents/{{ document.id }}/revisions/{{ revision.id }}/admission"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <input type="hidden" name="decision" value="cancel" />
+                <button type="submit" class="secondary-button">取消处理</button>
+              </form>
+            {% endif %}
+
+            {% if show_start_processing %}
+              <form
+                method="post"
+                action="/projects/{{ project.slug }}/documents/{{ document.id }}/revisions/{{ revision.id }}/processing/start"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="primary-button">开始/继续处理</button>
+              </form>
+            {% endif %}
+
+            {% if show_retry_processing %}
+              <form
+                method="post"
+                action="/projects/{{ project.slug }}/documents/{{ document.id }}/revisions/{{ revision.id }}/processing/retry"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="primary-button">重试提取</button>
+              </form>
+            {% endif %}
+
+            {% if show_recover_processing %}
+              <form
+                method="post"
+                action="/projects/{{ project.slug }}/documents/{{ document.id }}/revisions/{{ revision.id }}/processing/recover"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                <button type="submit" class="secondary-button">恢复卡住任务</button>
+              </form>
+            {% endif %}
+          </div>
+
+          {% if not show_admission_actions and not show_start_processing and not show_retry_processing and not show_recover_processing %}
+            <div class="empty-state">
+              <strong>当前没有可执行操作</strong>
+              <span>请根据当前状态等待处理完成，或返回项目继续查看其他文档。</span>
+            </div>
+          {% endif %}
+        {% else %}
+          <div class="status-banner" role="status">
+            <strong>当前身份为只读</strong>
+            <span>viewer 可以查看状态，但不能确认准入、启动、重试或恢复处理。</span>
+          </div>
+        {% endif %}
+      </section>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>技术预检</h2>
+            <p>这里只展示安全结果，不暴露内部存储路径或失败内部信息。</p>
+          </div>
+        </div>
+
+        <div class="detail-grid">
+          <div class="detail-item">
+            <span>结论</span>
+            <strong>{{ report.outcome if report else "pending" }}</strong>
+          </div>
+          <div class="detail-item">
+            <span>报告状态</span>
+            <strong>{{ report.status if report else "pending" }}</strong>
+          </div>
+          <div class="detail-item">
+            <span>人工决定</span>
+            <strong>{{ report.user_decision if report else "none" }}</strong>
+          </div>
+          <div class="detail-item">
+            <span>检测 MIME</span>
+            <strong>{{ report.file_checks.detected_mime if report and report.file_checks else "unknown" }}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>最新处理任务</h2>
+            <p>展示最近一次排队或执行的安全摘要。</p>
+          </div>
+        </div>
+
+        {% if latest_processing_job %}
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span>任务状态</span>
+              <strong>{{ latest_processing_job.status }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>触发方式</span>
+              <strong>{{ latest_processing_job.trigger_kind }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>尝试号</span>
+              <strong>{{ latest_processing_job.attempt_no }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>失败代码</span>
+              <strong>{{ latest_processing_job.failure_code or "none" }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>创建时间</span>
+              <strong>{{ latest_processing_job.created_at }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>开始时间</span>
+              <strong>{{ latest_processing_job.started_at or "not_started" }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>完成时间</span>
+              <strong>{{ latest_processing_job.completed_at or "not_completed" }}</strong>
+            </div>
+          </div>
+        {% else %}
+          <div class="empty-state">
+            <strong>暂无处理任务</strong>
+            <span>当前修订还没有创建后台处理任务。</span>
+          </div>
+        {% endif %}
+      </section>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>最近提取结果</h2>
+            <p>仅展示结果摘要，不展示正文全文或内部错误细节。</p>
+          </div>
+        </div>
+
+        {% if latest_extraction_run %}
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span>结果状态</span>
+              <strong>{{ latest_extraction_run.status }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>提取结论</span>
+              <strong>{{ latest_extraction_run.outcome }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>尝试号</span>
+              <strong>{{ latest_extraction_run.attempt_no }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>失败代码</span>
+              <strong>{{ latest_extraction_run.failure_code or "none" }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>块数量</span>
+              <strong>{{ latest_extraction_run.block_count }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>字符数</span>
+              <strong>{{ latest_extraction_run.character_count }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>开始时间</span>
+              <strong>{{ latest_extraction_run.started_at or "not_started" }}</strong>
+            </div>
+            <div class="detail-item">
+              <span>完成时间</span>
+              <strong>{{ latest_extraction_run.completed_at or "not_completed" }}</strong>
+            </div>
+          </div>
+        {% else %}
+          <div class="empty-state">
+            <strong>暂无提取记录</strong>
+            <span>当前修订还没有完成正文提取。</span>
+          </div>
+        {% endif %}
+      </section>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <div>
+            <h2>风险标记</h2>
+            <p>技术预检阶段产出的确定性风险标记。</p>
+          </div>
+        </div>
+
+        {% if risk_flags %}
+          <div class="project-list">
+            {% for flag in risk_flags %}
+              <article class="project-card">
+                <strong>{{ flag.kind }}</strong>
+                <span>{{ flag.category }} · {{ flag.severity }} · {{ flag.detector }}</span>
+                <p>{{ flag.message }}</p>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state">
+            <strong>暂无风险标记</strong>
+            <span>当前修订没有记录到额外的技术预警。</span>
+          </div>
+        {% endif %}
+      </section>
+
+      <div class="inline-actions">
+        <a href="/projects/{{ project.slug }}" class="secondary-button">返回项目</a>
+        <a href="/projects/{{ project.slug }}/documents/upload" class="primary-button">继续上传</a>
+      </div>
+    </section>
+  </main>
+{% endblock %}

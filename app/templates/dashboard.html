@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+
+{% block title %}织文工作区{% endblock %}
+
+{% block body %}
+  <main class="page-shell">
+    <section class="hero-card workspace-card">
+      <div class="workspace-header">
+        <div>
+          <p class="eyebrow">Workspace</p>
+          <h1>{{ current_user.display_name }}</h1>
+          <p class="tagline">@{{ current_user.handle }} 正在管理自己的知识库项目。</p>
+        </div>
+
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <button type="submit" class="secondary-button">退出当前身份</button>
+        </form>
+      </div>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <h2>参与的项目</h2>
+          <p>这里展示当前身份参与的全部项目。</p>
+        </div>
+
+        {% if projects %}
+          <div class="project-list">
+            {% for project in projects %}
+              <a class="project-card" href="/projects/{{ project.slug }}">
+                <strong>{{ project.name }}</strong>
+                <span>{{ project.slug }}</span>
+                <p>{{ project.description or "暂无项目描述" }}</p>
+              </a>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state">
+            <strong>还没有项目</strong>
+            <span>先创建一个项目，后续文档、版本和协作能力会在这里接入。</span>
+          </div>
+        {% endif %}
+      </section>
+
+      <section class="workspace-section">
+        <div class="section-header">
+          <h2>创建项目</h2>
+          <p>创建成功后会自动建立 owner 成员关系，并跳转到项目详情页。</p>
+        </div>
+
+        <form method="post" action="/projects" class="form-grid">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <label class="form-field">
+            <span>项目名称</span>
+            <input type="text" name="name" value="{{ project_form.name }}" required />
+            {% if errors.name %}<small class="field-error">{{ errors.name }}</small>{% endif %}
+          </label>
+
+          <label class="form-field">
+            <span>Slug</span>
+            <input type="text" name="slug" value="{{ project_form.slug }}" required />
+            {% if errors.slug %}<small class="field-error">{{ errors.slug }}</small>{% endif %}
+          </label>
+
+          <label class="form-field">
+            <span>描述</span>
+            <textarea name="description" rows="4">{{ project_form.description }}</textarea>
+            {% if errors.description %}<small class="field-error">{{ errors.description }}</small>{% endif %}
+          </label>
+
+          <label class="form-field">
+            <span>可见性</span>
+            <select name="visibility">
+              <option value="private" {% if project_form.visibility == "private" %}selected{% endif %}>private</option>
+              <option value="unlisted" {% if project_form.visibility == "unlisted" %}selected{% endif %}>unlisted</option>
+              <option value="public" {% if project_form.visibility == "public" %}selected{% endif %}>public</option>
+            </select>
+            {% if errors.visibility %}<small class="field-error">{{ errors.visibility }}</small>{% endif %}
+          </label>
+
+          {% if errors.form %}<p class="field-error">{{ errors.form }}</p>{% endif %}
+
+          <button type="submit" class="primary-button">创建项目</button>
+        </form>
+      </section>
+    </section>
+  </main>
+{% endblock %}
