@@ -34,6 +34,13 @@ from app.models.document_revision import (
     SourceAuthority,
     UploadIntent,
 )
+from app.models.inference import (
+    InferenceInputBatch,
+    InferenceInputBlock,
+    InferenceRun,
+    InferenceRunStatus,
+    InferenceTaskType,
+)
 from app.models.ingestion_validation import (
     IngestionRiskCategory,
     IngestionRiskDetector,
@@ -73,6 +80,11 @@ __all__ = [
     "DocumentBlock",
     "DocumentBlockType",
     "SourceEvidence",
+    "InferenceInputBatch",
+    "InferenceInputBlock",
+    "InferenceRun",
+    "InferenceRunStatus",
+    "InferenceTaskType",
     "Fact",
     "FactStatus",
     "FactValue",

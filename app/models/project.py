@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from app.models.document import Document
     from app.models.dynamic_schema import DynamicSchema
     from app.models.fact import Fact
+    from app.models.inference import InferenceInputBatch, InferenceRun
     from app.models.processing_job import ProcessingJob
     from app.models.project_member import ProjectMember
     from app.models.user import User
@@ -96,6 +97,16 @@ class Project(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         passive_deletes=True,
     )
     processing_jobs: Mapped[list["ProcessingJob"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    inference_input_batches: Mapped[list["InferenceInputBatch"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    inference_runs: Mapped[list["InferenceRun"]] = relationship(
         back_populates="project",
         cascade="all, delete-orphan",
         passive_deletes=True,

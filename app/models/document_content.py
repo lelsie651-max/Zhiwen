@@ -16,6 +16,7 @@ from app.utils.validation import normalize_text
 if TYPE_CHECKING:
     from app.models.document_revision import DocumentRevision
     from app.models.fact import FactEvidenceLink, FactValue
+    from app.models.inference import InferenceInputBlock
     from app.models.processing_job import ProcessingJob
 
 
@@ -229,6 +230,11 @@ class DocumentBlock(UUIDPrimaryKeyMixin, Base):
     evidences: Mapped[list["SourceEvidence"]] = relationship(
         back_populates="block",
         cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    inference_input_references: Mapped[list["InferenceInputBlock"]] = relationship(
+        back_populates="document_block",
+        foreign_keys="InferenceInputBlock.document_block_id",
         passive_deletes=True,
     )
 
