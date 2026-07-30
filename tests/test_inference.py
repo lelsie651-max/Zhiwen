@@ -69,6 +69,19 @@ def fake_row(block: DocumentBlock, *, project_id: uuid.UUID, status="completed",
     )
 
 
+_BATCH_IDENTITY_CONSTRAINT = (
+    "uq_inference_input_batches_project_id_task_type_snapshot_hash"
+)
+
+
+def make_integrity_error(constraint_name: str | None):
+    """Build an IntegrityError whose orig.diag.constraint_name mimics psycopg."""
+    from sqlalchemy.exc import IntegrityError
+
+    orig = SimpleNamespace(diag=SimpleNamespace(constraint_name=constraint_name))
+    return IntegrityError("stmt", {}, orig)
+
+
 class FakeSession:
     def __init__(self):
         self.committed = 0
@@ -106,7 +119,7 @@ def test_single_migration_head_is_inference():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202607310300"]
+    assert list(script.get_heads()) == ["202607310330"]
 
 
 def test_status_uses_string_and_check_not_native_enum():
@@ -333,9 +346,10 @@ def test_create_batch_is_idempotent_when_identity_exists(monkeypatch):
         snapshot_hash=sha256("x"),
     )
     created = _patch_batch_repo(monkeypatch, rows=rows, identity_results=[existing])
+    session = FakeSession()
     result = run_async(
         inference_service.create_inference_input_batch(
-            FakeSession(),
+            session,
             project_id=project_id,
             task_type="fact_extraction",
             block_ids=[b1.id],
@@ -344,11 +358,10 @@ def test_create_batch_is_idempotent_when_identity_exists(monkeypatch):
     )
     assert result is existing
     assert created["count"] == 0
+    assert session.committed == 1  # idempotent path still commits to release the txn
 
 
-def test_create_batch_reraises_query_on_integrity_conflict(monkeypatch):
-    from sqlalchemy.exc import IntegrityError
-
+def test_create_batch_idempotent_only_on_target_constraint(monkeypatch):
     project_id = uuid.uuid4()
     b1 = build_source_block(raw_text="A", location_key="loc-1")
     rows = [fake_row(b1, project_id=project_id)]
@@ -360,12 +373,12 @@ def test_create_batch_reraises_query_on_integrity_conflict(monkeypatch):
         character_count=1,
         snapshot_hash=sha256("x"),
     )
-    # First identity check returns None, after conflict returns existing.
+    # First identity check returns None, after the target conflict returns existing.
     created = _patch_batch_repo(
         monkeypatch,
         rows=rows,
         identity_results=[None, existing],
-        create_raises=IntegrityError("dup", {}, Exception()),
+        create_raises=make_integrity_error(_BATCH_IDENTITY_CONSTRAINT),
     )
     session = FakeSession()
     result = run_async(
@@ -379,6 +392,33 @@ def test_create_batch_reraises_query_on_integrity_conflict(monkeypatch):
     )
     assert result is existing
     assert created["count"] == 1
+    assert session.rolled_back == 1
+    assert session.committed == 1  # commit the re-query txn
+
+
+def test_create_batch_does_not_swallow_unrelated_integrity_error(monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    project_id = uuid.uuid4()
+    b1 = build_source_block(raw_text="A", location_key="loc-1")
+    rows = [fake_row(b1, project_id=project_id)]
+    session = FakeSession()
+    _patch_batch_repo(
+        monkeypatch,
+        rows=rows,
+        identity_results=[None],
+        create_raises=make_integrity_error("some_other_constraint"),
+    )
+    with pytest.raises(IntegrityError):
+        run_async(
+            inference_service.create_inference_input_batch(
+                session,
+                project_id=project_id,
+                task_type="fact_extraction",
+                block_ids=[b1.id],
+                selection_strategy="manual",
+            )
+        )
     assert session.rolled_back == 1
 
 
@@ -820,3 +860,275 @@ def test_fail_rejects_exception_objects(monkeypatch):
                 FakeSession(), run_id=run.id, failure_code=ValueError("boom")  # type: ignore[arg-type]
             )
         )
+
+
+# --------------------------------------------------------------------------- #
+# Round: transaction closure, identity hashing, metadata, DB invariants
+# --------------------------------------------------------------------------- #
+
+
+def test_lifecycle_idempotent_paths_commit_to_release_lock(monkeypatch):
+    # start: already running -> idempotent commit
+    run = _running_run(uuid.uuid4())
+    _patch_run_lookup(monkeypatch, run)
+    s = FakeSession()
+    run_async(inference_service.start_inference_run(s, run_id=run.id))
+    assert s.committed == 1 and s.rolled_back == 0
+
+    # complete: same response hash -> idempotent commit
+    content = '{"a": 1}'
+    completed = _running_run(uuid.uuid4())
+    completed.status = InferenceRunStatus.COMPLETED.value
+    completed.response_hash = sha256(content)
+    _patch_run_lookup(monkeypatch, completed)
+    s2 = FakeSession()
+    run_async(
+        inference_service.complete_inference_run(
+            s2, run_id=completed.id, completion=make_stub_completion(content, provider="deepseek")
+        )
+    )
+    assert s2.committed == 1 and s2.rolled_back == 0
+
+    # fail: same failure result -> idempotent commit
+    failed = _running_run(uuid.uuid4())
+    failed.status = InferenceRunStatus.FAILED.value
+    failed.failure_code = "network_error"
+    failed.failure_message = None
+    _patch_run_lookup(monkeypatch, failed)
+    s3 = FakeSession()
+    run_async(inference_service.fail_inference_run(s3, run_id=failed.id, failure_code="network_error"))
+    assert s3.committed == 1 and s3.rolled_back == 0
+
+
+def test_lifecycle_error_paths_rollback(monkeypatch):
+    # start on terminal
+    run = _pending_run(uuid.uuid4())
+    run.status = InferenceRunStatus.COMPLETED.value
+    _patch_run_lookup(monkeypatch, run)
+    s = FakeSession()
+    with pytest.raises(inference_service.InferenceRunStateError):
+        run_async(inference_service.start_inference_run(s, run_id=run.id))
+    assert s.rolled_back == 1 and s.committed == 0
+
+    # complete provider mismatch
+    r2 = _running_run(uuid.uuid4(), provider="deepseek")
+    _patch_run_lookup(monkeypatch, r2)
+    s2 = FakeSession()
+    with pytest.raises(inference_service.InferenceProviderMismatchError):
+        run_async(
+            inference_service.complete_inference_run(
+                s2, run_id=r2.id, completion=make_stub_completion('{"a":1}', provider="openai")
+            )
+        )
+    assert s2.rolled_back == 1 and s2.committed == 0
+
+    # complete conflict (already completed, different hash)
+    r3 = _running_run(uuid.uuid4())
+    r3.status = InferenceRunStatus.COMPLETED.value
+    r3.response_hash = sha256("different")
+    _patch_run_lookup(monkeypatch, r3)
+    s3 = FakeSession()
+    with pytest.raises(inference_service.InferenceCompletionConflictError):
+        run_async(
+            inference_service.complete_inference_run(
+                s3, run_id=r3.id, completion=make_stub_completion('{"a":1}', provider="deepseek")
+            )
+        )
+    assert s3.rolled_back == 1 and s3.committed == 0
+
+    # complete strict-json failure
+    r4 = _running_run(uuid.uuid4())
+    _patch_run_lookup(monkeypatch, r4)
+    s4 = FakeSession()
+    with pytest.raises(inference_service.InvalidInferenceCompletionError):
+        run_async(
+            inference_service.complete_inference_run(
+                s4, run_id=r4.id, completion=make_stub_completion("not json", provider="deepseek")
+            )
+        )
+    assert s4.rolled_back == 1 and s4.committed == 0
+
+    # fail conflict
+    r5 = _running_run(uuid.uuid4())
+    r5.status = InferenceRunStatus.FAILED.value
+    r5.failure_code = "code_a"
+    _patch_run_lookup(monkeypatch, r5)
+    s5 = FakeSession()
+    with pytest.raises(inference_service.InferenceFailureConflictError):
+        run_async(inference_service.fail_inference_run(s5, run_id=r5.id, failure_code="code_b"))
+    assert s5.rolled_back == 1 and s5.committed == 0
+
+
+def test_create_run_batch_mismatch_rolls_back(monkeypatch):
+    project_id = uuid.uuid4()
+    batch = _fake_batch(uuid.uuid4())  # different project
+    _patch_create_run_repo(monkeypatch, batch=batch)
+    s = FakeSession()
+    with pytest.raises(inference_service.InferenceBatchMismatchError):
+        run_async(inference_service.create_inference_run(s, **_create_run_kwargs(project_id, batch.id)))
+    assert s.rolled_back == 1 and s.committed == 0
+
+
+def test_identity_normalized_before_query_and_hash(monkeypatch):
+    project_id = uuid.uuid4()
+    batch = _fake_batch(project_id)
+    captured = {}
+
+    async def fake_attempt(session, input_batch_id, agent_name, prompt_version):
+        captured["agent_name"] = agent_name
+        captured["prompt_version"] = prompt_version
+        return 1
+
+    monkeypatch.setattr(inference_repository, "get_batch_for_update", _acoro(lambda *a, **k: batch))
+    monkeypatch.setattr(inference_repository, "get_next_run_attempt_no", fake_attempt)
+
+    async def fake_create(_s, run):
+        return run
+
+    monkeypatch.setattr(inference_repository, "create_inference_run", fake_create)
+
+    kwargs = _create_run_kwargs(project_id, batch.id)
+    kwargs.update(agent_name="  extractor  ", prompt_version="  1  ", requested_model=" deepseek-v4-flash ")
+    run = run_async(inference_service.create_inference_run(FakeSession(), **kwargs))
+
+    # attempt query received normalized values
+    assert captured == {"agent_name": "extractor", "prompt_version": "1"}
+    # persisted values are normalized
+    assert run.agent_name == "extractor"
+    assert run.prompt_version == "1"
+    assert run.requested_model == "deepseek-v4-flash"
+
+
+def test_request_hash_recomputable_from_persisted_fields(monkeypatch):
+    project_id = uuid.uuid4()
+    batch = _fake_batch(project_id)
+    _patch_create_run_repo(monkeypatch, batch=batch)
+    kwargs = _create_run_kwargs(project_id, batch.id)
+    kwargs.update(agent_name="  extractor  ")  # whitespace should not break recompute
+    run = run_async(inference_service.create_inference_run(FakeSession(), **kwargs))
+
+    payload = {
+        "snapshot_hash": batch.snapshot_hash,
+        "task_type": run.task_type,
+        "agent_name": run.agent_name,
+        "agent_version": run.agent_version,
+        "prompt_name": run.prompt_name,
+        "prompt_version": run.prompt_version,
+        "prompt_contract_hash": run.prompt_contract_hash,
+        "provider": run.provider,
+        "requested_model": run.requested_model,
+        "temperature": run.temperature,
+        "max_output_tokens": run.max_output_tokens,
+        "request_metadata": run.request_metadata,
+    }
+    expected = inference_service._sha256(inference_service._canonical_json(payload))
+    assert run.request_hash == expected
+
+
+def test_negative_zero_temperature_hashes_same_as_zero(monkeypatch):
+    project_id = uuid.uuid4()
+    batch = _fake_batch(project_id)
+    _patch_create_run_repo(monkeypatch, batch=batch)
+    k1 = _create_run_kwargs(project_id, batch.id)
+    k1["temperature"] = -0.0
+    run1 = run_async(inference_service.create_inference_run(FakeSession(), **k1))
+    _patch_create_run_repo(monkeypatch, batch=batch)
+    k2 = _create_run_kwargs(project_id, batch.id)
+    k2["temperature"] = 0.0
+    run2 = run_async(inference_service.create_inference_run(FakeSession(), **k2))
+    assert run1.request_hash == run2.request_hash
+
+
+@pytest.mark.parametrize(
+    "bad_metadata",
+    [
+        {"score": float("nan")},
+        {"score": float("inf")},
+        {1: "non-string-key"},
+        {"id": uuid.uuid4()},
+        {"created": __import__("datetime").datetime(2026, 1, 1)},
+        {"tags": {1, 2, 3}},
+    ],
+)
+def test_metadata_rejects_non_json(monkeypatch, bad_metadata):
+    b1 = build_source_block(raw_text="A", location_key="loc-1")
+    project_id = uuid.uuid4()
+    _patch_batch_repo(monkeypatch, rows=[fake_row(b1, project_id=project_id)])
+    with pytest.raises(inference_service.InvalidInferenceInputError):
+        run_async(
+            inference_service.create_inference_input_batch(
+                FakeSession(),
+                project_id=project_id,
+                task_type="fact_extraction",
+                block_ids=[b1.id],
+                selection_strategy="manual",
+                selection_metadata=bad_metadata,
+            )
+        )
+
+
+def test_metadata_is_deep_copied(monkeypatch):
+    project_id = uuid.uuid4()
+    b1 = build_source_block(raw_text="A", location_key="loc-1")
+    _patch_batch_repo(monkeypatch, rows=[fake_row(b1, project_id=project_id)])
+    original = {"nested": {"k": [1, 2]}}
+    batch = run_async(
+        inference_service.create_inference_input_batch(
+            FakeSession(),
+            project_id=project_id,
+            task_type="fact_extraction",
+            block_ids=[b1.id],
+            selection_strategy="manual",
+            selection_metadata=original,
+        )
+    )
+    original["nested"]["k"].append(999)
+    assert batch.selection_metadata == {"nested": {"k": [1, 2]}}
+
+
+def test_batch_by_identity_uses_selectinload_and_ordered_blocks():
+    source = (
+        Path(__file__).resolve().parents[1] / "app" / "repositories" / "inference.py"
+    ).read_text(encoding="utf-8")
+    assert "selectinload" in source
+    rel = InferenceInputBatch.__mapper__.relationships["blocks"]
+    assert rel.order_by  # ordering configured
+    assert "source_order" in str(rel.order_by[0])
+
+
+def test_pending_running_db_constraints_forbid_response_identity():
+    from sqlalchemy import CheckConstraint
+
+    runs = Base.metadata.tables["inference_runs"]
+    checks = {
+        c.name: str(c.sqltext)
+        for c in runs.constraints
+        if isinstance(c, CheckConstraint)
+    }
+    pending = next(v for k, v in checks.items() if "pending_shape" in k)
+    running = next(v for k, v in checks.items() if "running_shape" in k)
+    for sql in (pending, running):
+        for field in (
+            "response_model IS NULL",
+            "response_id IS NULL",
+            "system_fingerprint IS NULL",
+            "finish_reason IS NULL",
+            "prompt_tokens IS NULL",
+            "reasoning_tokens IS NULL",
+        ):
+            assert field in sql
+
+
+def test_jsonb_type_constraints_exist():
+    from sqlalchemy import CheckConstraint
+
+    def checks(table):
+        return " ".join(
+            str(c.sqltext)
+            for c in Base.metadata.tables[table].constraints
+            if isinstance(c, CheckConstraint)
+        )
+
+    assert "jsonb_typeof(selection_metadata) = 'object'" in checks("inference_input_batches")
+    assert "jsonb_typeof(request_metadata) = 'object'" in checks("inference_runs")
+    assert "jsonb_typeof(heading_path) = 'array'" in checks("inference_input_blocks")

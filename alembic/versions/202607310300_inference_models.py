@@ -352,7 +352,7 @@ def upgrade() -> None:
             "agent_name",
             "prompt_version",
             "attempt_no",
-            name="uq_inference_runs_input_batch_id_agent_name_prompt_version_attempt_no",
+            name="uq_inference_runs_batch_agent_prompt_attempt",
         ),
     )
     op.create_index(

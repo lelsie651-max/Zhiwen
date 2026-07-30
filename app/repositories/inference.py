@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from sqlalchemy import func, select
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.document import Document
 from app.models.document_content import DocumentBlock, ExtractionRun
@@ -50,11 +51,15 @@ async def get_batch_by_identity(
     snapshot_hash: str,
 ) -> InferenceInputBatch | None:
     result = await session.execute(
-        select(InferenceInputBatch).where(
+        select(InferenceInputBatch)
+        .where(
             InferenceInputBatch.project_id == project_id,
             InferenceInputBatch.task_type == task_type,
             InferenceInputBatch.snapshot_hash == snapshot_hash,
         )
+        # Eagerly load blocks (ordered by source_order via the relationship) so an
+        # idempotently returned batch never triggers an async lazy load later.
+        .options(selectinload(InferenceInputBatch.blocks))
     )
     return result.scalar_one_or_none()
 

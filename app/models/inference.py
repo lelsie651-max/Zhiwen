@@ -50,6 +50,31 @@ _TASK_TYPE_SQL = "('fact_extraction', 'schema_inference', 'consistency_check')"
 _RUN_STATUS_SQL = "('pending', 'running', 'completed', 'failed')"
 _BLOCK_TYPE_SQL = "('heading', 'paragraph', 'list_item', 'table_row', 'code', 'page_text')"
 
+# Non-terminal runs (pending/running) must not carry any response identity or
+# token accounting. Shared here so the ORM and the migration stay identical.
+_RUN_RESPONSE_NULLS_SQL = (
+    "response_json IS NULL AND response_hash IS NULL "
+    "AND response_model IS NULL AND response_id IS NULL "
+    "AND system_fingerprint IS NULL AND finish_reason IS NULL "
+    "AND prompt_tokens IS NULL AND completion_tokens IS NULL "
+    "AND total_tokens IS NULL AND prompt_cache_hit_tokens IS NULL "
+    "AND prompt_cache_miss_tokens IS NULL AND reasoning_tokens IS NULL"
+)
+_RUN_PENDING_SHAPE_SQL = (
+    "status <> 'pending' OR ("
+    "started_at IS NULL AND completed_at IS NULL "
+    "AND failure_code IS NULL AND failure_message IS NULL "
+    "AND attempt_count = 0 "
+    f"AND {_RUN_RESPONSE_NULLS_SQL})"
+)
+_RUN_RUNNING_SHAPE_SQL = (
+    "status <> 'running' OR ("
+    "started_at IS NOT NULL AND completed_at IS NULL "
+    "AND failure_code IS NULL AND failure_message IS NULL "
+    "AND attempt_count = 0 "
+    f"AND {_RUN_RESPONSE_NULLS_SQL})"
+)
+
 
 class InferenceInputBatch(UUIDPrimaryKeyMixin, Base):
     """An immutable, ordered snapshot of the blocks fed into one AI task.
@@ -82,6 +107,10 @@ class InferenceInputBatch(UUIDPrimaryKeyMixin, Base):
         CheckConstraint(
             "char_length(selection_strategy) BETWEEN 1 AND 64",
             name="inference_input_batches_selection_strategy_length",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(selection_metadata) = 'object'",
+            name="inference_input_batches_selection_metadata_is_object",
         ),
     )
 
@@ -195,6 +224,10 @@ class InferenceInputBlock(UUIDPrimaryKeyMixin, Base):
         CheckConstraint("page_no IS NULL OR page_no > 0", name="inference_input_blocks_page_no_positive"),
         CheckConstraint("start_line IS NULL OR start_line > 0", name="inference_input_blocks_start_line_positive"),
         CheckConstraint("end_line IS NULL OR end_line > 0", name="inference_input_blocks_end_line_positive"),
+        CheckConstraint(
+            "jsonb_typeof(heading_path) = 'array'",
+            name="inference_input_blocks_heading_path_is_array",
+        ),
     )
 
     batch_id: Mapped[uuid.UUID] = mapped_column(
@@ -288,7 +321,9 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
             "agent_name",
             "prompt_version",
             "attempt_no",
-            name="uq_inference_runs_input_batch_id_agent_name_prompt_version_attempt_no",
+            # Kept <= 63 chars for PostgreSQL's identifier limit (the descriptive
+            # name would be truncated non-deterministically otherwise).
+            name="uq_inference_runs_batch_agent_prompt_attempt",
         ),
         CheckConstraint(
             f"status IN {_RUN_STATUS_SQL}",
@@ -350,19 +385,11 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
             name="inference_runs_completed_after_started",
         ),
         # State-shape invariants, enforced at the database level.
+        CheckConstraint(_RUN_PENDING_SHAPE_SQL, name="inference_runs_pending_shape"),
+        CheckConstraint(_RUN_RUNNING_SHAPE_SQL, name="inference_runs_running_shape"),
         CheckConstraint(
-            "status <> 'pending' OR ("
-            "started_at IS NULL AND completed_at IS NULL AND response_json IS NULL "
-            "AND response_hash IS NULL AND failure_code IS NULL AND failure_message IS NULL "
-            "AND attempt_count = 0)",
-            name="inference_runs_pending_shape",
-        ),
-        CheckConstraint(
-            "status <> 'running' OR ("
-            "started_at IS NOT NULL AND completed_at IS NULL AND response_json IS NULL "
-            "AND response_hash IS NULL AND failure_code IS NULL AND failure_message IS NULL "
-            "AND attempt_count = 0)",
-            name="inference_runs_running_shape",
+            "jsonb_typeof(request_metadata) = 'object'",
+            name="inference_runs_request_metadata_is_object",
         ),
         CheckConstraint(
             "status <> 'completed' OR ("
