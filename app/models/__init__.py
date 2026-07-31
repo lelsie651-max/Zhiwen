@@ -9,6 +9,14 @@ from app.models.dynamic_schema import (
     DynamicSchemaVersionSourceKind,
     DynamicSchemaVersionStatus,
 )
+from app.models.entity import (
+    Entity,
+    EntityAlias,
+    EntityAliasKind,
+    EntityAliasStatus,
+    EntityStatus,
+    normalize_entity_alias,
+)
 from app.models.document_content import (
     DocumentBlock,
     DocumentBlockType,
@@ -71,6 +79,12 @@ __all__ = [
     "DynamicSchemaVersion",
     "DynamicSchemaVersionStatus",
     "DynamicSchemaVersionSourceKind",
+    "Entity",
+    "EntityStatus",
+    "EntityAlias",
+    "EntityAliasKind",
+    "EntityAliasStatus",
+    "normalize_entity_alias",
     "DynamicSchemaField",
     "DynamicSchemaFieldValueType",
     "DynamicSchemaFieldCardinality",

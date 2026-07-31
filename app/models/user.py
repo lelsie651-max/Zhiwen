@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from app.models.document import Document
     from app.models.document_revision import DocumentRevision
     from app.models.dynamic_schema import DynamicSchema, DynamicSchemaVersion
+    from app.models.entity import Entity, EntityAlias
     from app.models.fact import Fact, FactValue
     from app.models.ingestion_validation import IngestionValidationReport
     from app.models.processing_job import ProcessingJob
@@ -91,6 +92,14 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     created_facts: Mapped[list["Fact"]] = relationship(
         back_populates="created_by",
         foreign_keys="Fact.created_by_id",
+    )
+    created_entities: Mapped[list["Entity"]] = relationship(
+        back_populates="created_by",
+        foreign_keys="Entity.created_by_id",
+    )
+    created_entity_aliases: Mapped[list["EntityAlias"]] = relationship(
+        back_populates="created_by",
+        foreign_keys="EntityAlias.created_by_id",
     )
     created_fact_values: Mapped[list["FactValue"]] = relationship(
         back_populates="created_by",

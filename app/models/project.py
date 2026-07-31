@@ -13,6 +13,7 @@ from app.utils.validation import normalize_text, validate_slug
 if TYPE_CHECKING:
     from app.models.document import Document
     from app.models.dynamic_schema import DynamicSchema
+    from app.models.entity import Entity
     from app.models.fact import Fact
     from app.models.inference import InferenceInputBatch, InferenceRun
     from app.models.processing_job import ProcessingJob
@@ -87,6 +88,11 @@ class Project(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         passive_deletes=True,
     )
     facts: Mapped[list["Fact"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    entities: Mapped[list["Entity"]] = relationship(
         back_populates="project",
         cascade="all, delete-orphan",
         passive_deletes=True,

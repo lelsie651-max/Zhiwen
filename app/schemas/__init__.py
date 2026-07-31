@@ -6,6 +6,14 @@ from app.schemas.dynamic_schema import (
     DynamicSchemaVersionInput,
     DynamicSchemaVersionRead,
 )
+from app.schemas.entity import (
+    EntityAliasCreateInput,
+    EntityAliasRead,
+    EntityAliasResolutionRead,
+    EntityCreateInput,
+    EntityRead,
+    ResolvedEntityAliasCandidate,
+)
 from app.schemas.dynamic_schema_commands import AISchemaProposalInput, HumanSchemaDraftInput
 from app.schemas.dynamic_schema_projection import (
     DynamicSchemaProjection,
@@ -79,6 +87,12 @@ __all__ = [
     "DynamicSchemaRead",
     "DynamicSchemaVersionRead",
     "DynamicSchemaFieldRead",
+    "EntityCreateInput",
+    "EntityAliasCreateInput",
+    "EntityRead",
+    "EntityAliasRead",
+    "ResolvedEntityAliasCandidate",
+    "EntityAliasResolutionRead",
     "DynamicSchemaIdentityInput",
     "DynamicSchemaFieldInput",
     "DynamicSchemaVersionInput",
