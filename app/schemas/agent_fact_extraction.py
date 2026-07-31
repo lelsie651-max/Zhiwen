@@ -10,6 +10,7 @@ than maintained twice.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -41,6 +42,15 @@ class EvidenceProposal(BaseModel):
     role: EvidenceRole
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("start_offset", "end_offset", mode="before")
+    @classmethod
+    def _offsets_must_be_int(cls, value: Any) -> Any:
+        # Offsets are exact character indices: reject bool, float, and numeric
+        # strings rather than let pydantic's lax mode coerce them.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("offset must be an integer")
+        return value
 
     @model_validator(mode="after")
     def validate_offsets(self) -> "EvidenceProposal":
@@ -88,14 +98,38 @@ class FactProposal(BaseModel):
     def _validate_language_code(cls, value: str | None) -> str | None:
         return _normalize_optional_text(value, field_name="language_code", max_length=32)
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence_must_be_number(cls, value: Any) -> Any:
+        # A real, finite JSON number: reject bool and numeric strings, and store
+        # a float so the type is uniform downstream.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("confidence must be a number")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError("confidence must be finite")
+        return numeric
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _evidence_must_be_list(cls, value: Any) -> Any:
+        # Do not let a tuple (or other sequence) be silently coerced into a list.
+        if not isinstance(value, list):
+            raise ValueError("evidence must be a list")
+        return value
+
     @model_validator(mode="after")
     def validate_value_and_evidence(self) -> "FactProposal":
         # Reuse the canonical Fact value-type rules (no implicit string->number
         # coercion, strict null handling) instead of duplicating them here.
         try:
-            _normalize_value_by_type(self.value_type.value, self.value_json)
+            normalized_value = _normalize_value_by_type(self.value_type.value, self.value_json)
         except InvalidFactProposalError as error:
             raise ValueError(str(error)) from None
+
+        # Persist the Fact-layer normalized representation so the dedupe signature
+        # and any downstream Fact service observe one identical value.
+        self.value_json = normalized_value
 
         supporting = [e for e in self.evidence if e.role == "supporting"]
         if not supporting:
@@ -131,6 +165,20 @@ class FactExtractionResponse(BaseModel):
     uncertainties: list[str] = Field(default_factory=list, max_length=50)
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("facts", mode="before")
+    @classmethod
+    def _facts_must_be_list(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            raise ValueError("facts must be a list")
+        return value
+
+    @field_validator("uncertainties", mode="before")
+    @classmethod
+    def _uncertainties_must_be_list(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            raise ValueError("uncertainties must be a list")
+        return value
 
     @field_validator("uncertainties")
     @classmethod

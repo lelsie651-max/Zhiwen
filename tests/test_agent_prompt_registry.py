@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 
 import pytest
 from pydantic import BaseModel
 
+from app.agents import prompt_registry as pr
 from app.agents.prompt_registry import (
+    InvalidPromptDefinitionError,
     PromptAlreadyRegisteredError,
     PromptDefinition,
     PromptNotFoundError,
@@ -128,3 +131,80 @@ def test_build_default_registry_is_independent_each_call():
     r2 = build_default_registry()
     assert r1 is not r2
     assert get_prompt("agent1_fact_extraction", "1.0.0") is not None
+
+
+# --------------------------------------------------------------------------- #
+# Renderer version participates in the contract hash
+# --------------------------------------------------------------------------- #
+
+
+def test_renderer_version_feeds_contract_hash(monkeypatch):
+    definition = _definition()
+    baseline = definition.contract_hash
+    monkeypatch.setattr(pr, "RENDERER_VERSION", "9.9.9-test")
+    assert definition.contract_hash != baseline
+
+
+# --------------------------------------------------------------------------- #
+# PromptDefinition validation
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"task_type": ""},
+        {"task_type": "   "},
+        {"agent_name": ""},
+        {"agent_name": "a" * 101},
+        {"agent_version": "v" * 33},
+        {"prompt_name": "p" * 101},
+        {"prompt_version": "v" * 33},
+        {"system_template": ""},
+        {"instruction_template": "   "},
+        {"response_model": dict},
+        {"response_model": "not-a-model"},
+    ],
+)
+def test_invalid_prompt_definition_fields_are_rejected(overrides):
+    with pytest.raises(InvalidPromptDefinitionError):
+        _definition(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"temperature": float("nan")},
+        {"temperature": float("inf")},
+        {"temperature": -0.1},
+        {"temperature": 2.1},
+        {"temperature": True},
+        {"temperature": "0.1"},
+        {"max_output_tokens": 0},
+        {"max_output_tokens": -1},
+        {"max_output_tokens": True},
+        {"max_output_tokens": 1.5},
+    ],
+)
+def test_invalid_sampling_params_are_rejected(overrides):
+    with pytest.raises(InvalidPromptDefinitionError):
+        _definition(**overrides)
+
+
+def test_temperature_negative_zero_is_normalized():
+    definition = _definition(temperature=-0.0)
+    assert definition.temperature == 0.0
+    assert math.copysign(1.0, definition.temperature) == 1.0  # collapsed to +0.0
+    # -0.0 and +0.0 must produce an identical, representation-stable hash.
+    assert definition.contract_hash == _definition(temperature=0.0).contract_hash
+
+
+def test_invalid_definition_never_hashable_because_unconstructable():
+    with pytest.raises(InvalidPromptDefinitionError):
+        _definition(temperature=5.0)
+
+
+def test_register_rejects_non_prompt_definition():
+    registry = PromptRegistry()
+    with pytest.raises(TypeError):
+        registry.register({"prompt_name": "x"})  # type: ignore[arg-type]

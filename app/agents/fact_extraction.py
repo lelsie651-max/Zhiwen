@@ -10,8 +10,9 @@ exceptions.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -24,6 +25,21 @@ if TYPE_CHECKING:
 
 
 _FACT_EXTRACTION_TASK_TYPE = "fact_extraction"
+
+# Bounds on the structural error summary surfaced from a failed contract
+# validation. They keep the message small and free of any model-supplied values.
+_MAX_ERROR_ITEMS = 20
+_MAX_ERROR_SUMMARY_CHARS = 1000
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 class AgentError(Exception):
@@ -46,6 +62,12 @@ def render_fact_extraction_messages(
     prompt: "PromptDefinition",
     batch: "InferenceInputBatch",
 ) -> tuple[LLMMessage, LLMMessage]:
+    # The prompt and the batch must both describe the same task, and the prompt
+    # must carry the exact contract this renderer knows how to send.
+    if prompt.task_type != _FACT_EXTRACTION_TASK_TYPE:
+        raise AgentContextError("prompt task_type must be fact_extraction")
+    if prompt.response_model is not FactExtractionResponse:
+        raise AgentContextError("prompt response_model must be FactExtractionResponse")
     if batch.task_type != _FACT_EXTRACTION_TASK_TYPE:
         raise AgentContextError("input batch task_type must be fact_extraction")
 
@@ -60,11 +82,32 @@ def render_fact_extraction_messages(
     ordered = sorted(blocks, key=lambda b: b.source_order)
     if [b.source_order for b in ordered] != list(range(len(ordered))):
         raise AgentContextError("input batch blocks are not contiguous from 0")
-    refs = [b.block_ref for b in ordered]
-    if len(set(refs)) != len(refs):
-        raise AgentContextError("input batch block_refs are not unique")
+    if len(ordered) != batch.block_count:
+        raise AgentContextError("input batch block_count does not match loaded blocks")
+
+    # block_ref must be exactly the canonical sequence B0001, B0002, ... aligned
+    # to source_order — this also guarantees uniqueness.
+    expected_refs = [f"B{index + 1:04d}" for index in range(len(ordered))]
+    if [b.block_ref for b in ordered] != expected_refs:
+        raise AgentContextError("input batch block_refs must be sequential B0001, B0002, ...")
+
+    total_characters = 0
+    for block in ordered:
+        content = block.content_text
+        if not isinstance(content, str):
+            raise AgentContextError("block content_text must be a string")
+        # content_text is verbatim: it is never stripped or normalized here.
+        total_characters += len(content)
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if digest != block.content_hash:
+            raise AgentContextError("block content_hash does not match content_text")
+    if total_characters != batch.character_count:
+        raise AgentContextError("input batch character_count does not match block content")
 
     envelope = {
+        # The full response contract goes to the model verbatim; it is the only
+        # permitted output shape. Its values come straight from the prompt model.
+        "response_contract": prompt.response_json_schema,
         "input_batch": {
             "snapshot_hash": batch.snapshot_hash,
             "blocks": [
@@ -79,9 +122,9 @@ def render_fact_extraction_messages(
                 }
                 for block in ordered
             ],
-        }
+        },
     }
-    envelope_json = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
+    envelope_json = _canonical_json(envelope)
 
     system_message = LLMMessage(role="system", content=prompt.system_template)
     user_message = LLMMessage(
@@ -115,11 +158,14 @@ def parse_fact_extraction_completion(
     try:
         return FactExtractionResponse.model_validate(payload)
     except ValidationError as error:
-        # Only field locations + error types — never the raw model content.
-        summary = "; ".join(
-            f"{'.'.join(str(part) for part in item['loc'])}:{item['type']}"
-            for item in error.errors()
-        )
+        # Only field locations + error types — never the raw model content, the
+        # offending input value, or validation context. Also bounded in count and
+        # length so a pathological reply cannot bloat the message.
+        parts = []
+        for item in error.errors(include_url=False)[:_MAX_ERROR_ITEMS]:
+            location = ".".join(str(part) for part in item["loc"])
+            parts.append(f"{location}:{item['type']}")
+        summary = "; ".join(parts)[:_MAX_ERROR_SUMMARY_CHARS]
     raise AgentResponseError(
         f"fact extraction response failed contract validation: {summary}"
     )
