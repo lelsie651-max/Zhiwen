@@ -26,6 +26,7 @@ from app.utils.validation import normalize_text
 
 if TYPE_CHECKING:
     from app.models.document_content import DocumentBlock
+    from app.models.fact import FactValue
     from app.models.project import Project
 
 
@@ -476,6 +477,10 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
     input_batch: Mapped["InferenceInputBatch"] = relationship(
         back_populates="runs",
         foreign_keys=[input_batch_id],
+    )
+    fact_values: Mapped[list["FactValue"]] = relationship(
+        back_populates="inference_run",
+        foreign_keys="FactValue.inference_run_id",
     )
 
     @validates(

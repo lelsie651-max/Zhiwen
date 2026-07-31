@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.engine import Row
@@ -13,6 +14,16 @@ from app.models.document_content import DocumentBlock, ExtractionRun
 from app.models.document_revision import DocumentRevision
 from app.models.inference import InferenceInputBatch, InferenceRun
 from app.models.project import Project
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedFactExtractionRunContext:
+    run_id: uuid.UUID
+    project_id: uuid.UUID
+    task_type: str
+    status: str
+    batch_id: uuid.UUID
+    extraction_run_id_snapshots: frozenset[uuid.UUID]
 
 
 async def get_project(session: AsyncSession, project_id: uuid.UUID) -> Project | None:
@@ -120,3 +131,41 @@ async def get_run_for_update(
         select(InferenceRun).where(InferenceRun.id == run_id).with_for_update()
     )
     return result.scalar_one_or_none()
+
+
+async def get_completed_fact_extraction_run_context(
+    session: AsyncSession,
+    *,
+    inference_run_id: uuid.UUID,
+) -> CompletedFactExtractionRunContext | None:
+    result = await session.execute(
+        select(
+            InferenceRun.id.label("run_id"),
+            InferenceRun.project_id.label("project_id"),
+            InferenceRun.task_type.label("task_type"),
+            InferenceRun.status.label("status"),
+            InferenceRun.input_batch_id.label("batch_id"),
+            InferenceInputBlock.extraction_run_id_snapshot.label("extraction_run_id_snapshot"),
+        )
+        .join(InferenceInputBatch, InferenceRun.input_batch_id == InferenceInputBatch.id)
+        .outerjoin(InferenceInputBlock, InferenceInputBlock.batch_id == InferenceInputBatch.id)
+        .where(InferenceRun.id == inference_run_id)
+    )
+    rows = list(result.all())
+    if not rows:
+        return None
+
+    first = rows[0]
+    extraction_run_id_snapshots = frozenset(
+        row.extraction_run_id_snapshot
+        for row in rows
+        if row.extraction_run_id_snapshot is not None
+    )
+    return CompletedFactExtractionRunContext(
+        run_id=first.run_id,
+        project_id=first.project_id,
+        task_type=first.task_type,
+        status=first.status,
+        batch_id=first.batch_id,
+        extraction_run_id_snapshots=extraction_run_id_snapshots,
+    )

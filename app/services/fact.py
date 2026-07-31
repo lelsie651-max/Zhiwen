@@ -20,9 +20,11 @@ from app.models.fact import (
     FactValueStatus,
     FactValueType,
 )
+from app.models.inference import InferenceRunStatus, InferenceTaskType
 from app.models.project_member import ProjectMemberRole
 from app.models.user import UserStatus
 from app.repositories import fact as fact_repository
+from app.repositories import inference as inference_repository
 from app.repositories import user as user_repository
 from app.schemas.fact import FactIdentityInput, FactValueInput
 from app.schemas.fact_commands import (
@@ -43,6 +45,18 @@ class FactProposalRunNotFoundError(FactProposalError):
 
 class InvalidFactProposalError(FactProposalError):
     """Raised when the AI proposal payload or related resources are invalid."""
+
+
+class InferenceRunNotEligibleForFactError(FactProposalError):
+    """Raised when an inference run cannot be used as AI fact provenance."""
+
+
+class FactInferenceProjectMismatchError(FactProposalError):
+    """Raised when inference provenance belongs to a different project."""
+
+
+class FactInferenceSourceMismatchError(FactProposalError):
+    """Raised when inference provenance does not cover the target extraction run."""
 
 
 class RetiredFactError(FactProposalError):
@@ -74,6 +88,7 @@ async def propose_ai_fact_value(
     *,
     project_id: uuid.UUID,
     extraction_run_id: uuid.UUID,
+    inference_run_id: uuid.UUID,
     payload: AIProposalInput,
 ) -> FactValue:
     extraction_run = await fact_repository.get_extraction_run_with_project(session, extraction_run_id)
@@ -92,6 +107,29 @@ async def propose_ai_fact_value(
         ExtractionRunOutcome.PARTIAL.value,
     }:
         raise InvalidFactProposalError("Only successful or partial extraction runs can produce AI fact proposals.")
+
+    inference_context = await inference_repository.get_completed_fact_extraction_run_context(
+        session,
+        inference_run_id=inference_run_id,
+    )
+    if inference_context is None:
+        raise InferenceRunNotEligibleForFactError("Inference run not found.")
+    if inference_context.status != InferenceRunStatus.COMPLETED.value:
+        raise InferenceRunNotEligibleForFactError(
+            "Only completed inference runs can produce AI fact proposals."
+        )
+    if inference_context.task_type != InferenceTaskType.FACT_EXTRACTION.value:
+        raise InferenceRunNotEligibleForFactError(
+            "Only fact_extraction inference runs can produce AI fact proposals."
+        )
+    if inference_context.project_id != project_id:
+        raise FactInferenceProjectMismatchError(
+            "Inference run does not belong to the requested project."
+        )
+    if extraction_run_id not in inference_context.extraction_run_id_snapshots:
+        raise FactInferenceSourceMismatchError(
+            "Inference run input batch does not include the requested extraction run."
+        )
 
     evidence_ids = [evidence.evidence_id for evidence in payload.evidences]
     evidence_records = await fact_repository.list_source_evidences_with_context(session, evidence_ids)
@@ -133,6 +171,7 @@ async def propose_ai_fact_value(
         status=FactValueStatus.PROPOSED.value,
         source_kind=FactValueSourceKind.AI.value,
         extraction_run_id=extraction_run_id,
+        inference_run_id=inference_run_id,
         confidence=payload.value.confidence,
         created_by_id=None,
         decided_by_id=None,
@@ -202,6 +241,7 @@ async def create_human_fact_value(
         status=FactValueStatus.ACCEPTED.value,
         source_kind=FactValueSourceKind.HUMAN.value,
         extraction_run_id=None,
+        inference_run_id=None,
         confidence=payload.value.confidence,
         created_by_id=actor.id,
         decided_by_id=actor.id,

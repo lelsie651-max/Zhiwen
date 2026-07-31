@@ -116,6 +116,7 @@ class FactValueRead(BaseModel):
     status: FactValueStatus
     source_kind: FactValueSourceKind
     extraction_run_id: uuid.UUID | None = None
+    inference_run_id: uuid.UUID | None = None
     confidence: float | None = None
     created_by_id: uuid.UUID | None = None
     decided_by_id: uuid.UUID | None = None

@@ -119,7 +119,7 @@ def test_single_migration_head_is_inference():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202607310330"]
+    assert list(script.get_heads()) == ["202607311030"]
 
 
 def test_status_uses_string_and_check_not_native_enum():
@@ -215,6 +215,10 @@ def test_repository_uses_explicit_joins_no_lazy_load():
         Path(__file__).resolve().parents[1] / "app" / "repositories" / "inference.py"
     ).read_text(encoding="utf-8")
     assert ".join(" in source
+    assert "get_completed_fact_extraction_run_context" in source
+    assert "content_text" not in source
+    assert "extraction_run_id_snapshot" in source
+    assert ".outerjoin(" in source
 
 
 # --------------------------------------------------------------------------- #

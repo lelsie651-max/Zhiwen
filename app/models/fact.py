@@ -15,6 +15,7 @@ from app.utils.validation import normalize_text
 
 if TYPE_CHECKING:
     from app.models.document_content import ExtractionRun, SourceEvidence
+    from app.models.inference import InferenceRun
     from app.models.project import Project
     from app.models.user import User
 
@@ -194,8 +195,12 @@ class FactValue(UUIDPrimaryKeyMixin, Base):
             name="fact_values_human_requires_created_by",
         ),
         CheckConstraint(
-            "(source_kind <> 'ai' OR extraction_run_id IS NOT NULL)",
-            name="fact_values_ai_requires_extraction_run",
+            "(source_kind <> 'ai' OR (extraction_run_id IS NOT NULL AND inference_run_id IS NOT NULL))",
+            name="fact_values_ai_requires_extraction_and_inference_run",
+        ),
+        CheckConstraint(
+            "(source_kind = 'ai' OR inference_run_id IS NULL)",
+            name="fact_values_non_ai_forbids_inference_run",
         ),
     )
 
@@ -219,6 +224,11 @@ class FactValue(UUIDPrimaryKeyMixin, Base):
     source_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     extraction_run_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("extraction_runs.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    inference_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("inference_runs.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -253,6 +263,10 @@ class FactValue(UUIDPrimaryKeyMixin, Base):
     extraction_run: Mapped["ExtractionRun | None"] = relationship(
         back_populates="fact_values",
         foreign_keys=[extraction_run_id],
+    )
+    inference_run: Mapped["InferenceRun | None"] = relationship(
+        back_populates="fact_values",
+        foreign_keys=[inference_run_id],
     )
     created_by: Mapped["User | None"] = relationship(
         back_populates="created_fact_values",

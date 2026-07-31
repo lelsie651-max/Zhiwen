@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from app.models import Base
 from app.models.fact import Fact, FactEvidenceLink, FactValue
-from app.schemas.fact import FactIdentityInput, FactValueInput
+from app.schemas.fact import FactIdentityInput, FactValueInput, FactValueRead
 
 
 def test_fact_tables_are_registered() -> None:
@@ -81,7 +81,21 @@ def test_fact_value_ai_source_requires_extraction_run_constraint_exists() -> Non
         for constraint in table.constraints
         if isinstance(constraint, CheckConstraint)
     }
-    assert any("source_kind <> 'ai' OR extraction_run_id IS NOT NULL" in sql for sql in check_sql)
+    assert any(
+        "source_kind <> 'ai' OR (extraction_run_id IS NOT NULL AND inference_run_id IS NOT NULL)"
+        in sql
+        for sql in check_sql
+    )
+
+
+def test_fact_value_non_ai_source_forbids_inference_run_constraint_exists() -> None:
+    table = Base.metadata.tables["fact_values"]
+    check_sql = {
+        str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert any("source_kind = 'ai' OR inference_run_id IS NULL" in sql for sql in check_sql)
 
 
 def test_fact_value_extraction_run_foreign_key_uses_restrict() -> None:
@@ -93,6 +107,38 @@ def test_fact_value_extraction_run_foreign_key_uses_restrict() -> None:
     )
 
     assert extraction_run_fk.ondelete == "RESTRICT"
+
+
+def test_fact_value_inference_run_foreign_key_uses_restrict() -> None:
+    table = Base.metadata.tables["fact_values"]
+    inference_run_fk = next(
+        constraint
+        for constraint in table.foreign_key_constraints
+        if tuple(constraint.column_keys) == ("inference_run_id",)
+    )
+
+    assert inference_run_fk.ondelete == "RESTRICT"
+
+
+def test_fact_value_inference_run_column_is_indexed() -> None:
+    table = Base.metadata.tables["fact_values"]
+    indexes = {tuple(index.columns.keys()) for index in table.indexes}
+    assert ("inference_run_id",) in indexes
+
+
+def test_fact_value_and_inference_run_relationships_are_bidirectional() -> None:
+    assert FactValue.inference_run.property.back_populates == "fact_values"
+    assert FactValue.inference_run.property._user_defined_foreign_keys
+    assert "inference_run_id" in {
+        column.key for column in FactValue.inference_run.property._user_defined_foreign_keys
+    }
+
+
+def test_fact_value_read_exposes_only_inference_run_id_for_ai_provenance() -> None:
+    assert "inference_run_id" in FactValueRead.model_fields
+    assert "response_json" not in FactValueRead.model_fields
+    assert "failure_message" not in FactValueRead.model_fields
+    assert "prompt" not in FactValueRead.model_fields
 
 
 def test_fact_value_decision_constraints_exist() -> None:
@@ -222,8 +268,49 @@ def test_fact_migration_uses_restrict_for_ai_extraction_run_foreign_key() -> Non
     assert 'name=op.f("fk_fact_values_extraction_run_id_extraction_runs"),\n            ondelete="RESTRICT"' in content
 
 
-def test_no_new_fact_migration_was_created() -> None:
-    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
-    fact_migrations = sorted(versions_dir.glob("*_fact_models.py"))
+def test_fact_value_inference_provenance_migration_adds_fk_and_constraints() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202607311030_fact_value_inference_provenance.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
 
-    assert [path.name for path in fact_migrations] == ["202607301630_fact_models.py"]
+    assert 'down_revision: str | None = "202607310330"' in content
+    assert 'sa.Column("inference_run_id", sa.Uuid(), nullable=True)' in content
+    assert 'op.f("ix_fact_values_inference_run_id")' in content
+    assert 'op.f("fk_fact_values_inference_run_id_inference_runs")' in content
+    assert "Cannot add fact_value inference provenance" in content
+    assert "explicit inference_run_id backfill" in content
+    assert "extraction_run_id IS NOT NULL AND inference_run_id IS NOT NULL" in content
+    assert "source_kind = 'ai' OR inference_run_id IS NULL" in content
+
+
+def test_fact_value_inference_provenance_migration_downgrade_restores_old_constraint() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202607311030_fact_value_inference_provenance.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert 'op.drop_constraint(op.f(_NON_AI_CHECK), "fact_values", type_="check")' in content
+    assert 'op.drop_constraint(op.f(_NEW_AI_CHECK), "fact_values", type_="check")' in content
+    assert "\"(source_kind <> 'ai' OR extraction_run_id IS NOT NULL)\"" in content
+    assert 'op.drop_column("fact_values", "inference_run_id")' in content
+
+
+def test_fact_migrations_include_inference_provenance_followup() -> None:
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    fact_migrations = sorted(
+        path.name
+        for path in versions_dir.glob("*_fact*.py")
+        if path.name != "__init__.py"
+    )
+
+    assert fact_migrations == [
+        "202607301630_fact_models.py",
+        "202607311030_fact_value_inference_provenance.py",
+    ]
