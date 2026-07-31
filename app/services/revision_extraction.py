@@ -20,7 +20,7 @@ from app.repositories import revision_extraction as revision_extraction_reposito
 from app.schemas.document_extraction import ExtractedDocument, ExtractionOutcome
 from app.schemas.file_ingestion import DetectedFileFormat
 from app.schemas.revision_extraction import RevisionExtractionResult
-from app.services.document_content import persist_extraction_result
+from app.services.document_content import persist_extraction_result_in_transaction
 from app.services.document_extraction import extract_document
 from app.storage import FileStorage
 
@@ -114,23 +114,23 @@ async def _enter_parsing_phase(
     project_id: uuid.UUID,
     revision_id: uuid.UUID,
 ) -> tuple[DetectedFileFormat, str | None, str]:
-    revision = await _lock_revision_for_project(
-        session,
-        project_id=project_id,
-        revision_id=revision_id,
-    )
-    if revision.status != DocumentRevisionStatus.ACCEPTED.value:
-        raise RevisionExtractionTransitionError("Only accepted revisions can enter extraction.")
-
-    report = await _lock_latest_report(session, revision_id=revision.id)
-    _validate_admission_consistency_for_extraction(revision=revision, report=report)
-    file_format, detected_encoding = _read_extraction_config(report)
-
-    revision.status = DocumentRevisionStatus.PARSING.value
     try:
+        revision = await _lock_revision_for_project(
+            session,
+            project_id=project_id,
+            revision_id=revision_id,
+        )
+        if revision.status != DocumentRevisionStatus.ACCEPTED.value:
+            raise RevisionExtractionTransitionError("Only accepted revisions can enter extraction.")
+
+        report = await _lock_latest_report(session, revision_id=revision.id)
+        _validate_admission_consistency_for_extraction(revision=revision, report=report)
+        file_format, detected_encoding = _read_extraction_config(report)
+
+        revision.status = DocumentRevisionStatus.PARSING.value
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
 
@@ -143,19 +143,19 @@ async def _enter_extracting_phase(
     project_id: uuid.UUID,
     revision_id: uuid.UUID,
 ) -> None:
-    revision = await _lock_revision_for_project(
-        session,
-        project_id=project_id,
-        revision_id=revision_id,
-    )
-    if revision.status != DocumentRevisionStatus.PARSING.value:
-        raise RevisionExtractionTransitionError("Revision must be parsing before entering extracting.")
-
-    revision.status = DocumentRevisionStatus.EXTRACTING.value
     try:
+        revision = await _lock_revision_for_project(
+            session,
+            project_id=project_id,
+            revision_id=revision_id,
+        )
+        if revision.status != DocumentRevisionStatus.PARSING.value:
+            raise RevisionExtractionTransitionError("Revision must be parsing before entering extracting.")
+
+        revision.status = DocumentRevisionStatus.EXTRACTING.value
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
 
@@ -170,18 +170,20 @@ async def _finalize_extraction_phase(
     completed_at: datetime,
     finalizer: RevisionExtractionFinalizer | None = None,
 ) -> RevisionExtractionResult:
-    revision = await _lock_revision_for_project(
-        session,
-        project_id=project_id,
-        revision_id=revision_id,
-    )
-    if revision.status != DocumentRevisionStatus.EXTRACTING.value:
-        raise RevisionExtractionTransitionError("Revision must remain extracting before final persistence.")
-
-    previous_status = revision.status
-    failure_code = _resolve_failure_code(extracted_document.outcome)
+    revision: DocumentRevision | None = None
+    previous_status: str | None = None
     try:
-        extraction_run = await persist_extraction_result(
+        revision = await _lock_revision_for_project(
+            session,
+            project_id=project_id,
+            revision_id=revision_id,
+        )
+        if revision.status != DocumentRevisionStatus.EXTRACTING.value:
+            raise RevisionExtractionTransitionError("Revision must remain extracting before final persistence.")
+
+        previous_status = revision.status
+        failure_code = _resolve_failure_code(extracted_document.outcome)
+        extraction_run = await persist_extraction_result_in_transaction(
             session,
             revision_id=revision.id,
             extracted_document=extracted_document,
@@ -191,7 +193,6 @@ async def _finalize_extraction_phase(
             failure_message=None,
             started_at=started_at,
             completed_at=completed_at,
-            commit=False,
         )
         revision.status = _map_extraction_outcome_to_revision_status(extracted_document.outcome)
         if finalizer is not None:
@@ -199,7 +200,8 @@ async def _finalize_extraction_phase(
         await session.flush()
         await session.commit()
     except BaseException:
-        revision.status = previous_status
+        if revision is not None and previous_status is not None:
+            revision.status = previous_status
         await session.rollback()
         raise
 

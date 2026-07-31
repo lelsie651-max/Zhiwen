@@ -236,7 +236,11 @@ def test_accepted_revision_flows_to_awaiting_review(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
 
     result = run_async(
         revision_extraction_service.run_revision_extraction(
@@ -255,7 +259,7 @@ def test_accepted_revision_flows_to_awaiting_review(monkeypatch) -> None:
     assert captured["extract_storage_key"] == revision.storage_key
     assert captured["extract_format"] == DetectedFileFormat.PDF
     assert captured["extract_encoding"] is None
-    assert captured["persist_kwargs"]["commit"] is False
+    assert "commit" not in captured["persist_kwargs"]
     assert captured["persist_kwargs"]["extractor_name"] == revision_extraction_service.EXTRACTOR_NAME
     assert captured["persist_kwargs"]["extractor_version"] == revision_extraction_service.EXTRACTOR_VERSION
     assert captured["persist_kwargs"]["failure_code"] is None
@@ -291,7 +295,11 @@ def test_partial_flows_to_awaiting_review(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
 
     result = run_async(
         revision_extraction_service.run_revision_extraction(
@@ -348,7 +356,11 @@ def test_needs_ocr_and_failed_enter_failed_and_keep_run(monkeypatch, outcome, ex
         )
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
 
     result = run_async(
         revision_extraction_service.run_revision_extraction(
@@ -408,7 +420,11 @@ def test_parsing_and_extracting_are_committed_separately(monkeypatch) -> None:
     session.flush = tracked_flush
     session.commit = tracked_commit
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
 
     run_async(
         revision_extraction_service.run_revision_extraction(
@@ -467,7 +483,11 @@ def test_extraction_happens_outside_database_transaction(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
 
     run_async(
         revision_extraction_service.run_revision_extraction(
@@ -496,7 +516,11 @@ def test_final_persistence_failure_rolls_back_and_leaves_extracting(monkeypatch)
         raise RuntimeError("persist failed")
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", failing_persist)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        failing_persist,
+    )
 
     with pytest.raises(RuntimeError):
         run_async(
@@ -547,7 +571,11 @@ def test_pass_and_warning_admission_consistency(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
     result = run_async(
         revision_extraction_service.run_revision_extraction(
             session,
@@ -677,7 +705,11 @@ def test_real_extraction_times_are_passed_to_run(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", fake_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
 
     run_async(
         revision_extraction_service.run_revision_extraction(
@@ -906,7 +938,11 @@ def test_service_log_does_not_leak_storage_key(monkeypatch, caplog) -> None:
         )
 
     monkeypatch.setattr(revision_extraction_service, "extract_document", broken_extract_document)
-    monkeypatch.setattr(revision_extraction_service, "persist_extraction_result", fake_persist_extraction_result)
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result,
+    )
 
     with caplog.at_level("WARNING"):
         result = run_async(
@@ -920,3 +956,309 @@ def test_service_log_does_not_leak_storage_key(monkeypatch, caplog) -> None:
 
     assert result.outcome == ExtractionOutcome.FAILED
     assert storage_key not in caplog.text
+
+
+def test_enter_parsing_phase_rolls_back_on_report_error(monkeypatch) -> None:
+    session = FakeSession()
+    revision = build_revision(status=DocumentRevisionStatus.ACCEPTED.value)
+
+    async def fake_get_revision_for_extraction_update(_session, *, project_id, revision_id):
+        return revision
+
+    async def fake_get_latest_validation_report_for_update(_session, *, revision_id):
+        return None
+
+    monkeypatch.setattr(
+        revision_extraction_service.revision_extraction_repository,
+        "get_revision_for_extraction_update",
+        fake_get_revision_for_extraction_update,
+    )
+    monkeypatch.setattr(
+        revision_extraction_service.revision_extraction_repository,
+        "get_latest_validation_report_for_update",
+        fake_get_latest_validation_report_for_update,
+    )
+
+    with pytest.raises(revision_extraction_service.RevisionExtractionAdmissionStateError):
+        run_async(
+            revision_extraction_service._enter_parsing_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=revision.id,
+            )
+        )
+
+    assert session.rollback_count == 1
+    assert session.commit_count == 0
+
+
+def test_enter_extracting_phase_cancelled_error_rolls_back(monkeypatch) -> None:
+    session = FakeSession()
+    revision = build_revision(status=DocumentRevisionStatus.PARSING.value)
+
+    async def fake_lock_revision_for_project(_session, *, project_id, revision_id):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "_lock_revision_for_project",
+        fake_lock_revision_for_project,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(
+            revision_extraction_service._enter_extracting_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=revision.id,
+            )
+        )
+
+    assert session.rollback_count == 1
+    assert session.commit_count == 0
+
+
+def test_finalize_phase_cancelled_error_rolls_back(monkeypatch) -> None:
+    session = FakeSession()
+    revision = build_revision(status=DocumentRevisionStatus.EXTRACTING.value)
+
+    async def fake_lock_revision_for_project(_session, *, project_id, revision_id):
+        return revision
+
+    async def fake_persist_extraction_result_in_transaction(_session, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "_lock_revision_for_project",
+        fake_lock_revision_for_project,
+    )
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result_in_transaction,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(
+            revision_extraction_service._finalize_extraction_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=revision.id,
+                extracted_document=build_extracted_document(outcome=ExtractionOutcome.SUCCESS),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+
+    assert session.rollback_count == 1
+    assert revision.status == DocumentRevisionStatus.EXTRACTING.value
+
+
+def test_finalize_phase_lock_revision_not_found_rolls_back_without_unbound_local(monkeypatch) -> None:
+    session = FakeSession()
+
+    async def fake_lock_revision_for_project(_session, *, project_id, revision_id):
+        raise revision_extraction_service.RevisionExtractionNotFoundError("missing revision")
+
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "_lock_revision_for_project",
+        fake_lock_revision_for_project,
+    )
+
+    with pytest.raises(revision_extraction_service.RevisionExtractionNotFoundError) as exc_info:
+        run_async(
+            revision_extraction_service._finalize_extraction_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=uuid.uuid4(),
+                extracted_document=build_extracted_document(outcome=ExtractionOutcome.SUCCESS),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+
+    assert "missing revision" in str(exc_info.value)
+    assert session.rollback_count == 1
+
+
+def test_finalize_phase_lock_revision_cancelled_rolls_back_without_unbound_local(monkeypatch) -> None:
+    session = FakeSession()
+
+    async def fake_lock_revision_for_project(_session, *, project_id, revision_id):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "_lock_revision_for_project",
+        fake_lock_revision_for_project,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(
+            revision_extraction_service._finalize_extraction_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=uuid.uuid4(),
+                extracted_document=build_extracted_document(outcome=ExtractionOutcome.SUCCESS),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+
+    assert session.rollback_count == 1
+
+
+def test_finalize_phase_transition_error_rolls_back_and_preserves_revision_status(monkeypatch) -> None:
+    session = FakeSession()
+    revision = build_revision(status=DocumentRevisionStatus.PARSING.value)
+
+    async def fake_lock_revision_for_project(_session, *, project_id, revision_id):
+        return revision
+
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "_lock_revision_for_project",
+        fake_lock_revision_for_project,
+    )
+
+    with pytest.raises(revision_extraction_service.RevisionExtractionTransitionError):
+        run_async(
+            revision_extraction_service._finalize_extraction_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=revision.id,
+                extracted_document=build_extracted_document(outcome=ExtractionOutcome.SUCCESS),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+
+    assert session.rollback_count == 1
+    assert revision.status == DocumentRevisionStatus.PARSING.value
+
+
+def test_finalize_phase_finalizer_failure_rolls_back_and_restores_extracting(monkeypatch) -> None:
+    session = FakeSession()
+    revision = build_revision(status=DocumentRevisionStatus.EXTRACTING.value)
+    extraction_run = ExtractionRun(
+        id=uuid.uuid4(),
+        revision_id=revision.id,
+        attempt_no=1,
+        status="completed",
+        outcome="success",
+        extractor_name="x",
+        extractor_version="y",
+        detected_format="pdf",
+        detected_encoding=None,
+        page_count=1,
+        character_count=5,
+        block_count=1,
+        warnings=[],
+        content_metadata={},
+        completed_at=datetime.now(timezone.utc),
+    )
+
+    async def fake_lock_revision_for_project(_session, *, project_id, revision_id):
+        return revision
+
+    async def fake_persist_extraction_result_in_transaction(_session, **kwargs):
+        return extraction_run
+
+    async def fake_finalizer(_session, _revision, _extraction_run):
+        raise RuntimeError("finalizer failed")
+
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "_lock_revision_for_project",
+        fake_lock_revision_for_project,
+    )
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result_in_transaction,
+    )
+
+    with pytest.raises(RuntimeError):
+        run_async(
+            revision_extraction_service._finalize_extraction_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=revision.id,
+                extracted_document=build_extracted_document(outcome=ExtractionOutcome.SUCCESS),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+                finalizer=fake_finalizer,
+            )
+        )
+
+    assert session.rollback_count == 1
+    assert revision.status == DocumentRevisionStatus.EXTRACTING.value
+
+
+def test_finalize_phase_commit_failure_rolls_back_and_restores_extracting(monkeypatch) -> None:
+    session = FakeSession()
+    revision = build_revision(status=DocumentRevisionStatus.EXTRACTING.value)
+    extraction_run = ExtractionRun(
+        id=uuid.uuid4(),
+        revision_id=revision.id,
+        attempt_no=1,
+        status="completed",
+        outcome="success",
+        extractor_name="x",
+        extractor_version="y",
+        detected_format="pdf",
+        detected_encoding=None,
+        page_count=1,
+        character_count=5,
+        block_count=1,
+        warnings=[],
+        content_metadata={},
+        completed_at=datetime.now(timezone.utc),
+    )
+
+    async def fake_lock_revision_for_project(_session, *, project_id, revision_id):
+        return revision
+
+    async def fake_persist_extraction_result_in_transaction(_session, **kwargs):
+        return extraction_run
+
+    async def failing_commit():
+        session.commit_count += 1
+        session.events.append("commit")
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "_lock_revision_for_project",
+        fake_lock_revision_for_project,
+    )
+    monkeypatch.setattr(
+        revision_extraction_service,
+        "persist_extraction_result_in_transaction",
+        fake_persist_extraction_result_in_transaction,
+    )
+    session.commit = failing_commit
+
+    with pytest.raises(RuntimeError):
+        run_async(
+            revision_extraction_service._finalize_extraction_phase(
+                session,
+                project_id=uuid.uuid4(),
+                revision_id=revision.id,
+                extracted_document=build_extracted_document(outcome=ExtractionOutcome.SUCCESS),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+
+    assert session.rollback_count == 1
+    assert revision.status == DocumentRevisionStatus.EXTRACTING.value
+
+
+def test_finalize_phase_source_uses_in_transaction_persistence() -> None:
+    source = inspect.getsource(revision_extraction_service)
+    assert "persist_extraction_result_in_transaction(" in source
+    assert "persist_extraction_result(" not in source
+    assert "commit=False" not in source

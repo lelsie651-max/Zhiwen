@@ -26,9 +26,18 @@ class ProcessingExtractionResultContext:
     run_revision_id: uuid.UUID | None
     run_status: str | None
     run_outcome: str | None
+    run_completed_at: datetime | None
     revision_status: str
     lease_token: uuid.UUID | None
     lease_expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessingJobIdentitySnapshot:
+    job_id: uuid.UUID
+    project_id: uuid.UUID
+    revision_id: uuid.UUID
+    job_type: str
 
 
 async def get_revision_for_processing_job_update(
@@ -203,6 +212,30 @@ async def get_processing_job_by_id(
     return result.scalar_one_or_none()
 
 
+async def get_processing_job_identity_snapshot(
+    session: AsyncSession,
+    *,
+    job_id: uuid.UUID,
+) -> ProcessingJobIdentitySnapshot | None:
+    result = await session.execute(
+        select(
+            ProcessingJob.id,
+            ProcessingJob.project_id,
+            ProcessingJob.revision_id,
+            ProcessingJob.job_type,
+        ).where(ProcessingJob.id == job_id)
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+    return ProcessingJobIdentitySnapshot(
+        job_id=row[0],
+        project_id=row[1],
+        revision_id=row[2],
+        job_type=row[3],
+    )
+
+
 async def get_processing_job_by_id_for_update(
     session: AsyncSession,
     *,
@@ -257,28 +290,10 @@ async def get_processing_extraction_result_context(
     job_id: uuid.UUID,
     for_update: bool = False,
 ) -> ProcessingExtractionResultContext | None:
-    statement = (
-        select(
-            ProcessingJob.id,
-            ProcessingJob.project_id,
-            ProcessingJob.status,
-            ProcessingJob.job_type,
-            ProcessingJob.revision_id,
-            ProcessingJob.result_extraction_run_id,
-            ExtractionRun.revision_id,
-            ExtractionRun.status,
-            ExtractionRun.outcome,
-            DocumentRevision.status,
-            ProcessingJob.lease_token,
-            ProcessingJob.lease_expires_at,
-        )
-        .join(DocumentRevision, DocumentRevision.id == ProcessingJob.revision_id)
-        .outerjoin(ExtractionRun, ExtractionRun.id == ProcessingJob.result_extraction_run_id)
-        .where(ProcessingJob.id == job_id)
+    statement = _build_processing_extraction_result_context_statement(
+        job_id=job_id,
+        for_update=for_update,
     )
-    if for_update:
-        statement = statement.with_for_update()
-
     result = await session.execute(statement)
     row = result.one_or_none()
     if row is None:
@@ -294,22 +309,59 @@ async def get_processing_extraction_result_context(
         run_revision_id=row[6],
         run_status=row[7],
         run_outcome=row[8],
-        revision_status=row[9],
-        lease_token=row[10],
-        lease_expires_at=row[11],
+        run_completed_at=row[9],
+        revision_status=row[10],
+        lease_token=row[11],
+        lease_expires_at=row[12],
     )
 
 
-async def revision_has_terminal_extraction_run(
+def _build_processing_extraction_result_context_statement(
+    *,
+    job_id: uuid.UUID,
+    for_update: bool,
+):
+    statement = (
+        select(
+            ProcessingJob.id,
+            ProcessingJob.project_id,
+            ProcessingJob.status,
+            ProcessingJob.job_type,
+            ProcessingJob.revision_id,
+            ProcessingJob.result_extraction_run_id,
+            ExtractionRun.revision_id,
+            ExtractionRun.status,
+            ExtractionRun.outcome,
+            ExtractionRun.completed_at,
+            DocumentRevision.status,
+            ProcessingJob.lease_token,
+            ProcessingJob.lease_expires_at,
+        )
+        .join(DocumentRevision, DocumentRevision.id == ProcessingJob.revision_id)
+        .outerjoin(ExtractionRun, ExtractionRun.id == ProcessingJob.result_extraction_run_id)
+        .where(ProcessingJob.id == job_id)
+    )
+    if for_update:
+        statement = statement.with_for_update(of=ProcessingJob)
+    return statement
+
+
+async def revision_has_unlinked_terminal_extraction_run(
     session: AsyncSession,
     *,
     revision_id: uuid.UUID,
 ) -> bool:
+    linked_job_exists = exists(
+        select(1)
+        .select_from(ProcessingJob)
+        .where(ProcessingJob.result_extraction_run_id == ExtractionRun.id)
+    )
     result = await session.execute(
         select(
             exists().where(
                 ExtractionRun.revision_id == revision_id,
                 ExtractionRun.status.in_(("completed", "failed")),
+                ~linked_job_exists,
             )
         )
     )

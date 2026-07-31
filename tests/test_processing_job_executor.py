@@ -699,4 +699,5 @@ def test_executor_source_keeps_10b_transaction_boundary_and_safe_calls() -> None
     source = inspect.getsource(processing_job_executor_service)
     assert "run_revision_extraction(" in source
     assert "persist_extraction_result(" not in source
+    assert "complete_processing_job(" not in source
     assert "extract_document(" not in source

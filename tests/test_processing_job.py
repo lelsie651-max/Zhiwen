@@ -18,6 +18,7 @@ from app.models.processing_job import ProcessingJob, ProcessingJobStatus, Proces
 from app.models.project import Project
 from app.models.project_member import ProjectMember
 from app.models.user import User
+from app.repositories import processing_job as processing_job_repository
 from app.schemas.processing_job import ProcessingJobRead
 from app.services import processing_job as processing_job_service
 
@@ -185,6 +186,47 @@ def build_processing_job(
         created_at=now,
         updated_at=now,
     )
+
+
+def build_processing_job_identity_snapshot(*, job: ProcessingJob):
+    return processing_job_repository.ProcessingJobIdentitySnapshot(
+        job_id=job.id,
+        project_id=job.project_id,
+        revision_id=job.revision_id,
+        job_type=job.job_type,
+    )
+
+
+def build_result_context(
+    *,
+    project_id: uuid.UUID,
+    job: ProcessingJob,
+    revision: DocumentRevision,
+    result_run_id: uuid.UUID | None,
+    run_revision_id: uuid.UUID | None,
+    run_status: str | None,
+    run_outcome: str | None,
+    run_completed_at: datetime | None = None,
+):
+    return type(
+        "ResultContext",
+        (),
+        {
+            "job_id": job.id,
+            "project_id": project_id,
+            "job_status": job.status,
+            "job_type": job.job_type,
+            "job_revision_id": revision.id,
+            "result_run_id": result_run_id,
+            "run_revision_id": run_revision_id,
+            "run_status": run_status,
+            "run_outcome": run_outcome,
+            "run_completed_at": run_completed_at,
+            "revision_status": revision.status,
+            "lease_token": job.lease_token,
+            "lease_expires_at": job.lease_expires_at,
+        },
+    )()
 
 
 def test_processing_job_partial_unique_active_index_exists() -> None:
@@ -408,7 +450,7 @@ def test_duplicate_enqueue_returns_existing_active_job(monkeypatch) -> None:
     )
 
     assert result is existing_job
-    assert session.commit_count == 0
+    assert session.commit_count == 1
 
 
 def test_attempt_no_increments_inside_lock_order(monkeypatch) -> None:
@@ -606,26 +648,17 @@ def test_expired_running_job_can_be_recovered(monkeypatch) -> None:
 
     async def fake_get_processing_extraction_result_context(_session, *, job_id, for_update=False):
         assert job_id == expired_job.id
-        return type(
-            "ResultContext",
-            (),
-            {
-                "job_id": expired_job.id,
-                "project_id": project.id,
-                "job_status": expired_job.status,
-                "job_type": expired_job.job_type,
-                "job_revision_id": revision.id,
-                "result_run_id": None,
-                "run_revision_id": None,
-                "run_status": None,
-                "run_outcome": None,
-                "revision_status": revision.status,
-                "lease_token": expired_job.lease_token,
-                "lease_expires_at": expired_job.lease_expires_at,
-            },
-        )()
+        return build_result_context(
+            project_id=project.id,
+            job=expired_job,
+            revision=revision,
+            result_run_id=None,
+            run_revision_id=None,
+            run_status=None,
+            run_outcome=None,
+        )
 
-    async def fake_revision_has_terminal_extraction_run(_session, *, revision_id):
+    async def fake_revision_has_unlinked_terminal_extraction_run(_session, *, revision_id):
         assert revision_id == revision.id
         return False
 
@@ -657,8 +690,8 @@ def test_expired_running_job_can_be_recovered(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         processing_job_service.processing_job_repository,
-        "revision_has_terminal_extraction_run",
-        fake_revision_has_terminal_extraction_run,
+        "revision_has_unlinked_terminal_extraction_run",
+        fake_revision_has_unlinked_terminal_extraction_run,
     )
 
     result = run_async(
@@ -703,7 +736,7 @@ def test_stale_parsing_or_extracting_without_job_can_be_recovered(monkeypatch) -
     async def fake_create_processing_job(_session, *, job):
         return job
 
-    async def fake_revision_has_terminal_extraction_run(_session, *, revision_id):
+    async def fake_revision_has_unlinked_terminal_extraction_run(_session, *, revision_id):
         assert revision_id == revision.id
         return False
 
@@ -730,8 +763,8 @@ def test_stale_parsing_or_extracting_without_job_can_be_recovered(monkeypatch) -
     )
     monkeypatch.setattr(
         processing_job_service.processing_job_repository,
-        "revision_has_terminal_extraction_run",
-        fake_revision_has_terminal_extraction_run,
+        "revision_has_unlinked_terminal_extraction_run",
+        fake_revision_has_unlinked_terminal_extraction_run,
     )
 
     result = run_async(
@@ -868,6 +901,7 @@ def test_claim_complete_and_fail_state_machine(monkeypatch) -> None:
     assert claimed.lease_expires_at is not None
 
     running_job = claimed
+    revision.status = DocumentRevisionStatus.FAILED.value
     extraction_run = build_extraction_run(revision_id=revision.id, outcome="failed")
     session = FakeSession()
 
@@ -882,6 +916,16 @@ def test_claim_complete_and_fail_state_machine(monkeypatch) -> None:
         processing_job_service.processing_job_repository,
         "get_processing_job_for_update",
         fake_get_processing_job_for_update_complete,
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_identity_snapshot",
+        async_return(build_processing_job_identity_snapshot(job=running_job)),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(revision),
     )
     monkeypatch.setattr(
         processing_job_service.processing_job_repository,
@@ -993,6 +1037,16 @@ def test_cross_revision_result_run_is_rejected(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         processing_job_service.processing_job_repository,
+        "get_processing_job_identity_snapshot",
+        async_return(build_processing_job_identity_snapshot(job=running_job)),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(job_revision),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
         "get_extraction_run_by_id_for_update",
         async_return(other_run),
     )
@@ -1012,7 +1066,7 @@ def test_cross_revision_result_run_is_rejected(monkeypatch) -> None:
 def test_complete_processing_job_is_idempotent_for_same_run(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
-    revision = build_revision()
+    revision = build_revision(status=DocumentRevisionStatus.AWAITING_REVIEW.value)
     extraction_run = build_extraction_run(revision_id=revision.id, outcome="success")
     completed_job = build_processing_job(
         project_id=project.id,
@@ -1026,6 +1080,16 @@ def test_complete_processing_job_is_idempotent_for_same_run(monkeypatch) -> None
         processing_job_service.processing_job_repository,
         "get_processing_job_for_update",
         async_return(completed_job),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_identity_snapshot",
+        async_return(build_processing_job_identity_snapshot(job=completed_job)),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(revision),
     )
     monkeypatch.setattr(
         processing_job_service.processing_job_repository,
@@ -1071,6 +1135,16 @@ def test_complete_processing_job_rejects_existing_other_run(monkeypatch) -> None
     )
     monkeypatch.setattr(
         processing_job_service.processing_job_repository,
+        "get_processing_job_identity_snapshot",
+        async_return(build_processing_job_identity_snapshot(job=running_job)),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(revision),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
         "get_extraction_run_by_id_for_update",
         async_return(other_run),
     )
@@ -1103,7 +1177,6 @@ def test_recovery_repairs_running_job_with_linked_terminal_result(monkeypatch) -
         lease_token=uuid.uuid4(),
         lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
         started_at=datetime.now(timezone.utc) - timedelta(minutes=2),
-        result_extraction_run_id=linked_run.id,
     )
 
     patch_actor_and_member(monkeypatch, actor=actor, membership=membership)
@@ -1121,24 +1194,16 @@ def test_recovery_repairs_running_job_with_linked_terminal_result(monkeypatch) -
         processing_job_service.processing_job_repository,
         "get_processing_extraction_result_context",
         async_return(
-            type(
-                "ResultContext",
-                (),
-                {
-                    "job_id": stale_job.id,
-                    "project_id": project.id,
-                    "job_status": stale_job.status,
-                    "job_type": stale_job.job_type,
-                    "job_revision_id": revision.id,
-                    "result_run_id": linked_run.id,
-                    "run_revision_id": revision.id,
-                    "run_status": linked_run.status,
-                    "run_outcome": linked_run.outcome,
-                    "revision_status": revision.status,
-                    "lease_token": stale_job.lease_token,
-                    "lease_expires_at": stale_job.lease_expires_at,
-                },
-            )()
+            build_result_context(
+                project_id=project.id,
+                job=stale_job,
+                revision=revision,
+                result_run_id=linked_run.id,
+                run_revision_id=revision.id,
+                run_status=linked_run.status,
+                run_outcome=linked_run.outcome,
+                run_completed_at=linked_run.completed_at,
+            )
         ),
     )
 
@@ -1174,7 +1239,6 @@ def test_recovery_rejects_linked_result_state_mismatch(monkeypatch) -> None:
         lease_token=uuid.uuid4(),
         lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
         started_at=datetime.now(timezone.utc) - timedelta(minutes=2),
-        result_extraction_run_id=linked_run.id,
     )
 
     patch_actor_and_member(monkeypatch, actor=actor, membership=membership)
@@ -1192,24 +1256,16 @@ def test_recovery_rejects_linked_result_state_mismatch(monkeypatch) -> None:
         processing_job_service.processing_job_repository,
         "get_processing_extraction_result_context",
         async_return(
-            type(
-                "ResultContext",
-                (),
-                {
-                    "job_id": stale_job.id,
-                    "project_id": project.id,
-                    "job_status": stale_job.status,
-                    "job_type": stale_job.job_type,
-                    "job_revision_id": revision.id,
-                    "result_run_id": linked_run.id,
-                    "run_revision_id": revision.id,
-                    "run_status": linked_run.status,
-                    "run_outcome": linked_run.outcome,
-                    "revision_status": revision.status,
-                    "lease_token": stale_job.lease_token,
-                    "lease_expires_at": stale_job.lease_expires_at,
-                },
-            )()
+            build_result_context(
+                project_id=project.id,
+                job=stale_job,
+                revision=revision,
+                result_run_id=linked_run.id,
+                run_revision_id=revision.id,
+                run_status=linked_run.status,
+                run_outcome=linked_run.outcome,
+                run_completed_at=linked_run.completed_at,
+            )
         ),
     )
 
@@ -1258,29 +1314,138 @@ def test_recovery_marks_orphaned_terminal_result_without_rebinding(monkeypatch) 
         processing_job_service.processing_job_repository,
         "get_processing_extraction_result_context",
         async_return(
-            type(
-                "ResultContext",
-                (),
-                {
-                    "job_id": stale_job.id,
-                    "project_id": project.id,
-                    "job_status": stale_job.status,
-                    "job_type": stale_job.job_type,
-                    "job_revision_id": revision.id,
-                    "result_run_id": None,
-                    "run_revision_id": None,
-                    "run_status": None,
-                    "run_outcome": None,
-                    "revision_status": revision.status,
-                    "lease_token": stale_job.lease_token,
-                    "lease_expires_at": stale_job.lease_expires_at,
-                },
-            )()
+            build_result_context(
+                project_id=project.id,
+                job=stale_job,
+                revision=revision,
+                result_run_id=None,
+                run_revision_id=None,
+                run_status=None,
+                run_outcome=None,
+            )
         ),
     )
     monkeypatch.setattr(
         processing_job_service.processing_job_repository,
-        "revision_has_terminal_extraction_run",
+        "revision_has_unlinked_terminal_extraction_run",
+        async_return(True),
+    )
+    result = run_async(
+        processing_job_service.recover_stale_revision_extraction(
+            session,
+            project_id=project.id,
+            revision_id=revision.id,
+            actor_id=actor.id,
+            stale_before=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+
+    assert result is stale_job
+    assert stale_job.status == ProcessingJobStatus.FAILED.value
+    assert stale_job.result_extraction_run_id is None
+    assert stale_job.failure_code == processing_job_service.ORPHANED_EXTRACTION_RESULT_FAILURE_CODE
+    assert session.commit_count == 1
+
+
+def test_recovery_ignores_terminal_run_already_linked_to_old_job(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    membership = build_project_member(project_id=project.id, user_id=actor.id, role="owner")
+    revision = build_revision(status=DocumentRevisionStatus.FAILED.value)
+    stale_job = build_processing_job(
+        project_id=project.id,
+        revision_id=revision.id,
+        status=ProcessingJobStatus.RUNNING.value,
+        trigger_kind=ProcessingTriggerKind.RETRY.value,
+        lease_token=uuid.uuid4(),
+        lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+
+    patch_actor_and_member(monkeypatch, actor=actor, membership=membership)
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(revision),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_active_processing_job_for_update",
+        async_return(stale_job),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_extraction_result_context",
+        async_return(
+            build_result_context(
+                project_id=project.id,
+                job=stale_job,
+                revision=revision,
+                result_run_id=None,
+                run_revision_id=None,
+                run_status=None,
+                run_outcome=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "revision_has_unlinked_terminal_extraction_run",
+        async_return(False),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_next_processing_job_attempt_no",
+        async_return(2),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "create_processing_job",
+        async_return_job,
+    )
+
+    result = run_async(
+        processing_job_service.recover_stale_revision_extraction(
+            session,
+            project_id=project.id,
+            revision_id=revision.id,
+            actor_id=actor.id,
+            stale_before=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+
+    assert stale_job.status == ProcessingJobStatus.FAILED.value
+    assert stale_job.failure_code == processing_job_service.LEASE_EXPIRED_FAILURE_CODE
+    assert result.status == ProcessingJobStatus.QUEUED.value
+    assert result.trigger_kind == ProcessingTriggerKind.RECOVERY.value
+    assert session.commit_count == 1
+
+
+def test_recovery_without_active_job_rejects_unlinked_terminal_run(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    membership = build_project_member(project_id=project.id, user_id=actor.id, role="owner")
+    revision = build_revision(
+        status=DocumentRevisionStatus.ACCEPTED.value,
+        updated_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+
+    patch_actor_and_member(monkeypatch, actor=actor, membership=membership)
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(revision),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_active_processing_job_for_update",
+        async_return(None),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "revision_has_unlinked_terminal_extraction_run",
         async_return(True),
     )
 
@@ -1291,15 +1456,257 @@ def test_recovery_marks_orphaned_terminal_result_without_rebinding(monkeypatch) 
                 project_id=project.id,
                 revision_id=revision.id,
                 actor_id=actor.id,
-                stale_before=datetime.now(timezone.utc) - timedelta(minutes=5),
+                stale_before=datetime.now(timezone.utc) - timedelta(minutes=30),
             )
         )
 
     assert str(exc_info.value) == processing_job_service.ORPHANED_EXTRACTION_RESULT_FAILURE_CODE
-    assert stale_job.status == ProcessingJobStatus.FAILED.value
-    assert stale_job.result_extraction_run_id is None
-    assert stale_job.failure_code == processing_job_service.ORPHANED_EXTRACTION_RESULT_FAILURE_CODE
-    assert session.commit_count == 1
+    assert session.rollback_count == 1
+
+
+def test_complete_processing_job_rejects_running_extraction_run(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    revision = build_revision(status=DocumentRevisionStatus.AWAITING_REVIEW.value)
+    running_job = build_processing_job(
+        project_id=project.id,
+        revision_id=revision.id,
+        status=ProcessingJobStatus.RUNNING.value,
+        lease_token=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    extraction_run = build_extraction_run(revision_id=revision.id, outcome="success")
+    extraction_run.status = "running"
+    extraction_run.completed_at = None
+
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_identity_snapshot",
+        async_return(build_processing_job_identity_snapshot(job=running_job)),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(revision),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_for_update",
+        async_return(running_job),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_extraction_run_by_id_for_update",
+        async_return(extraction_run),
+    )
+
+    with pytest.raises(processing_job_service.ProcessingJobStateError) as exc_info:
+        run_async(
+            processing_job_service.complete_processing_job(
+                session,
+                project_id=project.id,
+                job_id=running_job.id,
+                lease_token=running_job.lease_token,
+                extraction_run_id=extraction_run.id,
+            )
+        )
+
+    assert str(exc_info.value) == processing_job_service.PROCESSING_RESULT_STATE_MISMATCH_CODE
+    assert session.rollback_count == 1
+
+
+def test_complete_processing_job_rejects_run_outcome_status_mismatch(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    revision = build_revision(status=DocumentRevisionStatus.FAILED.value)
+    running_job = build_processing_job(
+        project_id=project.id,
+        revision_id=revision.id,
+        status=ProcessingJobStatus.RUNNING.value,
+        lease_token=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    extraction_run = build_extraction_run(revision_id=revision.id, outcome="failed")
+    extraction_run.status = "completed"
+
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_identity_snapshot",
+        async_return(build_processing_job_identity_snapshot(job=running_job)),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        async_return(revision),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_for_update",
+        async_return(running_job),
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_extraction_run_by_id_for_update",
+        async_return(extraction_run),
+    )
+
+    with pytest.raises(processing_job_service.ProcessingJobStateError) as exc_info:
+        run_async(
+            processing_job_service.complete_processing_job(
+                session,
+                project_id=project.id,
+                job_id=running_job.id,
+                lease_token=running_job.lease_token,
+                extraction_run_id=extraction_run.id,
+            )
+        )
+
+    assert str(exc_info.value) == processing_job_service.PROCESSING_RESULT_STATE_MISMATCH_CODE
+
+
+def test_complete_processing_job_locks_revision_before_job_before_run(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    revision = build_revision(status=DocumentRevisionStatus.AWAITING_REVIEW.value)
+    running_job = build_processing_job(
+        project_id=project.id,
+        revision_id=revision.id,
+        status=ProcessingJobStatus.RUNNING.value,
+        lease_token=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    extraction_run = build_extraction_run(revision_id=revision.id, outcome="success")
+    call_order: list[str] = []
+
+    async def fake_get_processing_job_identity_snapshot(_session, *, job_id):
+        call_order.append("snapshot")
+        assert job_id == running_job.id
+        return build_processing_job_identity_snapshot(job=running_job)
+
+    async def fake_get_revision_for_processing_job_update(_session, *, project_id, revision_id):
+        call_order.append("revision")
+        assert project_id == project.id
+        assert revision_id == revision.id
+        return revision
+
+    async def fake_get_processing_job_for_update(_session, *, project_id, job_id):
+        call_order.append("job")
+        assert project_id == project.id
+        assert job_id == running_job.id
+        return running_job
+
+    async def fake_get_extraction_run_by_id_for_update(_session, *, extraction_run_id):
+        call_order.append("run")
+        assert extraction_run_id == extraction_run.id
+        return extraction_run
+
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_identity_snapshot",
+        fake_get_processing_job_identity_snapshot,
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_revision_for_processing_job_update",
+        fake_get_revision_for_processing_job_update,
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_for_update",
+        fake_get_processing_job_for_update,
+    )
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_extraction_run_by_id_for_update",
+        fake_get_extraction_run_by_id_for_update,
+    )
+
+    result = run_async(
+        processing_job_service.complete_processing_job(
+            session,
+            project_id=project.id,
+            job_id=running_job.id,
+            lease_token=running_job.lease_token,
+            extraction_run_id=extraction_run.id,
+        )
+    )
+
+    assert result.status == ProcessingJobStatus.COMPLETED.value
+    assert call_order == ["snapshot", "revision", "job", "run"]
+
+
+def test_processing_extraction_result_context_for_update_locks_only_processing_jobs() -> None:
+    statement = processing_job_repository._build_processing_extraction_result_context_statement(
+        job_id=uuid.uuid4(),
+        for_update=True,
+    )
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "FOR UPDATE OF processing_jobs" in sql
+    assert "FOR UPDATE OF extraction_runs" not in sql
+
+
+def test_claim_state_error_rolls_back(monkeypatch) -> None:
+    session = FakeSession()
+    job = build_processing_job(
+        project_id=uuid.uuid4(),
+        revision_id=uuid.uuid4(),
+        status=ProcessingJobStatus.RUNNING.value,
+        lease_token=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_for_update",
+        async_return(job),
+    )
+
+    with pytest.raises(processing_job_service.ProcessingJobStateError):
+        run_async(
+            processing_job_service.claim_processing_job(
+                session,
+                project_id=job.project_id,
+                job_id=job.id,
+                lease_seconds=30,
+            )
+        )
+
+    assert session.rollback_count == 1
+
+
+def test_renew_processing_job_lease_rolls_back_on_wrong_token(monkeypatch) -> None:
+    session = FakeSession()
+    job = build_processing_job(
+        project_id=uuid.uuid4(),
+        revision_id=uuid.uuid4(),
+        status=ProcessingJobStatus.RUNNING.value,
+        lease_token=uuid.uuid4(),
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+
+    monkeypatch.setattr(
+        processing_job_service.processing_job_repository,
+        "get_processing_job_by_id_for_update",
+        async_return(job),
+    )
+
+    with pytest.raises(processing_job_service.ProcessingJobLeaseError):
+        run_async(
+            processing_job_service.renew_processing_job_lease(
+                session,
+                job_id=job.id,
+                lease_token=uuid.uuid4(),
+                lease_seconds=60,
+            )
+        )
+
+    assert session.rollback_count == 1
 
 
 def test_transaction_failures_roll_back(monkeypatch) -> None:

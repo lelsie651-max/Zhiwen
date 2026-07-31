@@ -188,12 +188,13 @@ async def _run_revision_extraction(
             project_id=project_id,
             revision_id=revision_id,
             storage=storage,
-            finalizer=lambda finalize_session, _revision, extraction_run: complete_processing_job_in_transaction(
+            finalizer=lambda finalize_session, locked_revision, extraction_run: complete_processing_job_in_transaction(
                 finalize_session,
                 project_id=project_id,
                 job_id=job_id,
                 lease_token=lease_token,
                 extraction_run_id=extraction_run.id,
+                locked_revision=locked_revision,
             ),
         )
 

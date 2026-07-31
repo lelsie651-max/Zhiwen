@@ -821,3 +821,73 @@ def test_create_source_evidence_reraises_non_duplicate_integrity_error(monkeypat
     assert exc_info.value is original_error
     assert session.rollback_called is True
     assert session.commit_called is False
+
+
+def test_persist_extraction_result_in_transaction_does_not_commit(monkeypatch) -> None:
+    session = FakeSession()
+    revision = DocumentRevision(
+        id=uuid.uuid4(),
+        document_id=uuid.uuid4(),
+        revision_no=1,
+        upload_intent="new_document",
+        supersedes_revision_id=None,
+        original_filename="notes.md",
+        storage_key="files/aa/a.bin",
+        mime_type="text/markdown",
+        file_size_bytes=10,
+        sha256="a" * 64,
+        source_authority="pending",
+        status="uploaded",
+        uploaded_by_id=uuid.uuid4(),
+        uploaded_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    async def fake_get_revision_for_extraction_update(_session, _revision_id):
+        return revision
+
+    async def fake_get_next_extraction_attempt_no(_session, _revision_id):
+        return 4
+
+    async def fake_create_extraction_run(_session, extraction_run):
+        return extraction_run
+
+    async def fake_create_document_blocks(_session, blocks):
+        return blocks
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_revision_for_extraction_update",
+        fake_get_revision_for_extraction_update,
+    )
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_next_extraction_attempt_no",
+        fake_get_next_extraction_attempt_no,
+    )
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "create_extraction_run",
+        fake_create_extraction_run,
+    )
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "create_document_blocks",
+        fake_create_document_blocks,
+    )
+
+    result = run_async(
+        document_content_service.persist_extraction_result_in_transaction(
+            session,
+            revision_id=revision.id,
+            extracted_document=build_extracted_document(
+                build_extracted_block(source_order=0, raw_text="alpha")
+            ),
+            extractor_name="deterministic-extractor",
+            extractor_version="1.0.0",
+        )
+    )
+
+    assert result.attempt_no == 4
+    assert session.commit_called is False
+    assert session.rollback_called is False

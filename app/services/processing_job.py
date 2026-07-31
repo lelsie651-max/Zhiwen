@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import uuid
+from types import SimpleNamespace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,36 +55,37 @@ async def enqueue_revision_extraction_job(
     actor_id: uuid.UUID | None = None,
 ) -> ProcessingJob:
     normalized_trigger_kind = ProcessingTriggerKind(trigger_kind)
-    revision = await _lock_revision_for_project(
-        session,
-        project_id=project_id,
-        revision_id=revision_id,
-    )
-    if revision.status != DocumentRevisionStatus.ACCEPTED.value:
-        raise ProcessingJobStateError("Only accepted revisions can be queued for extraction.")
-
-    active_job = await processing_job_repository.get_active_processing_job_for_update(
-        session,
-        revision_id=revision.id,
-        job_type=ProcessingJobType.REVISION_EXTRACTION.value,
-    )
-    if active_job is not None:
-        return active_job
-
-    requested_by_id = await _resolve_enqueue_requester(
-        session,
-        project_id=project_id,
-        trigger_kind=normalized_trigger_kind,
-        actor_id=actor_id,
-    )
-    job = await _create_queued_job(
-        session,
-        project_id=project_id,
-        revision_id=revision.id,
-        trigger_kind=normalized_trigger_kind,
-        requested_by_id=requested_by_id,
-    )
     try:
+        revision = await _lock_revision_for_project(
+            session,
+            project_id=project_id,
+            revision_id=revision_id,
+        )
+        if revision.status != DocumentRevisionStatus.ACCEPTED.value:
+            raise ProcessingJobStateError("Only accepted revisions can be queued for extraction.")
+
+        active_job = await processing_job_repository.get_active_processing_job_for_update(
+            session,
+            revision_id=revision.id,
+            job_type=ProcessingJobType.REVISION_EXTRACTION.value,
+        )
+        if active_job is not None:
+            await session.commit()
+            return active_job
+
+        requested_by_id = await _resolve_enqueue_requester(
+            session,
+            project_id=project_id,
+            trigger_kind=normalized_trigger_kind,
+            actor_id=actor_id,
+        )
+        job = await _create_queued_job(
+            session,
+            project_id=project_id,
+            revision_id=revision.id,
+            trigger_kind=normalized_trigger_kind,
+            requested_by_id=requested_by_id,
+        )
         await session.commit()
     except BaseException:
         await session.rollback()
@@ -98,55 +100,55 @@ async def retry_failed_revision_extraction(
     revision_id: uuid.UUID,
     actor_id: uuid.UUID,
 ) -> ProcessingJob:
-    actor = await _require_active_owner_or_editor(
-        session,
-        project_id=project_id,
-        actor_id=actor_id,
-    )
-    revision = await _lock_revision_for_project(
-        session,
-        project_id=project_id,
-        revision_id=revision_id,
-    )
-    if revision.status != DocumentRevisionStatus.FAILED.value:
-        raise ProcessingJobStateError("Only failed revisions can be retried.")
-
-    active_job = await processing_job_repository.get_active_processing_job_for_update(
-        session,
-        revision_id=revision.id,
-        job_type=ProcessingJobType.REVISION_EXTRACTION.value,
-    )
-    if active_job is not None:
-        raise ProcessingJobStateError("Active extraction jobs block retry.")
-
-    latest_run = await processing_job_repository.get_latest_extraction_run_for_revision(
-        session,
-        revision_id=revision.id,
-    )
-    latest_failed_job = await processing_job_repository.get_latest_failed_processing_job(
-        session,
-        revision_id=revision.id,
-        job_type=ProcessingJobType.REVISION_EXTRACTION.value,
-    )
-    has_retryable_run = latest_run is not None and latest_run.outcome in {
-        ExtractionRunOutcome.FAILED.value,
-        ExtractionRunOutcome.NEEDS_OCR.value,
-    }
-    has_retryable_job = (
-        latest_failed_job is not None and latest_failed_job.result_extraction_run_id is None
-    )
-    if not (has_retryable_run or has_retryable_job):
-        raise ProcessingJobStateError("Retry requires a failed extraction run or failed processing job.")
-
-    revision.status = DocumentRevisionStatus.ACCEPTED.value
-    job = await _create_queued_job(
-        session,
-        project_id=project_id,
-        revision_id=revision.id,
-        trigger_kind=ProcessingTriggerKind.RETRY,
-        requested_by_id=actor.id,
-    )
     try:
+        actor = await _require_active_owner_or_editor(
+            session,
+            project_id=project_id,
+            actor_id=actor_id,
+        )
+        revision = await _lock_revision_for_project(
+            session,
+            project_id=project_id,
+            revision_id=revision_id,
+        )
+        if revision.status != DocumentRevisionStatus.FAILED.value:
+            raise ProcessingJobStateError("Only failed revisions can be retried.")
+
+        active_job = await processing_job_repository.get_active_processing_job_for_update(
+            session,
+            revision_id=revision.id,
+            job_type=ProcessingJobType.REVISION_EXTRACTION.value,
+        )
+        if active_job is not None:
+            raise ProcessingJobStateError("Active extraction jobs block retry.")
+
+        latest_run = await processing_job_repository.get_latest_extraction_run_for_revision(
+            session,
+            revision_id=revision.id,
+        )
+        latest_failed_job = await processing_job_repository.get_latest_failed_processing_job(
+            session,
+            revision_id=revision.id,
+            job_type=ProcessingJobType.REVISION_EXTRACTION.value,
+        )
+        has_retryable_run = latest_run is not None and latest_run.outcome in {
+            ExtractionRunOutcome.FAILED.value,
+            ExtractionRunOutcome.NEEDS_OCR.value,
+        }
+        has_retryable_job = (
+            latest_failed_job is not None and latest_failed_job.result_extraction_run_id is None
+        )
+        if not (has_retryable_run or has_retryable_job):
+            raise ProcessingJobStateError("Retry requires a failed extraction run or failed processing job.")
+
+        revision.status = DocumentRevisionStatus.ACCEPTED.value
+        job = await _create_queued_job(
+            session,
+            project_id=project_id,
+            revision_id=revision.id,
+            trigger_kind=ProcessingTriggerKind.RETRY,
+            requested_by_id=actor.id,
+        )
         await session.flush()
         await session.commit()
     except BaseException:
@@ -163,23 +165,23 @@ async def recover_stale_revision_extraction(
     actor_id: uuid.UUID,
     stale_before: datetime,
 ) -> ProcessingJob:
-    actor = await _require_active_owner_or_editor(
-        session,
-        project_id=project_id,
-        actor_id=actor_id,
-    )
-    revision = await _lock_revision_for_project(
-        session,
-        project_id=project_id,
-        revision_id=revision_id,
-    )
-    now = datetime.now(timezone.utc)
-    active_job = await processing_job_repository.get_active_processing_job_for_update(
-        session,
-        revision_id=revision.id,
-        job_type=ProcessingJobType.REVISION_EXTRACTION.value,
-    )
     try:
+        actor = await _require_active_owner_or_editor(
+            session,
+            project_id=project_id,
+            actor_id=actor_id,
+        )
+        revision = await _lock_revision_for_project(
+            session,
+            project_id=project_id,
+            revision_id=revision_id,
+        )
+        now = datetime.now(timezone.utc)
+        active_job = await processing_job_repository.get_active_processing_job_for_update(
+            session,
+            revision_id=revision.id,
+            job_type=ProcessingJobType.REVISION_EXTRACTION.value,
+        )
         if active_job is not None:
             if active_job.status != ProcessingJobStatus.RUNNING.value:
                 raise ProcessingJobStateError("Queued extraction jobs cannot be recovered as stale.")
@@ -197,6 +199,7 @@ async def recover_stale_revision_extraction(
                 _validate_result_context_consistency(result_context)
                 active_job.status = ProcessingJobStatus.COMPLETED.value
                 active_job.completed_at = now
+                active_job.result_extraction_run_id = result_context.result_run_id
                 active_job.lease_token = None
                 active_job.lease_expires_at = None
                 active_job.failure_code = None
@@ -205,11 +208,11 @@ async def recover_stale_revision_extraction(
                 await session.commit()
                 return active_job
 
-            has_terminal_run = await processing_job_repository.revision_has_terminal_extraction_run(
+            has_unlinked_terminal_run = await processing_job_repository.revision_has_unlinked_terminal_extraction_run(
                 session,
                 revision_id=revision.id,
             )
-            if _revision_has_orphaned_result(revision_status=revision.status, has_terminal_run=has_terminal_run):
+            if has_unlinked_terminal_run:
                 _mark_job_failed(
                     active_job,
                     now=now,
@@ -218,7 +221,7 @@ async def recover_stale_revision_extraction(
                 )
                 await session.flush()
                 await session.commit()
-                raise ProcessingJobStateError(ORPHANED_EXTRACTION_RESULT_FAILURE_CODE)
+                return active_job
 
             _mark_job_failed(
                 active_job,
@@ -252,11 +255,11 @@ async def recover_stale_revision_extraction(
         if revision.updated_at > stale_before:
             raise ProcessingJobStateError("Revision is not stale enough to recover.")
 
-        has_terminal_run = await processing_job_repository.revision_has_terminal_extraction_run(
+        has_unlinked_terminal_run = await processing_job_repository.revision_has_unlinked_terminal_extraction_run(
             session,
             revision_id=revision.id,
         )
-        if _revision_has_orphaned_result(revision_status=revision.status, has_terminal_run=has_terminal_run):
+        if has_unlinked_terminal_run:
             raise ProcessingJobStateError(ORPHANED_EXTRACTION_RESULT_FAILURE_CODE)
 
         if revision.status in {
@@ -290,20 +293,20 @@ async def claim_processing_job(
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be greater than 0.")
 
-    job = await _lock_processing_job_for_project(
-        session,
-        project_id=project_id,
-        job_id=job_id,
-    )
-    if job.status != ProcessingJobStatus.QUEUED.value:
-        raise ProcessingJobStateError("Only queued jobs can be claimed.")
-
-    now = datetime.now(timezone.utc)
-    job.status = ProcessingJobStatus.RUNNING.value
-    job.lease_token = uuid.uuid4()
-    job.started_at = now
-    job.lease_expires_at = now + timedelta(seconds=lease_seconds)
     try:
+        job = await _lock_processing_job_for_project(
+            session,
+            project_id=project_id,
+            job_id=job_id,
+        )
+        if job.status != ProcessingJobStatus.QUEUED.value:
+            raise ProcessingJobStateError("Only queued jobs can be claimed.")
+
+        now = datetime.now(timezone.utc)
+        job.status = ProcessingJobStatus.RUNNING.value
+        job.lease_token = uuid.uuid4()
+        job.started_at = now
+        job.lease_expires_at = now + timedelta(seconds=lease_seconds)
         await session.flush()
         await session.commit()
     except BaseException:
@@ -321,12 +324,24 @@ async def complete_processing_job(
     extraction_run_id: uuid.UUID,
 ) -> ProcessingJob:
     try:
+        snapshot = await processing_job_repository.get_processing_job_identity_snapshot(
+            session,
+            job_id=job_id,
+        )
+        if snapshot is None or snapshot.project_id != project_id:
+            raise ProcessingJobNotFoundError("Processing job must belong to the target project.")
+        locked_revision = await _lock_revision_for_project(
+            session,
+            project_id=project_id,
+            revision_id=snapshot.revision_id,
+        )
         job = await complete_processing_job_in_transaction(
             session,
             project_id=project_id,
             job_id=job_id,
             lease_token=lease_token,
             extraction_run_id=extraction_run_id,
+            locked_revision=locked_revision,
         )
         await session.flush()
         await session.commit()
@@ -372,11 +387,11 @@ async def renew_processing_job_lease(
     if lease_seconds < 30:
         raise ValueError("lease_seconds must be greater than or equal to 30.")
 
-    job = await _lock_processing_job_by_id(session, job_id=job_id)
-    now = datetime.now(timezone.utc)
-    _validate_running_job_lease(job, lease_token=lease_token, now=now)
-    job.lease_expires_at = now + timedelta(seconds=lease_seconds)
     try:
+        job = await _lock_processing_job_by_id(session, job_id=job_id)
+        now = datetime.now(timezone.utc)
+        _validate_running_job_lease(job, lease_token=lease_token, now=now)
+        job.lease_expires_at = now + timedelta(seconds=lease_seconds)
         await session.flush()
         await session.commit()
     except BaseException:
@@ -392,6 +407,7 @@ async def complete_processing_job_in_transaction(
     job_id: uuid.UUID,
     lease_token: uuid.UUID,
     extraction_run_id: uuid.UUID,
+    locked_revision: DocumentRevision,
 ) -> ProcessingJob:
     job = await _lock_processing_job_for_project(
         session,
@@ -399,16 +415,22 @@ async def complete_processing_job_in_transaction(
         job_id=job_id,
     )
     now = datetime.now(timezone.utc)
+    if job.job_type != ProcessingJobType.REVISION_EXTRACTION.value:
+        raise ProcessingJobStateError("Only revision extraction jobs can store extraction run results.")
+    if job.revision_id != locked_revision.id:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+
     extraction_run = await processing_job_repository.get_extraction_run_by_id_for_update(
         session,
         extraction_run_id=extraction_run_id,
     )
     if extraction_run is None:
         raise ProcessingJobStateError("Extraction run not found.")
-    if job.job_type != ProcessingJobType.REVISION_EXTRACTION.value:
-        raise ProcessingJobStateError("Only revision extraction jobs can store extraction run results.")
-    if extraction_run.revision_id != job.revision_id:
-        raise ProcessingJobStateError("Extraction run must belong to the same revision as the job.")
+    _validate_extraction_result_consistency(
+        extraction_run=extraction_run,
+        revision_status=locked_revision.status,
+        expected_revision_id=job.revision_id,
+    )
     if job.result_extraction_run_id is not None and job.result_extraction_run_id != extraction_run.id:
         raise ProcessingJobStateError("Processing job is already bound to another extraction run.")
 
@@ -627,35 +649,51 @@ def _validate_result_context_consistency(
         raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
     if context.result_run_id is None or context.run_revision_id is None:
         raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
-    if context.run_revision_id != context.job_revision_id:
-        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
-    if context.run_status not in {"completed", "failed"}:
+    _validate_extraction_result_consistency(
+        extraction_run=SimpleNamespace(
+            revision_id=context.run_revision_id,
+            status=context.run_status,
+            outcome=context.run_outcome,
+            completed_at=context.run_completed_at,
+        ),
+        revision_status=context.revision_status,
+        expected_revision_id=context.job_revision_id,
+    )
+
+
+def _validate_extraction_result_consistency(
+    *,
+    extraction_run: object,
+    revision_status: str,
+    expected_revision_id: uuid.UUID,
+) -> None:
+    if getattr(extraction_run, "revision_id", None) != expected_revision_id:
         raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
 
-    expected_revision_status = _map_extraction_outcome_to_revision_status(context.run_outcome)
-    if context.revision_status != expected_revision_status:
+    run_status = getattr(extraction_run, "status", None)
+    run_outcome = getattr(extraction_run, "outcome", None)
+    completed_at = getattr(extraction_run, "completed_at", None)
+
+    if run_status not in {"completed", "failed"}:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+    if completed_at is None:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+
+    expected_run_status, expected_revision_status = _map_extraction_outcome_consistency(run_outcome)
+    if run_status != expected_run_status:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+    if revision_status != expected_revision_status:
         raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
 
 
-def _map_extraction_outcome_to_revision_status(run_outcome: str | None) -> str:
+def _map_extraction_outcome_consistency(run_outcome: str | None) -> tuple[str, str]:
     if run_outcome in {
         ExtractionRunOutcome.SUCCESS.value,
         ExtractionRunOutcome.PARTIAL.value,
     }:
-        return DocumentRevisionStatus.AWAITING_REVIEW.value
-    if run_outcome in {
-        ExtractionRunOutcome.NEEDS_OCR.value,
-        ExtractionRunOutcome.FAILED.value,
-    }:
-        return DocumentRevisionStatus.FAILED.value
+        return "completed", DocumentRevisionStatus.AWAITING_REVIEW.value
+    if run_outcome == ExtractionRunOutcome.NEEDS_OCR.value:
+        return "completed", DocumentRevisionStatus.FAILED.value
+    if run_outcome == ExtractionRunOutcome.FAILED.value:
+        return "failed", DocumentRevisionStatus.FAILED.value
     raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
-
-
-def _revision_has_orphaned_result(*, revision_status: str, has_terminal_run: bool) -> bool:
-    if has_terminal_run:
-        return True
-    return revision_status in {
-        DocumentRevisionStatus.AWAITING_REVIEW.value,
-        DocumentRevisionStatus.COMPLETED.value,
-        DocumentRevisionStatus.FAILED.value,
-    }
