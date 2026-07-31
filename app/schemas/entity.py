@@ -59,6 +59,13 @@ class EntityAliasCreateInput(BaseModel):
     def _validate_language_code(cls, value: str) -> str:
         return _normalize_required_text(value, field_name="language_code", max_length=32)
 
+    @field_validator("is_primary", mode="before")
+    @classmethod
+    def _validate_is_primary(cls, value: object) -> bool:
+        if type(value) is not bool:
+            raise ValueError("is_primary must be a boolean")
+        return value
+
 
 class EntityRead(BaseModel):
     id: uuid.UUID

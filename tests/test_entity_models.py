@@ -121,6 +121,31 @@ def test_entity_identity_hash_is_deterministic() -> None:
     assert hash_one != changed
 
 
+def test_entity_identity_hash_normalizes_equivalent_inputs() -> None:
+    project_id = uuid.uuid4()
+    hash_one = build_entity_identity_hash(
+        project_id=project_id,
+        entity_type="  Person  ",
+        canonical_key="  Ａ\u3000B  ",
+    )
+    hash_two = build_entity_identity_hash(
+        project_id=project_id,
+        entity_type="Person",
+        canonical_key="a b",
+    )
+
+    assert hash_one == hash_two
+
+
+def test_entity_identity_hash_rejects_non_uuid_project_id() -> None:
+    with pytest.raises(ValueError):
+        build_entity_identity_hash(
+            project_id="not-a-uuid",
+            entity_type="person",
+            canonical_key="zhang san",
+        )
+
+
 def test_normalize_entity_alias_applies_nfkc_casefold_and_whitespace_rules() -> None:
     assert normalize_entity_alias("  Ａ\u3000B\tC  ") == "a b c"
     assert normalize_entity_alias("Straße") == "strasse"
@@ -158,6 +183,12 @@ def test_entity_create_input_normalizes_canonical_key() -> None:
     )
 
     assert payload.canonical_key == "a b"
+
+
+@pytest.mark.parametrize("invalid_value", [0, 1, "true"])
+def test_entity_alias_create_input_requires_strict_bool_for_is_primary(invalid_value: object) -> None:
+    with pytest.raises(ValidationError):
+        EntityAliasCreateInput(alias_text="张三", is_primary=invalid_value)
 
 
 def test_entity_model_migration_creates_tables_and_partial_unique_index() -> None:

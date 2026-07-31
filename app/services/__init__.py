@@ -14,11 +14,13 @@ from app.services.dynamic_schema import (
 )
 from app.services.entity import (
     EntityAliasNotFoundError,
+    EntityIdentityConflictError,
     EntityNotFoundError,
     EntityPermissionError,
     EntityProjectNotFoundError,
     EntityServiceError,
     EntityStateError,
+    PrimaryEntityAliasChangeError,
     PrimaryEntityAliasRetireError,
     add_entity_alias,
     build_entity_identity_hash,
@@ -157,7 +159,9 @@ __all__ = [
     "EntityProjectNotFoundError",
     "EntityNotFoundError",
     "EntityAliasNotFoundError",
+    "EntityIdentityConflictError",
     "EntityStateError",
+    "PrimaryEntityAliasChangeError",
     "PrimaryEntityAliasRetireError",
     "build_entity_identity_hash",
     "create_entity_with_primary_alias",

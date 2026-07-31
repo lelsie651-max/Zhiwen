@@ -52,6 +52,14 @@ class PrimaryEntityAliasRetireError(EntityServiceError):
     """Raised when attempting to retire the active primary alias."""
 
 
+class PrimaryEntityAliasChangeError(EntityServiceError):
+    """Raised when a general alias command attempts to modify the primary alias."""
+
+
+class EntityIdentityConflictError(EntityServiceError):
+    """Raised when stored entity identity data does not match the normalized request."""
+
+
 _ENTITY_UNIQUE_CONSTRAINT_NAMES = {
     "uq_ent_proj_type_key",
     "uq_ent_proj_hash",
@@ -127,6 +135,10 @@ async def add_entity_alias(
             raise EntityNotFoundError("Entity must belong to the target project.")
         if entity.status != EntityStatus.ACTIVE.value:
             raise EntityStateError("Merged or archived entities cannot accept new aliases.")
+        if payload.is_primary:
+            raise PrimaryEntityAliasChangeError(
+                "Primary alias changes must use a dedicated command."
+            )
 
         alias = EntityAlias(
             entity_id=entity.id,
@@ -185,16 +197,21 @@ async def resolve_entity_alias(
     entity_type: str,
     alias_text: str,
 ) -> tuple[EntityAlias, ...]:
-    await _require_project_available(session, project_id=project_id)
-    normalized_entity_type = _normalize_entity_type(entity_type)
-    normalized_alias = normalize_entity_alias(alias_text)
-    matches = await entity_repository.resolve_entity_alias(
-        session,
-        project_id=project_id,
-        entity_type=normalized_entity_type,
-        normalized_alias=normalized_alias,
-    )
-    return tuple(matches)
+    try:
+        await _require_project_available(session, project_id=project_id)
+        normalized_entity_type = _normalize_entity_type(entity_type)
+        normalized_alias = normalize_entity_alias(alias_text)
+        matches = await entity_repository.resolve_entity_alias(
+            session,
+            project_id=project_id,
+            entity_type=normalized_entity_type,
+            normalized_alias=normalized_alias,
+        )
+        await session.commit()
+        return tuple(matches)
+    except BaseException:
+        await session.rollback()
+        raise
 
 
 def build_entity_identity_hash(
@@ -203,13 +220,19 @@ def build_entity_identity_hash(
     entity_type: str,
     canonical_key: str,
 ) -> str:
+    if type(project_id) is not uuid.UUID:
+        raise ValueError("project_id must be a UUID")
+
+    normalized_entity_type = _normalize_entity_type(entity_type)
+    normalized_canonical_key = normalize_entity_alias(canonical_key)
     payload = {
-        "canonical_key": canonical_key,
-        "entity_type": entity_type,
+        "canonical_key": normalized_canonical_key,
+        "entity_type": normalized_entity_type,
         "project_id": str(project_id),
     }
     serialized = json.dumps(
         payload,
+        allow_nan=False,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -271,6 +294,13 @@ async def _get_or_create_entity_for_update(
         canonical_key=canonical_key,
     )
     if entity is not None:
+        _validate_entity_identity_match(
+            entity,
+            project_id=project_id,
+            entity_type=entity_type,
+            canonical_key=canonical_key,
+            identity_hash=identity_hash,
+        )
         return entity, False
 
     savepoint = await session.begin_nested()
@@ -287,7 +317,8 @@ async def _get_or_create_entity_for_update(
         )
         await entity_repository.create_entity(session, entity)
     except IntegrityError as exc:
-        if not _is_entity_identity_integrity_error(exc):
+        constraint_name = _get_integrity_constraint_name(exc)
+        if constraint_name not in _ENTITY_UNIQUE_CONSTRAINT_NAMES:
             await savepoint.rollback()
             raise
         await savepoint.rollback()
@@ -304,16 +335,47 @@ async def _get_or_create_entity_for_update(
                 identity_hash=identity_hash,
             )
         if entity is None:
-            raise
+            raise exc
+        _validate_entity_identity_match(
+            entity,
+            project_id=project_id,
+            entity_type=entity_type,
+            canonical_key=canonical_key,
+            identity_hash=identity_hash,
+        )
         return entity, False
     else:
         await savepoint.commit()
         return entity, True
 
 
-def _is_entity_identity_integrity_error(exc: IntegrityError) -> bool:
-    message = str(exc.orig or exc).lower()
-    return any(name in message for name in _ENTITY_UNIQUE_CONSTRAINT_NAMES)
+def _get_integrity_constraint_name(error: IntegrityError) -> str | None:
+    diag = getattr(error.orig, "diag", None)
+    constraint_name = getattr(diag, "constraint_name", None)
+    if constraint_name is None:
+        return None
+    if not isinstance(constraint_name, str):
+        return None
+    return constraint_name
+
+
+def _validate_entity_identity_match(
+    entity: Entity,
+    *,
+    project_id: uuid.UUID,
+    entity_type: str,
+    canonical_key: str,
+    identity_hash: str,
+) -> None:
+    if (
+        entity.project_id != project_id
+        or entity.entity_type != entity_type
+        or entity.canonical_key != canonical_key
+        or entity.identity_hash != identity_hash
+    ):
+        raise EntityIdentityConflictError(
+            "Stored entity identity does not match the normalized request."
+        )
 
 
 def _normalize_entity_type(value: str) -> str:

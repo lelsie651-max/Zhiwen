@@ -180,8 +180,20 @@ def patch_project_and_actor(monkeypatch, *, project: Project, actor: User | None
     )
 
 
-def make_integrity_error(message: str) -> IntegrityError:
-    return IntegrityError("insert", {}, Exception(message))
+class FakeDiag:
+    def __init__(self, constraint_name: str | None) -> None:
+        self.constraint_name = constraint_name
+
+
+class FakeOrigError(Exception):
+    def __init__(self, message: str, *, constraint_name: str | None = None) -> None:
+        super().__init__(message)
+        if constraint_name is not None:
+            self.diag = FakeDiag(constraint_name)
+
+
+def make_integrity_error(message: str, *, constraint_name: str | None = None) -> IntegrityError:
+    return IntegrityError("insert", {}, FakeOrigError(message, constraint_name=constraint_name))
 
 
 def test_create_entity_with_primary_alias_creates_both_records(monkeypatch) -> None:
@@ -277,7 +289,7 @@ def test_concurrent_identity_create_returns_existing_entity(monkeypatch) -> None
         return existing
 
     async def fake_create_entity(_session, _entity):
-        raise make_integrity_error("uq_ent_proj_type_key")
+        raise make_integrity_error("insert failed", constraint_name="uq_ent_proj_type_key")
 
     async def unexpected_create_alias(_session, _alias):
         raise AssertionError("alias creation must not run after idempotent conflict reuse")
@@ -312,7 +324,7 @@ def test_non_target_integrity_error_is_re_raised(monkeypatch) -> None:
         return None
 
     async def fake_create_entity(_session, _entity):
-        raise make_integrity_error("uq_some_other_constraint")
+        raise make_integrity_error("uq_ent_proj_type_key appears in message", constraint_name="uq_some_other_constraint")
 
     monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_identity_for_update", fake_get_entity_by_identity_for_update)
     monkeypatch.setattr(entity_service.entity_repository, "create_entity", fake_create_entity)
@@ -374,7 +386,7 @@ def test_same_entity_duplicate_alias_is_rejected(monkeypatch) -> None:
         return entity
 
     async def fake_create_entity_alias(_session, _alias):
-        raise make_integrity_error("uq_ea_ent_norm_lang")
+        raise make_integrity_error("uq_ea_ent_norm_lang", constraint_name="uq_ea_ent_norm_lang")
 
     monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_id_for_update", fake_get_entity_by_id_for_update)
     monkeypatch.setattr(entity_service.entity_repository, "create_entity_alias", fake_create_entity_alias)
@@ -422,6 +434,121 @@ def test_ambiguous_alias_returns_multiple_candidates_without_auto_selection(monk
     )
 
     assert tuple(alias.id for alias in result) == (first_alias.id, second_alias.id)
+
+
+def test_get_integrity_constraint_name_reads_only_diag_constraint_name() -> None:
+    error = make_integrity_error("message with uq_ent_proj_type_key", constraint_name="uq_ent_proj_hash")
+
+    assert entity_service._get_integrity_constraint_name(error) == "uq_ent_proj_hash"
+
+
+def test_get_integrity_constraint_name_ignores_text_without_target_diag() -> None:
+    error = make_integrity_error("uq_ent_proj_type_key appears in text", constraint_name="uq_other")
+
+    assert entity_service._get_integrity_constraint_name(error) == "uq_other"
+
+
+def test_get_integrity_constraint_name_without_diag_returns_none() -> None:
+    error = IntegrityError("insert", {}, Exception("uq_ent_proj_type_key"))
+
+    assert entity_service._get_integrity_constraint_name(error) is None
+
+
+def test_target_integrity_conflict_without_reloaded_entity_reraises_original(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    original_error = make_integrity_error("insert failed", constraint_name="uq_ent_proj_hash")
+
+    patch_project_and_actor(monkeypatch, project=project, actor=actor, role="owner")
+
+    async def fake_get_entity_by_identity_for_update(_session, **_kwargs):
+        return None
+
+    async def fake_get_entity_by_identity_hash_for_update(_session, **_kwargs):
+        return None
+
+    async def fake_create_entity(_session, _entity):
+        raise original_error
+
+    monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_identity_for_update", fake_get_entity_by_identity_for_update)
+    monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_identity_hash_for_update", fake_get_entity_by_identity_hash_for_update)
+    monkeypatch.setattr(entity_service.entity_repository, "create_entity", fake_create_entity)
+
+    with pytest.raises(IntegrityError) as exc_info:
+        run_async(
+            entity_service.create_entity_with_primary_alias(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=EntityCreateInput(entity_type="person", canonical_key="zhang san", display_name="张三"),
+            )
+        )
+
+    assert exc_info.value is original_error
+    assert session.rollback_count == 1
+
+
+def test_existing_entity_with_identity_hash_mismatch_is_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    existing = StubEntityWithoutRelations(project_id=project.id)
+    existing.identity_hash = "0" * 64
+
+    patch_project_and_actor(monkeypatch, project=project, actor=actor, role="owner")
+
+    async def fake_get_entity_by_identity_for_update(_session, **_kwargs):
+        return existing
+
+    monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_identity_for_update", fake_get_entity_by_identity_for_update)
+
+    with pytest.raises(entity_service.EntityIdentityConflictError):
+        run_async(
+            entity_service.create_entity_with_primary_alias(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=EntityCreateInput(entity_type="person", canonical_key="zhang san", display_name="张三"),
+            )
+        )
+
+    assert session.rollback_count == 1
+
+
+def test_hash_reload_with_different_identity_is_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    mismatched = StubEntityWithoutRelations(project_id=project.id)
+    mismatched.canonical_key = "li si"
+
+    patch_project_and_actor(monkeypatch, project=project, actor=actor, role="owner")
+
+    async def fake_get_entity_by_identity_for_update(_session, **_kwargs):
+        return None
+
+    async def fake_get_entity_by_identity_hash_for_update(_session, **_kwargs):
+        return mismatched
+
+    async def fake_create_entity(_session, _entity):
+        raise make_integrity_error("insert failed", constraint_name="uq_ent_proj_hash")
+
+    monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_identity_for_update", fake_get_entity_by_identity_for_update)
+    monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_identity_hash_for_update", fake_get_entity_by_identity_hash_for_update)
+    monkeypatch.setattr(entity_service.entity_repository, "create_entity", fake_create_entity)
+
+    with pytest.raises(entity_service.EntityIdentityConflictError):
+        run_async(
+            entity_service.create_entity_with_primary_alias(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=EntityCreateInput(entity_type="person", canonical_key="zhang san", display_name="张三"),
+            )
+        )
+
+    assert session.rollback_count == 1
 
 
 @pytest.mark.parametrize("status", ["merged", "archived"])
@@ -482,6 +609,86 @@ def test_active_primary_alias_cannot_be_retired(monkeypatch) -> None:
             )
         )
 
+    assert session.rollback_count == 1
+
+
+def test_resolve_entity_alias_commits_once_on_success(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    entity = build_entity(project_id=project.id)
+    alias = build_alias(entity_id=entity.id, alias_text="ACME", normalized_alias="acme")
+    alias.entity = entity
+
+    async def fake_get_project_by_id(_session, project_id):
+        return project if project_id == project.id else None
+
+    async def fake_resolve_entity_alias(_session, **_kwargs):
+        return [alias]
+
+    monkeypatch.setattr(entity_service.entity_repository, "get_project_by_id", fake_get_project_by_id)
+    monkeypatch.setattr(entity_service.entity_repository, "resolve_entity_alias", fake_resolve_entity_alias)
+
+    result = run_async(
+        entity_service.resolve_entity_alias(
+            session,
+            project_id=project.id,
+            entity_type="person",
+            alias_text="ＡＣＭＥ",
+        )
+    )
+
+    assert result == (alias,)
+    assert session.commit_count == 1
+    assert session.rollback_count == 0
+
+
+def test_resolve_entity_alias_failure_rolls_back(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project(status="archived")
+
+    async def fake_get_project_by_id(_session, project_id):
+        return project if project_id == project.id else None
+
+    monkeypatch.setattr(entity_service.entity_repository, "get_project_by_id", fake_get_project_by_id)
+
+    with pytest.raises(entity_service.EntityProjectNotFoundError):
+        run_async(
+            entity_service.resolve_entity_alias(
+                session,
+                project_id=project.id,
+                entity_type="person",
+                alias_text="acme",
+            )
+        )
+
+    assert session.commit_count == 0
+    assert session.rollback_count == 1
+
+
+def test_resolve_entity_alias_cancelled_error_rolls_back_and_propagates(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+
+    async def fake_get_project_by_id(_session, project_id):
+        return project if project_id == project.id else None
+
+    async def fake_resolve_entity_alias(_session, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(entity_service.entity_repository, "get_project_by_id", fake_get_project_by_id)
+    monkeypatch.setattr(entity_service.entity_repository, "resolve_entity_alias", fake_resolve_entity_alias)
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(
+            entity_service.resolve_entity_alias(
+                session,
+                project_id=project.id,
+                entity_type="person",
+                alias_text="acme",
+            )
+        )
+
+    assert session.commit_count == 0
     assert session.rollback_count == 1
 
 
@@ -598,6 +805,41 @@ def test_successful_add_alias_commits_once_without_rollback(monkeypatch) -> None
     assert captured["alias"].normalized_alias == "acme"
     assert session.commit_count == 1
     assert session.rollback_count == 0
+
+
+def test_add_entity_alias_rejects_primary_change_before_repository_write(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    entity = StubEntityWithoutRelations(project_id=project.id)
+    create_calls = {"count": 0}
+
+    patch_project_and_actor(monkeypatch, project=project, actor=actor, role="owner")
+
+    async def fake_get_entity_by_id_for_update(_session, **_kwargs):
+        return entity
+
+    async def fake_create_entity_alias(_session, _alias):
+        create_calls["count"] += 1
+        return _alias
+
+    monkeypatch.setattr(entity_service.entity_repository, "get_entity_by_id_for_update", fake_get_entity_by_id_for_update)
+    monkeypatch.setattr(entity_service.entity_repository, "create_entity_alias", fake_create_entity_alias)
+
+    with pytest.raises(entity_service.PrimaryEntityAliasChangeError):
+        run_async(
+            entity_service.add_entity_alias(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                entity_id=entity.id,
+                payload=EntityAliasCreateInput(alias_text="张三", is_primary=True),
+            )
+        )
+
+    assert create_calls["count"] == 0
+    assert session.commit_count == 0
+    assert session.rollback_count == 1
 
 
 def test_cancelled_error_rolls_back_and_propagates(monkeypatch) -> None:
