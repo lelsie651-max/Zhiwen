@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
@@ -127,6 +127,22 @@ async def get_fact_value_for_update(
         )
         .options(joinedload(FactValue.fact))
         .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_fact_value_with_links(
+    session: AsyncSession,
+    *,
+    fact_value_id: uuid.UUID,
+) -> FactValue | None:
+    result = await session.execute(
+        select(FactValue)
+        .where(FactValue.id == fact_value_id)
+        .options(
+            joinedload(FactValue.fact),
+            selectinload(FactValue.evidence_links),
+        )
     )
     return result.scalar_one_or_none()
 

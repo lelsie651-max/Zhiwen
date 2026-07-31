@@ -20,6 +20,7 @@ from sqlalchemy.schema import AddConstraint
 from app.models import Base
 from app.models.entity import EntityStatus
 from app.models.fact import FactValue, FactValueStatus, FactValueType
+from app.models.fact_extraction_application import FactExtractionBatchApplication
 from app.repositories import entity as entity_repository
 from app.repositories import fact_extraction_persistence as persistence_repository
 from app.schemas.fact_extraction_persistence import (
@@ -82,13 +83,29 @@ class FakeResult:
     def all(self):
         return self._rows
 
+    def one_or_none(self):
+        if self._rows is None:
+            return None
+        if isinstance(self._rows, list):
+            if len(self._rows) == 0:
+                return None
+            if len(self._rows) != 1:
+                raise AssertionError("expected exactly one row")
+            return self._rows[0]
+        return self._rows
+
 
 class ContextSession:
-    def __init__(self, rows):
-        self.rows = rows
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.index = 0
 
     async def execute(self, _statement):
-        return FakeResult(self.rows)
+        if self.index >= len(self.responses):
+            raise AssertionError("unexpected extra execute call")
+        response = self.responses[self.index]
+        self.index += 1
+        return FakeResult(response)
 
 
 def make_integrity_error(constraint_name: str | None) -> IntegrityError:
@@ -147,6 +164,13 @@ def build_block(
     document_block_project_id: uuid.UUID | None = None,
     content_text: str | None = None,
     content_hash: str | None = None,
+    block_type: str = "paragraph",
+    location_key: str | None = None,
+    anchor_hash: str | None = None,
+    page_no: int | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    heading_path: tuple[str, ...] = (),
 ) -> FactExtractionPersistenceBlock:
     block_id = document_block_id or uuid.uuid4()
     content = text if content_text is None else content_text
@@ -154,6 +178,13 @@ def build_block(
         input_block_id=uuid.uuid4(),
         block_ref=block_ref,
         source_order=source_order,
+        block_type=block_type,
+        location_key=location_key or f"loc-{source_order}",
+        anchor_hash=anchor_hash or sha256(f"{block_ref}:{text}"),
+        page_no=page_no,
+        start_line=start_line,
+        end_line=end_line,
+        heading_path=heading_path,
         document_block_id=block_id,
         source_block_id_snapshot=source_block_id_snapshot or block_id,
         extraction_run_id_snapshot=extraction_run_id,
@@ -174,34 +205,76 @@ def build_context(
     task_type: str = "fact_extraction",
     response_json: dict | None = None,
     blocks: tuple[FactExtractionPersistenceBlock, ...] | None = None,
+    batch_project_id: uuid.UUID | None = None,
+    batch_task_type: str | None = None,
+    batch_block_count: int | None = None,
+    batch_character_count: int | None = None,
+    batch_snapshot_hash: str | None = None,
+    response_hash: str | None = None,
+    response_json_hash: str | None = None,
 ) -> CompletedFactExtractionPersistenceContext:
     actual_project_id = project_id or uuid.uuid4()
     actual_extraction_run_id = extraction_run_id or uuid.uuid4()
+    actual_blocks = blocks or (
+        build_block(
+            source_order=0,
+            block_ref="B0001",
+            text="张三",
+            extraction_run_id=actual_extraction_run_id,
+            project_id=actual_project_id,
+        ),
+        build_block(
+            source_order=1,
+            block_ref="B0002",
+            text="国王",
+            extraction_run_id=actual_extraction_run_id,
+            project_id=actual_project_id,
+        ),
+    )
+    actual_response_json = copy.deepcopy(response_json or valid_response_json())
     return CompletedFactExtractionPersistenceContext(
         inference_run_id=inference_run_id or uuid.uuid4(),
         project_id=actual_project_id,
         task_type=task_type,
         status=status,
         input_batch_id=uuid.uuid4(),
-        response_json=copy.deepcopy(response_json or valid_response_json()),
-        response_hash="a" * 64,
-        blocks=blocks
-        or (
-            build_block(
-                source_order=0,
-                block_ref="B0001",
-                text="张三",
-                extraction_run_id=actual_extraction_run_id,
-                project_id=actual_project_id,
-            ),
-            build_block(
-                source_order=1,
-                block_ref="B0002",
-                text="国王",
-                extraction_run_id=actual_extraction_run_id,
-                project_id=actual_project_id,
-            ),
+        batch_project_id=batch_project_id or actual_project_id,
+        batch_task_type=batch_task_type or task_type,
+        batch_block_count=batch_block_count if batch_block_count is not None else len(actual_blocks),
+        batch_character_count=(
+            batch_character_count
+            if batch_character_count is not None
+            else sum(len(block.content_text) for block in actual_blocks)
         ),
+        batch_snapshot_hash=(
+            batch_snapshot_hash
+            or persistence_service.build_inference_input_batch_snapshot_hash(
+                [
+                    {
+                        "source_order": block.source_order,
+                        "block_ref": block.block_ref,
+                        "source_block_id": str(block.source_block_id_snapshot),
+                        "extraction_run_id": str(block.extraction_run_id_snapshot),
+                        "block_type": block.block_type,
+                        "location_key": block.location_key,
+                        "anchor_hash": block.anchor_hash,
+                        "page_no": block.page_no,
+                        "start_line": block.start_line,
+                        "end_line": block.end_line,
+                        "heading_path": list(block.heading_path),
+                        "content_hash": block.content_hash,
+                    }
+                    for block in actual_blocks
+                ]
+            )
+        ),
+        response_json=actual_response_json,
+        response_hash=response_hash or "a" * 64,
+        response_json_hash=(
+            response_json_hash
+            or persistence_service.build_inference_response_json_hash(actual_response_json)
+        ),
+        blocks=actual_blocks,
     )
 
 
@@ -224,26 +297,84 @@ def build_resolution(
     )
 
 
+def patch_application_prepare(monkeypatch):
+    state: dict[str, object | None] = {"application": None}
+
+    async def fake_prepare(_session, *, project_id, extraction_run_id, context):
+        application = state["application"]
+        if application is None:
+            application = SimpleNamespace(
+                id=uuid.uuid4(),
+                inference_run_id=context.inference_run_id,
+                project_id=project_id,
+                extraction_run_id=extraction_run_id,
+                input_batch_id=context.input_batch_id,
+                response_hash=context.response_hash,
+                response_json_hash=context.response_json_hash,
+                status="applying",
+                persistence_name=persistence_service.FACT_EXTRACTION_PERSISTENCE_NAME,
+                persistence_version=persistence_service.FACT_EXTRACTION_PERSISTENCE_VERSION,
+                entity_resolution_policy_name=persistence_service.ENTITY_RESOLUTION_POLICY_NAME,
+                entity_resolution_policy_version=persistence_service.ENTITY_RESOLUTION_POLICY_VERSION,
+                result_json=None,
+                result_hash=None,
+                completed_at=None,
+            )
+            state["application"] = application
+            return persistence_service.PreparedBatchApplication(
+                application=application,
+                replay_result=None,
+            )
+
+        stored_result = persistence_service.FactExtractionBatchPersistenceResult.model_validate(
+            application.result_json
+        )
+        replay_result = stored_result.model_copy(update={"replayed_application": True})
+        return persistence_service.PreparedBatchApplication(
+            application=application,
+            replay_result=replay_result,
+        )
+
+    monkeypatch.setattr(persistence_service, "_prepare_batch_application", fake_prepare)
+    return state
+
+
 def test_completed_fact_extraction_run_context_can_load_and_deepcopy_response() -> None:
     response = valid_response_json()
     run_id = uuid.uuid4()
     project_id = uuid.uuid4()
     extraction_run_id = uuid.uuid4()
     batch_id = uuid.uuid4()
-    rows = [
+    document_block_id = uuid.uuid4()
+    header_row = SimpleNamespace(
+        inference_run_id=run_id,
+        project_id=project_id,
+        task_type="fact_extraction",
+        status="completed",
+        input_batch_id=batch_id,
+        batch_project_id=project_id,
+        batch_task_type="fact_extraction",
+        batch_block_count=1,
+        batch_character_count=2,
+        batch_snapshot_hash="b" * 64,
+        response_json=response,
+        response_hash="a" * 64,
+        response_json_hash=persistence_service.build_inference_response_json_hash(response),
+    )
+    block_rows = [
         SimpleNamespace(
-            inference_run_id=run_id,
-            project_id=project_id,
-            task_type="fact_extraction",
-            status="completed",
-            input_batch_id=batch_id,
-            response_json=response,
-            response_hash="a" * 64,
             input_block_id=uuid.uuid4(),
             block_ref="B0001",
             source_order=0,
-            document_block_id=uuid.uuid4(),
-            source_block_id_snapshot=uuid.uuid4(),
+            block_type="paragraph",
+            location_key="loc-0",
+            anchor_hash=sha256("anchor"),
+            page_no=1,
+            start_line=1,
+            end_line=1,
+            heading_path=["H1"],
+            document_block_id=document_block_id,
+            source_block_id_snapshot=document_block_id,
             extraction_run_id_snapshot=extraction_run_id,
             content_text="张三",
             content_hash=sha256("张三"),
@@ -252,11 +383,10 @@ def test_completed_fact_extraction_run_context_can_load_and_deepcopy_response() 
             document_block_raw_text="张三",
         ),
     ]
-    rows[0].source_block_id_snapshot = rows[0].document_block_id
 
     context = run_async(
         persistence_repository.get_completed_fact_extraction_persistence_context(
-            ContextSession(rows),
+            ContextSession(header_row, block_rows),
             inference_run_id=run_id,
         )
     )
@@ -397,6 +527,64 @@ def test_block_source_order_must_be_continuous() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("context_kwargs", "expected_message"),
+    [
+        ({"batch_project_id": uuid.uuid4()}, "project mismatch"),
+        ({"batch_task_type": "schema_inference"}, "task_type mismatch"),
+        ({"batch_block_count": 3}, "block count"),
+        ({"batch_character_count": 999}, "character count"),
+    ],
+)
+def test_batch_header_integrity_is_revalidated(context_kwargs, expected_message: str) -> None:
+    context = build_context(**context_kwargs)
+
+    with pytest.raises(persistence_service.FactExtractionPersistenceContextError) as exc_info:
+        persistence_service._validate_persistence_context(
+            project_id=context.project_id,
+            extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+            inference_run_id=context.inference_run_id,
+            context=context,
+        )
+
+    assert expected_message in str(exc_info.value)
+
+
+def test_block_ref_must_match_source_order_exactly() -> None:
+    project_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    context = build_context(
+        blocks=(
+            build_block(
+                source_order=0,
+                block_ref="B0001",
+                text="张三",
+                extraction_run_id=extraction_run_id,
+                project_id=project_id,
+            ),
+            build_block(
+                source_order=1,
+                block_ref="B9999",
+                text="国王",
+                extraction_run_id=extraction_run_id,
+                project_id=project_id,
+            ),
+        ),
+        project_id=project_id,
+        extraction_run_id=extraction_run_id,
+    )
+
+    with pytest.raises(persistence_service.FactExtractionPersistenceContextError) as exc_info:
+        persistence_service._validate_persistence_context(
+            project_id=context.project_id,
+            extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+            inference_run_id=context.inference_run_id,
+            context=context,
+        )
+
+    assert "block_ref" in str(exc_info.value)
+
+
 def test_response_json_is_reparsed_strictly() -> None:
     context = build_context(response_json={"facts": "not-a-list"})
     with pytest.raises(persistence_service.FactExtractionPersistenceContextError):
@@ -422,21 +610,83 @@ def test_evidence_bounds_are_revalidated_against_batch() -> None:
         )
 
 
+def test_response_json_hash_is_revalidated_against_stored_response_json() -> None:
+    context = build_context(response_json_hash="b" * 64)
+
+    with pytest.raises(persistence_service.FactExtractionPersistenceContextError) as exc_info:
+        persistence_service._validate_persistence_context(
+            project_id=context.project_id,
+            extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+            inference_run_id=context.inference_run_id,
+            context=context,
+        )
+
+    assert "response_json_hash" in str(exc_info.value)
+
+
+def test_snapshot_hash_is_revalidated_against_batch_blocks() -> None:
+    context = build_context(batch_snapshot_hash="c" * 64)
+
+    with pytest.raises(persistence_service.FactExtractionPersistenceContextError) as exc_info:
+        persistence_service._validate_persistence_context(
+            project_id=context.project_id,
+            extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+            inference_run_id=context.inference_run_id,
+            context=context,
+        )
+
+    assert "snapshot_hash" in str(exc_info.value)
+
+
+def test_live_document_block_breakage_is_not_silently_dropped() -> None:
+    base_context = build_context()
+    context = build_context(
+        blocks=(
+            replace(
+                base_context.blocks[0],
+                document_block_id=None,
+                document_block_extraction_run_id=None,
+                document_block_project_id=None,
+                document_block_raw_text=None,
+            ),
+            base_context.blocks[1],
+        ),
+        project_id=base_context.project_id,
+        extraction_run_id=base_context.blocks[0].extraction_run_id_snapshot,
+    )
+
+    with pytest.raises(persistence_service.FactExtractionPersistenceContextError) as exc_info:
+        persistence_service._validate_persistence_context(
+            project_id=context.project_id,
+            extraction_run_id=context.blocks[1].extraction_run_id_snapshot,
+            inference_run_id=context.inference_run_id,
+            context=context,
+        )
+
+    assert "live document block context is missing" in str(exc_info.value)
+
+
 def test_completed_context_query_does_not_read_storage_key_or_failure_message() -> None:
-    source = inspect.getsource(persistence_repository.get_completed_fact_extraction_persistence_context)
-    assert "storage_key" not in source
-    assert "failure_message" not in source
-    assert ".join(InferenceInputBatch" in source
-    assert ".join(DocumentBlock" in source
+    header_source = inspect.getsource(persistence_repository.get_inference_run_batch_header)
+    block_source = inspect.getsource(persistence_repository.list_input_blocks_with_live_context)
+    assert "storage_key" not in header_source
+    assert "storage_key" not in block_source
+    assert "failure_message" not in header_source
+    assert "failure_message" not in block_source
+    assert ".join(InferenceInputBatch" in header_source
+    assert ".outerjoin(DocumentBlock" in block_source
 
 
 def test_completed_context_query_does_not_use_lazy_loading() -> None:
-    source = inspect.getsource(persistence_repository.get_completed_fact_extraction_persistence_context)
-    assert "joinedload" not in source
-    assert ".blocks" not in source
-    assert ".revision." not in source
-    assert ".document." not in source
-    assert ".project." not in source
+    header_source = inspect.getsource(persistence_repository.get_inference_run_batch_header)
+    block_source = inspect.getsource(persistence_repository.list_input_blocks_with_live_context)
+    assert "joinedload" not in header_source
+    assert "joinedload" not in block_source
+    assert ".blocks" not in header_source
+    assert ".blocks" not in block_source
+    assert ".revision." not in block_source
+    assert ".document." not in block_source
+    assert ".project." not in block_source
 
 
 def test_resolve_entity_mention_prefers_active_canonical_and_skips_alias(monkeypatch) -> None:
@@ -585,6 +835,7 @@ def test_persist_batch_uses_canonical_subject_and_referenced_entity(monkeypatch)
     project_id = uuid.uuid4()
     extraction_run_id = uuid.uuid4()
     referenced_entity_id = uuid.uuid4()
+    patch_application_prepare(monkeypatch)
     context = build_context(
         project_id=project_id,
         extraction_run_id=extraction_run_id,
@@ -656,6 +907,7 @@ def test_persist_batch_uses_canonical_subject_and_referenced_entity(monkeypatch)
 
 def test_unresolved_subject_can_create_unbound_fact(monkeypatch) -> None:
     session = FakeSession()
+    patch_application_prepare(monkeypatch)
     context = build_context()
     captured: dict[str, object] = {}
 
@@ -718,6 +970,7 @@ def test_withheld_proposals_do_not_materialize_evidence(
     expected_reason: FactProposalWithheldReason,
 ) -> None:
     session = FakeSession()
+    patch_application_prepare(monkeypatch)
     context = build_context(
         response_json=valid_response_json(
             value_type="entity_ref",
@@ -769,6 +1022,7 @@ def test_batch_with_ambiguous_and_retired_proposals_preserves_other_successes(mo
     session = FakeSession()
     project_id = uuid.uuid4()
     extraction_run_id = uuid.uuid4()
+    patch_application_prepare(monkeypatch)
     response = {
         "facts": [
             {
@@ -859,6 +1113,7 @@ def test_batch_with_ambiguous_and_retired_proposals_preserves_other_successes(mo
 
 def test_unexpected_evidence_error_rolls_back_entire_batch(monkeypatch) -> None:
     session = FakeSession()
+    patch_application_prepare(monkeypatch)
     context = build_context()
     monkeypatch.setattr(
         persistence_service.persistence_repository,
@@ -900,6 +1155,7 @@ def test_unexpected_evidence_error_rolls_back_entire_batch(monkeypatch) -> None:
 def test_outer_flush_and_commit_failures_rollback(monkeypatch) -> None:
     for failing_method in ("flush", "commit"):
         session = FakeSession()
+        patch_application_prepare(monkeypatch)
         context = build_context()
         monkeypatch.setattr(
             persistence_service.persistence_repository,
@@ -952,6 +1208,7 @@ def test_outer_flush_and_commit_failures_rollback(monkeypatch) -> None:
 
 def test_cancelled_error_rolls_back_batch_and_propagates(monkeypatch) -> None:
     session = FakeSession()
+    patch_application_prepare(monkeypatch)
     context = build_context()
     monkeypatch.setattr(
         persistence_service.persistence_repository,
@@ -991,6 +1248,7 @@ def test_cancelled_error_rolls_back_batch_and_propagates(monkeypatch) -> None:
 
 def test_batch_result_is_stable_and_safe(monkeypatch) -> None:
     session = FakeSession()
+    patch_application_prepare(monkeypatch)
     context = build_context()
     calls = {"count": 0}
 
@@ -1043,12 +1301,139 @@ def test_batch_result_is_stable_and_safe(monkeypatch) -> None:
 
     assert [item.proposal_index for item in first.items] == [item.proposal_index for item in second.items]
     assert first.created_count == 1
-    assert second.reused_count == 1
+    assert first.application_id == second.application_id
+    assert first.replayed_application is False
+    assert second.replayed_application is True
+    assert second.created_count == 1
+    assert second.reused_count == 0
+    assert calls["count"] == 1
     dumped = first.model_dump()
     assert "response_json" not in dumped
     assert "batch_summary" not in dumped
     assert "excerpt" not in str(dumped)
     assert "prompt" not in str(dumped).lower()
+
+
+def test_application_model_constraints_exist_and_compile() -> None:
+    table = Base.metadata.tables["fact_extraction_batch_applications"]
+    assert table.c.status.type.length == 16
+    checks = {
+        constraint.name
+        for constraint in table.constraints
+        if getattr(constraint, "name", None) is not None
+    }
+    assert "uq_feba_inference_run_id" in {
+        constraint.name
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert {
+        "ck_fact_extraction_batch_applications_feba_status_valid",
+        "ck_fact_extraction_batch_applications_feba_response_hash_format",
+        "ck_fact_extraction_batch_applications_feba_response_json_hash_fmt",
+        "ck_fact_extraction_batch_applications_feba_result_hash_format",
+        "ck_fact_extraction_batch_applications_feba_result_json_is_object",
+        "ck_fact_extraction_batch_applications_feba_applying_shape",
+        "ck_fact_extraction_batch_applications_feba_completed_shape",
+    } <= checks
+
+
+def test_prepare_batch_application_recovers_only_exact_constraint(monkeypatch) -> None:
+    context = build_context()
+    existing_application = FactExtractionBatchApplication(
+        id=uuid.uuid4(),
+        inference_run_id=context.inference_run_id,
+        project_id=context.project_id,
+        extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+        input_batch_id=context.input_batch_id,
+        response_hash=context.response_hash,
+        response_json_hash=context.response_json_hash,
+        status="completed",
+        persistence_name=persistence_service.FACT_EXTRACTION_PERSISTENCE_NAME,
+        persistence_version=persistence_service.FACT_EXTRACTION_PERSISTENCE_VERSION,
+        entity_resolution_policy_name=persistence_service.ENTITY_RESOLUTION_POLICY_NAME,
+        entity_resolution_policy_version=persistence_service.ENTITY_RESOLUTION_POLICY_VERSION,
+        result_json={
+            "application_id": str(uuid.uuid4()),
+            "replayed_application": False,
+            "project_id": str(context.project_id),
+            "extraction_run_id": str(context.blocks[0].extraction_run_id_snapshot),
+            "inference_run_id": str(context.inference_run_id),
+            "input_batch_id": str(context.input_batch_id),
+            "response_hash": context.response_hash,
+            "persistence_name": persistence_service.FACT_EXTRACTION_PERSISTENCE_NAME,
+            "persistence_version": persistence_service.FACT_EXTRACTION_PERSISTENCE_VERSION,
+            "entity_resolution_policy_name": persistence_service.ENTITY_RESOLUTION_POLICY_NAME,
+            "entity_resolution_policy_version": persistence_service.ENTITY_RESOLUTION_POLICY_VERSION,
+            "proposal_count": 0,
+            "created_count": 0,
+            "reused_count": 0,
+            "withheld_count": 0,
+            "items": [],
+        },
+        result_hash="a" * 64,
+        completed_at=object(),
+    )
+    existing_application.result_json["application_id"] = str(existing_application.id)
+    existing_application.result_hash = persistence_service.build_fact_extraction_application_result_hash(
+        existing_application.result_json
+    )
+
+    existing_results = iter([None, existing_application])
+
+    async def fake_get_existing(*_args, **_kwargs):
+        return next(existing_results)
+
+    async def raise_target(*_args, **_kwargs):
+        raise make_integrity_error("uq_feba_inference_run_id")
+
+    monkeypatch.setattr(
+        persistence_service.persistence_repository,
+        "get_batch_application_for_update",
+        fake_get_existing,
+    )
+    monkeypatch.setattr(
+        persistence_service.persistence_repository,
+        "create_batch_application",
+        raise_target,
+    )
+
+    prepared = run_async(
+        persistence_service._prepare_batch_application(
+            FakeSession(),
+            project_id=context.project_id,
+            extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+            context=context,
+        )
+    )
+
+    assert prepared.replay_result is not None
+    assert prepared.replay_result.replayed_application is True
+
+    monkeypatch.setattr(
+        persistence_service.persistence_repository,
+        "get_batch_application_for_update",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+    )
+
+    async def raise_other(*_args, **_kwargs):
+        raise make_integrity_error("other_constraint")
+
+    monkeypatch.setattr(
+        persistence_service.persistence_repository,
+        "create_batch_application",
+        raise_other,
+    )
+
+    with pytest.raises(IntegrityError):
+        run_async(
+            persistence_service._prepare_batch_application(
+                FakeSession(),
+                project_id=context.project_id,
+                extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+                context=context,
+            )
+        )
 
 
 def test_fact_value_replay_unique_constraint_exists_and_compiles() -> None:
@@ -1070,6 +1455,15 @@ def test_new_migration_source_contains_duplicate_guard_and_downgrade() -> None:
     assert "drop_constraint" in migration
 
 
+def test_response_json_hash_migration_contains_backfill_and_ai_fact_guard() -> None:
+    migration = Path("alembic/versions/202607311900_inference_response_json_hash.py").read_text(encoding="utf-8")
+    assert "response_json_hash" in migration
+    assert "WHERE status = 'completed'" in migration
+    assert "Cannot create fact_extraction_batch_applications" in migration
+    assert "uq_feba_inference_run_id" in migration
+    assert "jsonb_typeof(result_json) = 'object'" in migration
+
+
 def test_single_migration_head_is_fact_value_replay() -> None:
     from alembic.config import Config
     from alembic.script import ScriptDirectory
@@ -1078,7 +1472,7 @@ def test_single_migration_head_is_fact_value_replay() -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202607311800"]
+    assert list(script.get_heads()) == ["202607311900"]
 
 
 def test_postgresql_offline_ddl_for_new_unique_constraint_compiles() -> None:

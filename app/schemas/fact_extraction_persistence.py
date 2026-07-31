@@ -5,7 +5,7 @@ from enum import StrEnum
 import uuid
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,17 +13,24 @@ class FactExtractionPersistenceBlock:
     input_block_id: uuid.UUID
     block_ref: str
     source_order: int
+    block_type: str
+    location_key: str
+    anchor_hash: str
+    page_no: int | None
+    start_line: int | None
+    end_line: int | None
+    heading_path: tuple[Any, ...]
 
-    document_block_id: uuid.UUID
+    document_block_id: uuid.UUID | None
     source_block_id_snapshot: uuid.UUID
     extraction_run_id_snapshot: uuid.UUID
 
     content_text: str
     content_hash: str
 
-    document_block_extraction_run_id: uuid.UUID
-    document_block_project_id: uuid.UUID
-    document_block_raw_text: str
+    document_block_extraction_run_id: uuid.UUID | None
+    document_block_project_id: uuid.UUID | None
+    document_block_raw_text: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,8 +41,14 @@ class CompletedFactExtractionPersistenceContext:
     status: str
 
     input_batch_id: uuid.UUID
+    batch_project_id: uuid.UUID
+    batch_task_type: str
+    batch_block_count: int
+    batch_character_count: int
+    batch_snapshot_hash: str
     response_json: dict[str, Any]
     response_hash: str
+    response_json_hash: str
 
     blocks: tuple[FactExtractionPersistenceBlock, ...]
 
@@ -102,6 +115,8 @@ class FactProposalPersistenceItem(BaseModel):
 
 
 class FactExtractionBatchPersistenceResult(BaseModel):
+    application_id: uuid.UUID
+    replayed_application: StrictBool
     project_id: uuid.UUID
     extraction_run_id: uuid.UUID
     inference_run_id: uuid.UUID

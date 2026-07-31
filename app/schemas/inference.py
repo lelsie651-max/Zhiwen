@@ -86,6 +86,7 @@ class InferenceRunRead(BaseModel):
     prompt_cache_miss_tokens: int | None = None
     reasoning_tokens: int | None = None
     response_hash: str | None = None
+    response_json_hash: str | None = None
     failure_code: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None

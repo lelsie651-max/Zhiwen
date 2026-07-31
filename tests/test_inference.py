@@ -151,7 +151,7 @@ def test_single_migration_head_is_inference():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202607311800"]
+    assert list(script.get_heads()) == ["202607311900"]
 
 
 def test_status_uses_string_and_check_not_native_enum():
@@ -962,6 +962,9 @@ def _completed_run(project_id, *, request_hash: str, prompt_contract_hash: str |
     run.attempt_count = 1
     run.response_json = {"facts": []}
     run.response_hash = sha256('{"facts":[]}')
+    run.response_json_hash = inference_service.build_inference_response_json_hash(
+        run.response_json
+    )
     return run
 
 
@@ -1176,9 +1179,12 @@ def test_lifecycle_idempotent_paths_commit_to_release_lock(monkeypatch):
 
     # complete: same response hash -> idempotent commit
     content = '{"a": 1}'
-    completed = _running_run(uuid.uuid4())
-    completed.status = InferenceRunStatus.COMPLETED.value
+    completed = _completed_run(uuid.uuid4(), request_hash=sha256("req"))
+    completed.response_json = {"a": 1}
     completed.response_hash = sha256(content)
+    completed.response_json_hash = inference_service.build_inference_response_json_hash(
+        completed.response_json
+    )
     _patch_run_lookup(monkeypatch, completed)
     s2 = FakeSession()
     run_async(

@@ -182,6 +182,28 @@ def _block_ref(index: int) -> str:
     return f"B{index + 1:04d}"
 
 
+def build_inference_input_batch_snapshot_hash(
+    snapshot_records: Sequence[dict[str, Any]],
+) -> str:
+    if not isinstance(snapshot_records, Sequence):
+        raise InvalidInferenceInputError("snapshot_records must be a sequence.")
+    return _sha256(_canonical_json(list(snapshot_records)))
+
+
+def build_inference_response_json_hash(
+    response_json: dict[str, Any],
+) -> str:
+    if type(response_json) is not dict:
+        raise InvalidInferenceCompletionError("response_json must be a JSON object.")
+    try:
+        _validate_json_value(response_json, top_level=True)
+    except _JsonBoundaryError as error:
+        raise InvalidInferenceCompletionError(
+            f"response_json must be a strict JSON object: {error.reason}"
+        ) from None
+    return _sha256(_canonical_json(copy.deepcopy(response_json)))
+
+
 def build_inference_request_hash(
     *,
     snapshot_hash: str,
@@ -281,7 +303,7 @@ async def create_inference_input_batch(
             ordered_blocks.append(row.DocumentBlock)
 
         snapshot_records = _build_snapshot_records(ordered_blocks)
-        snapshot_hash = _sha256(_canonical_json(snapshot_records))
+        snapshot_hash = build_inference_input_batch_snapshot_hash(snapshot_records)
         character_count = sum(len(block.raw_text) for block in ordered_blocks)
 
         existing = await inference_repository.get_batch_by_identity(
@@ -695,12 +717,17 @@ def _validate_reusable_completed_run(
         raise InferenceRunStateError("Completed run request_hash does not match the request.")
     if run.response_json is None or run.response_hash is None:
         raise InferenceRunStateError("Completed run is missing structured response data.")
+    if run.response_json_hash is None:
+        raise InferenceRunStateError("Completed run is missing response_json_hash.")
     if run.finish_reason != "stop":
         raise InferenceRunStateError("Completed run has an invalid finish_reason.")
     if run.response_model is None or run.completed_at is None or run.started_at is None:
         raise InferenceRunStateError("Completed run is missing terminal completion metadata.")
     if run.attempt_count < 1:
         raise InferenceRunStateError("Completed run has an invalid attempt_count.")
+    recomputed_json_hash = build_inference_response_json_hash(run.response_json)
+    if recomputed_json_hash != run.response_json_hash:
+        raise InferenceRunStateError("Completed run response_json_hash does not match stored response_json.")
 
 
 async def complete_inference_run(
@@ -718,6 +745,13 @@ async def complete_inference_run(
 
         if run.status == InferenceRunStatus.COMPLETED.value:
             if run.response_hash == response_hash:
+                _validate_reusable_completed_run(
+                    run,
+                    provider=run.provider,
+                    requested_model=run.requested_model,
+                    prompt_contract_hash=run.prompt_contract_hash,
+                    request_hash=run.request_hash,
+                )
                 await session.commit()  # idempotent; release lock
                 return run
             raise InferenceCompletionConflictError(
@@ -743,6 +777,7 @@ async def complete_inference_run(
             raise InvalidInferenceCompletionError(
                 "Completion content must be a single strict JSON object."
             ) from error
+        response_json_hash = build_inference_response_json_hash(response_object)
 
         run.status = InferenceRunStatus.COMPLETED.value
         run.completed_at = utc_now()
@@ -759,6 +794,7 @@ async def complete_inference_run(
         run.reasoning_tokens = completion.usage.reasoning_tokens
         run.response_json = response_object
         run.response_hash = response_hash
+        run.response_json_hash = response_json_hash
 
         await session.flush()
         await session.commit()
@@ -806,6 +842,7 @@ async def fail_inference_run(
         run.status = InferenceRunStatus.FAILED.value
         run.failure_code = safe_code
         run.failure_message = safe_message
+        run.response_json_hash = None
 
         await session.flush()
         await session.commit()

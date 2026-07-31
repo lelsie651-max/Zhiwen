@@ -27,6 +27,7 @@ from app.utils.validation import normalize_text
 
 if TYPE_CHECKING:
     from app.models.document_content import DocumentBlock
+    from app.models.fact_extraction_application import FactExtractionBatchApplication
     from app.models.fact import FactValue
     from app.models.project import Project
 
@@ -55,7 +56,7 @@ _BLOCK_TYPE_SQL = "('heading', 'paragraph', 'list_item', 'table_row', 'code', 'p
 # Non-terminal runs (pending/running) must not carry any response identity or
 # token accounting. Shared here so the ORM and the migration stay identical.
 _RUN_RESPONSE_NULLS_SQL = (
-    "response_json IS NULL AND response_hash IS NULL "
+    "response_json IS NULL AND response_hash IS NULL AND response_json_hash IS NULL "
     "AND response_model IS NULL AND response_id IS NULL "
     "AND system_fingerprint IS NULL AND finish_reason IS NULL "
     "AND prompt_tokens IS NULL AND completion_tokens IS NULL "
@@ -386,6 +387,10 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
             name="inference_runs_response_hash_format",
         ),
         CheckConstraint(
+            "response_json_hash IS NULL OR response_json_hash ~ '^[0-9a-f]{64}$'",
+            name="inference_runs_response_json_hash_format",
+        ),
+        CheckConstraint(
             "response_json IS NULL OR jsonb_typeof(response_json) = 'object'",
             name="inference_runs_response_json_is_object",
         ),
@@ -404,13 +409,14 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
             "status <> 'completed' OR ("
             "started_at IS NOT NULL AND completed_at IS NOT NULL AND finish_reason = 'stop' "
             "AND response_model IS NOT NULL AND response_json IS NOT NULL AND response_hash IS NOT NULL "
+            "AND response_json_hash IS NOT NULL "
             "AND attempt_count > 0 AND failure_code IS NULL AND failure_message IS NULL)",
             name="inference_runs_completed_shape",
         ),
         CheckConstraint(
             "status <> 'failed' OR ("
             "started_at IS NOT NULL AND completed_at IS NOT NULL AND failure_code IS NOT NULL "
-            "AND response_json IS NULL AND response_hash IS NULL)",
+            "AND response_json IS NULL AND response_hash IS NULL AND response_json_hash IS NULL)",
             name="inference_runs_failed_shape",
         ),
     )
@@ -467,6 +473,7 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     response_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    response_json_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -489,6 +496,13 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
     fact_values: Mapped[list["FactValue"]] = relationship(
         back_populates="inference_run",
         foreign_keys="FactValue.inference_run_id",
+    )
+    batch_application: Mapped["FactExtractionBatchApplication | None"] = relationship(
+        back_populates="inference_run",
+        foreign_keys="FactExtractionBatchApplication.inference_run_id",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
     @validates(
@@ -519,7 +533,7 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
         normalized = normalize_text(value)
         return normalized or None
 
-    @validates("prompt_contract_hash", "request_hash", "response_hash")
+    @validates("prompt_contract_hash", "request_hash", "response_hash", "response_json_hash")
     def validate_optional_hash(self, _key: str, value: str | None) -> str | None:
         if value is None:
             return None

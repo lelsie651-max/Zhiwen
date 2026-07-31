@@ -3,15 +3,21 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.fact_extraction import parse_fact_extraction_response_object
+from app.models.base import utc_now
 from app.models.entity import EntityStatus, normalize_entity_alias
 from app.models.fact import FactValueType
+from app.models.fact_extraction_application import FactExtractionBatchApplication
 from app.models.inference import InferenceRunStatus, InferenceTaskType
 from app.repositories import entity as entity_repository
+from app.repositories import fact as fact_repository
 from app.repositories import fact_extraction_persistence as persistence_repository
 from app.schemas.agent_fact_extraction import FactExtractionResponse, FactProposal
 from app.schemas.fact import FactIdentityInput, FactValueInput
@@ -31,6 +37,10 @@ from app.services.document_content import get_or_create_source_evidence_in_trans
 from app.services.entity import normalize_entity_type
 from app.services.fact import FactSubjectEntityConflictError, RetiredFactError, propose_ai_fact_value_in_transaction
 from app.services.fact_extraction_execution import validate_fact_extraction_response_against_batch
+from app.services.inference import (
+    build_inference_input_batch_snapshot_hash,
+    build_inference_response_json_hash,
+)
 
 
 FACT_EXTRACTION_PERSISTENCE_NAME = "agent1_fact_persistence"
@@ -39,7 +49,10 @@ FACT_EXTRACTION_PERSISTENCE_VERSION = "1.0.0"
 ENTITY_RESOLUTION_POLICY_NAME = "canonical_then_unique_active_alias"
 ENTITY_RESOLUTION_POLICY_VERSION = "1.0.0"
 
-_BLOCK_REF_PATTERN = re.compile(r"^B[0-9]{4,}$")
+_APPLICATION_STATUS_APPLYING = "applying"
+_APPLICATION_STATUS_COMPLETED = "completed"
+_APPLICATION_CONSTRAINT = "uq_feba_inference_run_id"
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class FactExtractionPersistenceError(Exception):
@@ -48,6 +61,16 @@ class FactExtractionPersistenceError(Exception):
 
 class FactExtractionPersistenceContextError(FactExtractionPersistenceError):
     """Raised when the stored inference context is not safe to persist."""
+
+
+class FactExtractionApplicationReplayConflictError(FactExtractionPersistenceError):
+    """Raised when a stored application ledger cannot be replayed safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedBatchApplication:
+    application: FactExtractionBatchApplication
+    replay_result: FactExtractionBatchPersistenceResult | None
 
 
 def _sha256_text(value: str) -> str:
@@ -60,10 +83,29 @@ def _require_uuid_instance(value: uuid.UUID, *, field_name: str) -> uuid.UUID:
     return value
 
 
+def _require_sha256(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise FactExtractionPersistenceContextError(f"{field_name} must be a string")
+    normalized = value.lower()
+    if not _SHA256_PATTERN.fullmatch(normalized):
+        raise FactExtractionPersistenceContextError(f"{field_name} must be a SHA-256 hex string")
+    return normalized
+
+
+def build_fact_extraction_application_result_hash(
+    result_json: dict[str, Any],
+) -> str:
+    return build_inference_response_json_hash(result_json)
+
+
+def _block_ref_for_order(source_order: int) -> str:
+    return f"B{source_order + 1:04d}"
+
+
 def _build_block_snapshots(
     *,
     input_batch_id: uuid.UUID,
-    blocks: tuple[FactExtractionPersistenceBlock, ...],
+    blocks: Sequence[FactExtractionPersistenceBlock],
 ) -> tuple[InferenceInputBlockSnapshot, ...]:
     return tuple(
         InferenceInputBlockSnapshot(
@@ -74,14 +116,72 @@ def _build_block_snapshots(
             document_block_id=block.document_block_id,
             source_block_id_snapshot=block.source_block_id_snapshot,
             extraction_run_id_snapshot=block.extraction_run_id_snapshot,
-            block_type="paragraph",
-            location_key="persisted",
-            anchor_hash="0" * 64,
+            block_type=block.block_type,
+            location_key=block.location_key,
+            anchor_hash=block.anchor_hash,
+            page_no=block.page_no,
+            start_line=block.start_line,
+            end_line=block.end_line,
+            heading_path=list(block.heading_path),
             content_text=block.content_text,
             content_hash=block.content_hash,
         )
         for block in blocks
     )
+
+
+def _build_snapshot_records(
+    blocks: Sequence[FactExtractionPersistenceBlock],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "source_order": block.source_order,
+            "block_ref": block.block_ref,
+            "source_block_id": str(block.source_block_id_snapshot),
+            "extraction_run_id": str(block.extraction_run_id_snapshot),
+            "block_type": block.block_type,
+            "location_key": block.location_key,
+            "anchor_hash": block.anchor_hash,
+            "page_no": block.page_no,
+            "start_line": block.start_line,
+            "end_line": block.end_line,
+            "heading_path": list(block.heading_path),
+            "content_hash": block.content_hash,
+        }
+        for block in blocks
+    ]
+
+
+def _validate_result_counts(result: FactExtractionBatchPersistenceResult) -> None:
+    items = result.items
+    created_count = sum(item.outcome == FactProposalPersistenceOutcome.CREATED for item in items)
+    reused_count = sum(item.outcome == FactProposalPersistenceOutcome.REUSED for item in items)
+    withheld_count = sum(item.outcome == FactProposalPersistenceOutcome.WITHHELD for item in items)
+    if result.proposal_count != len(items):
+        raise FactExtractionApplicationReplayConflictError("application result proposal_count is inconsistent")
+    if result.created_count != created_count:
+        raise FactExtractionApplicationReplayConflictError("application result created_count is inconsistent")
+    if result.reused_count != reused_count:
+        raise FactExtractionApplicationReplayConflictError("application result reused_count is inconsistent")
+    if result.withheld_count != withheld_count:
+        raise FactExtractionApplicationReplayConflictError("application result withheld_count is inconsistent")
+
+
+def _validate_replay_item_shape(item: FactProposalPersistenceItem) -> None:
+    if item.outcome == FactProposalPersistenceOutcome.WITHHELD:
+        if (
+            item.fact_id is not None
+            or item.fact_value_id is not None
+            or item.evidence_ids
+        ):
+            raise FactExtractionApplicationReplayConflictError(
+                "withheld application item carries persisted identifiers"
+            )
+        return
+    if item.fact_id is None or item.fact_value_id is None:
+        raise FactExtractionApplicationReplayConflictError(
+            "persisted application item is missing fact identifiers"
+        )
 
 
 def _validate_persistence_context(
@@ -102,31 +202,51 @@ def _validate_persistence_context(
         raise FactExtractionPersistenceContextError("inference run must be completed")
     if context.task_type != InferenceTaskType.FACT_EXTRACTION.value:
         raise FactExtractionPersistenceContextError("inference run task_type must be fact_extraction")
-    if context.project_id != project_id:
-        raise FactExtractionPersistenceContextError("inference run project mismatch")
-    if context.response_hash is None:
-        raise FactExtractionPersistenceContextError("inference run response payload is missing")
+    if context.project_id != project_id or context.batch_project_id != project_id:
+        raise FactExtractionPersistenceContextError("inference run or batch project mismatch")
+    if context.batch_task_type != context.task_type or context.batch_task_type != InferenceTaskType.FACT_EXTRACTION.value:
+        raise FactExtractionPersistenceContextError("inference run or batch task_type mismatch")
+    response_hash = _require_sha256(context.response_hash, field_name="response_hash")
+    response_json_hash = _require_sha256(
+        context.response_json_hash,
+        field_name="response_json_hash",
+    )
+    batch_snapshot_hash = _require_sha256(
+        context.batch_snapshot_hash,
+        field_name="batch_snapshot_hash",
+    )
 
     try:
         response = parse_fact_extraction_response_object(context.response_json)
-    except Exception as error:
+    except Exception:
         raise FactExtractionPersistenceContextError(
             "stored inference response_json is not a valid fact extraction response"
         ) from None
 
-    if not context.blocks:
-        raise FactExtractionPersistenceContextError("inference input batch must contain blocks")
-    expected_order = list(range(len(context.blocks)))
+    if context.batch_block_count <= 0:
+        raise FactExtractionPersistenceContextError("inference input batch must contain at least one block")
+    if len(context.blocks) != context.batch_block_count:
+        raise FactExtractionPersistenceContextError("input block count does not match the batch header")
     actual_order = [block.source_order for block in context.blocks]
-    if actual_order != expected_order:
+    if actual_order != list(range(context.batch_block_count)):
         raise FactExtractionPersistenceContextError("input blocks must be continuous from source_order 0")
+    actual_character_count = sum(len(block.content_text) for block in context.blocks)
+    if actual_character_count != context.batch_character_count:
+        raise FactExtractionPersistenceContextError("input block character count does not match the batch header")
 
-    block_refs: set[str] = set()
     for block in context.blocks:
+        expected_block_ref = _block_ref_for_order(block.source_order)
+        if block.block_ref != expected_block_ref:
+            raise FactExtractionPersistenceContextError("input block_ref does not match source_order")
+        if (
+            block.document_block_id is None
+            or block.document_block_extraction_run_id is None
+            or block.document_block_project_id is None
+            or block.document_block_raw_text is None
+        ):
+            raise FactExtractionPersistenceContextError("live document block context is missing")
         if block.document_block_id != block.source_block_id_snapshot:
             raise FactExtractionPersistenceContextError("document_block_id must match source_block_id_snapshot")
-        if block.source_block_id_snapshot != block.document_block_id:
-            raise FactExtractionPersistenceContextError("source block snapshot must match live document block")
         if block.extraction_run_id_snapshot != extraction_run_id:
             raise FactExtractionPersistenceContextError("input block extraction_run snapshot mismatch")
         if block.document_block_extraction_run_id != extraction_run_id:
@@ -137,11 +257,16 @@ def _validate_persistence_context(
             raise FactExtractionPersistenceContextError("input block content_text must match live document raw_text")
         if _sha256_text(block.content_text) != block.content_hash:
             raise FactExtractionPersistenceContextError("input block content_hash mismatch")
-        if not _BLOCK_REF_PATTERN.fullmatch(block.block_ref):
-            raise FactExtractionPersistenceContextError("input block_ref format is invalid")
-        if block.block_ref in block_refs:
-            raise FactExtractionPersistenceContextError("input block_ref values must be unique")
-        block_refs.add(block.block_ref)
+
+    recomputed_snapshot_hash = build_inference_input_batch_snapshot_hash(
+        _build_snapshot_records(context.blocks)
+    )
+    if recomputed_snapshot_hash != batch_snapshot_hash:
+        raise FactExtractionPersistenceContextError("input batch snapshot_hash mismatch")
+    recomputed_response_json_hash = build_inference_response_json_hash(context.response_json)
+    if recomputed_response_json_hash != response_json_hash:
+        raise FactExtractionPersistenceContextError("stored response_json_hash mismatch")
+    _require_sha256(response_hash, field_name="response_hash")
 
     try:
         validate_fact_extraction_response_against_batch(
@@ -333,6 +458,204 @@ def _build_evidence_inputs(
     return evidence_inputs
 
 
+async def _validate_replayed_result_against_database(
+    session: AsyncSession,
+    *,
+    result: FactExtractionBatchPersistenceResult,
+    inference_run_id: uuid.UUID,
+) -> None:
+    _validate_result_counts(result)
+    for item in result.items:
+        _validate_replay_item_shape(item)
+        if item.outcome == FactProposalPersistenceOutcome.WITHHELD:
+            continue
+
+        fact_value = await fact_repository.get_fact_value_with_links(
+            session,
+            fact_value_id=item.fact_value_id,
+        )
+        if fact_value is None:
+            raise FactExtractionApplicationReplayConflictError("application fact_value record is missing")
+        if fact_value.inference_run_id != inference_run_id:
+            raise FactExtractionApplicationReplayConflictError("application fact_value inference_run_id mismatch")
+        if fact_value.fact_id != item.fact_id:
+            raise FactExtractionApplicationReplayConflictError("application fact_value fact_id mismatch")
+        if fact_value.referenced_entity_id != item.referenced_entity_id:
+            raise FactExtractionApplicationReplayConflictError("application referenced_entity_id mismatch")
+        if fact_value.fact is None or fact_value.fact.subject_entity_id != item.subject_entity_id:
+            raise FactExtractionApplicationReplayConflictError("application subject_entity_id mismatch")
+
+        ordered_links = sorted(
+            fact_value.evidence_links,
+            key=lambda link: (link.source_order, str(link.id)),
+        )
+        evidence_ids = tuple(link.evidence_id for link in ordered_links)
+        if evidence_ids != item.evidence_ids:
+            raise FactExtractionApplicationReplayConflictError("application evidence link ids do not match")
+        if [link.source_order for link in ordered_links] != list(range(len(ordered_links))):
+            raise FactExtractionApplicationReplayConflictError("application evidence link source_order is inconsistent")
+
+
+async def _replay_completed_application(
+    session: AsyncSession,
+    *,
+    application: FactExtractionBatchApplication,
+    context: CompletedFactExtractionPersistenceContext,
+    project_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+) -> FactExtractionBatchPersistenceResult:
+    if application.status != _APPLICATION_STATUS_COMPLETED:
+        raise FactExtractionApplicationReplayConflictError("application is not completed")
+    if (
+        application.inference_run_id != context.inference_run_id
+        or application.project_id != project_id
+        or application.extraction_run_id != extraction_run_id
+        or application.input_batch_id != context.input_batch_id
+    ):
+        raise FactExtractionApplicationReplayConflictError("application identity does not match the replay request")
+    if application.response_hash != context.response_hash:
+        raise FactExtractionApplicationReplayConflictError("application response_hash mismatch")
+    if application.response_json_hash != context.response_json_hash:
+        raise FactExtractionApplicationReplayConflictError("application response_json_hash mismatch")
+    if (
+        application.result_json is None
+        or application.result_hash is None
+        or application.completed_at is None
+    ):
+        raise FactExtractionApplicationReplayConflictError("application completed shape is invalid")
+    recomputed_result_hash = build_fact_extraction_application_result_hash(application.result_json)
+    if recomputed_result_hash != application.result_hash:
+        raise FactExtractionApplicationReplayConflictError("application result_hash does not match stored result_json")
+
+    try:
+        stored_result = FactExtractionBatchPersistenceResult.model_validate(application.result_json)
+    except Exception:
+        raise FactExtractionApplicationReplayConflictError("application result_json is not a valid persistence result") from None
+
+    if stored_result.application_id != application.id:
+        raise FactExtractionApplicationReplayConflictError("application result_json has the wrong application_id")
+    if stored_result.replayed_application is not False:
+        raise FactExtractionApplicationReplayConflictError("stored application result must record replayed_application=false")
+    if (
+        stored_result.project_id != project_id
+        or stored_result.extraction_run_id != extraction_run_id
+        or stored_result.inference_run_id != context.inference_run_id
+        or stored_result.input_batch_id != context.input_batch_id
+        or stored_result.response_hash != context.response_hash
+    ):
+        raise FactExtractionApplicationReplayConflictError("stored application result header does not match the application")
+    if stored_result.persistence_name != application.persistence_name:
+        raise FactExtractionApplicationReplayConflictError("stored application persistence_name mismatch")
+    if stored_result.persistence_version != application.persistence_version:
+        raise FactExtractionApplicationReplayConflictError("stored application persistence_version mismatch")
+    if stored_result.entity_resolution_policy_name != application.entity_resolution_policy_name:
+        raise FactExtractionApplicationReplayConflictError("stored application entity resolution policy mismatch")
+    if stored_result.entity_resolution_policy_version != application.entity_resolution_policy_version:
+        raise FactExtractionApplicationReplayConflictError("stored application entity resolution policy version mismatch")
+
+    await _validate_replayed_result_against_database(
+        session,
+        result=stored_result,
+        inference_run_id=context.inference_run_id,
+    )
+    return stored_result.model_copy(update={"replayed_application": True})
+
+
+async def _prepare_batch_application(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+    context: CompletedFactExtractionPersistenceContext,
+) -> PreparedBatchApplication:
+    existing = await persistence_repository.get_batch_application_for_update(
+        session,
+        inference_run_id=context.inference_run_id,
+    )
+    if existing is not None:
+        replay = await _replay_completed_application(
+            session,
+            application=existing,
+            context=context,
+            project_id=project_id,
+            extraction_run_id=extraction_run_id,
+        )
+        return PreparedBatchApplication(application=existing, replay_result=replay)
+
+    application = FactExtractionBatchApplication(
+        inference_run_id=context.inference_run_id,
+        project_id=project_id,
+        extraction_run_id=extraction_run_id,
+        input_batch_id=context.input_batch_id,
+        response_hash=context.response_hash,
+        response_json_hash=context.response_json_hash,
+        status=_APPLICATION_STATUS_APPLYING,
+        persistence_name=FACT_EXTRACTION_PERSISTENCE_NAME,
+        persistence_version=FACT_EXTRACTION_PERSISTENCE_VERSION,
+        entity_resolution_policy_name=ENTITY_RESOLUTION_POLICY_NAME,
+        entity_resolution_policy_version=ENTITY_RESOLUTION_POLICY_VERSION,
+    )
+
+    savepoint = await session.begin_nested()
+    try:
+        await persistence_repository.create_batch_application(session, application)
+        await savepoint.commit()
+        return PreparedBatchApplication(application=application, replay_result=None)
+    except IntegrityError as error:
+        await savepoint.rollback()
+        constraint_name = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+        if constraint_name != _APPLICATION_CONSTRAINT:
+            raise
+        existing = await persistence_repository.get_batch_application_for_update(
+            session,
+            inference_run_id=context.inference_run_id,
+        )
+        if existing is None:
+            raise error
+        replay = await _replay_completed_application(
+            session,
+            application=existing,
+            context=context,
+            project_id=project_id,
+            extraction_run_id=extraction_run_id,
+        )
+        return PreparedBatchApplication(application=existing, replay_result=replay)
+
+
+def _build_result(
+    *,
+    application_id: uuid.UUID,
+    project_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+    inference_run_id: uuid.UUID,
+    input_batch_id: uuid.UUID,
+    response_hash: str,
+    items: Sequence[FactProposalPersistenceItem],
+) -> FactExtractionBatchPersistenceResult:
+    items_tuple = tuple(items)
+    created_count = sum(item.outcome == FactProposalPersistenceOutcome.CREATED for item in items_tuple)
+    reused_count = sum(item.outcome == FactProposalPersistenceOutcome.REUSED for item in items_tuple)
+    withheld_count = sum(item.outcome == FactProposalPersistenceOutcome.WITHHELD for item in items_tuple)
+    return FactExtractionBatchPersistenceResult(
+        application_id=application_id,
+        replayed_application=False,
+        project_id=project_id,
+        extraction_run_id=extraction_run_id,
+        inference_run_id=inference_run_id,
+        input_batch_id=input_batch_id,
+        response_hash=response_hash,
+        persistence_name=FACT_EXTRACTION_PERSISTENCE_NAME,
+        persistence_version=FACT_EXTRACTION_PERSISTENCE_VERSION,
+        entity_resolution_policy_name=ENTITY_RESOLUTION_POLICY_NAME,
+        entity_resolution_policy_version=ENTITY_RESOLUTION_POLICY_VERSION,
+        proposal_count=len(items_tuple),
+        created_count=created_count,
+        reused_count=reused_count,
+        withheld_count=withheld_count,
+        items=items_tuple,
+    )
+
+
 async def persist_completed_fact_extraction_batch(
     session: AsyncSession,
     *,
@@ -351,8 +674,17 @@ async def persist_completed_fact_extraction_batch(
             inference_run_id=inference_run_id,
             context=context,
         )
-        block_by_ref = {block.block_ref: block for block in context.blocks}
+        prepared_application = await _prepare_batch_application(
+            session,
+            project_id=project_id,
+            extraction_run_id=extraction_run_id,
+            context=context,
+        )
+        if prepared_application.replay_result is not None:
+            await session.commit()
+            return prepared_application.replay_result
 
+        block_by_ref = {block.block_ref: block for block in context.blocks}
         items: list[FactProposalPersistenceItem] = []
         for proposal_index, proposal in enumerate(response.facts):
             subject_resolution = await resolve_entity_mention(
@@ -496,29 +828,24 @@ async def persist_completed_fact_extraction_batch(
                     )
                 )
 
+        result = _build_result(
+            application_id=prepared_application.application.id,
+            project_id=project_id,
+            extraction_run_id=extraction_run_id,
+            inference_run_id=inference_run_id,
+            input_batch_id=context.input_batch_id,
+            response_hash=context.response_hash,
+            items=items,
+        )
+        result_json = result.model_dump(mode="json")
+        prepared_application.application.status = _APPLICATION_STATUS_COMPLETED
+        prepared_application.application.result_json = result_json
+        prepared_application.application.result_hash = build_fact_extraction_application_result_hash(result_json)
+        prepared_application.application.completed_at = utc_now()
+
         await session.flush()
         await session.commit()
+        return result
     except BaseException:
         await session.rollback()
         raise
-
-    items_tuple = tuple(items)
-    created_count = sum(item.outcome == FactProposalPersistenceOutcome.CREATED for item in items_tuple)
-    reused_count = sum(item.outcome == FactProposalPersistenceOutcome.REUSED for item in items_tuple)
-    withheld_count = sum(item.outcome == FactProposalPersistenceOutcome.WITHHELD for item in items_tuple)
-    return FactExtractionBatchPersistenceResult(
-        project_id=project_id,
-        extraction_run_id=extraction_run_id,
-        inference_run_id=inference_run_id,
-        input_batch_id=context.input_batch_id,
-        response_hash=context.response_hash,
-        persistence_name=FACT_EXTRACTION_PERSISTENCE_NAME,
-        persistence_version=FACT_EXTRACTION_PERSISTENCE_VERSION,
-        entity_resolution_policy_name=ENTITY_RESOLUTION_POLICY_NAME,
-        entity_resolution_policy_version=ENTITY_RESOLUTION_POLICY_VERSION,
-        proposal_count=len(items_tuple),
-        created_count=created_count,
-        reused_count=reused_count,
-        withheld_count=withheld_count,
-        items=items_tuple,
-    )

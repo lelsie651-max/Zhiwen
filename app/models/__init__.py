@@ -35,6 +35,7 @@ from app.models.fact import (
     FactValueStatus,
     FactValueType,
 )
+from app.models.fact_extraction_application import FactExtractionBatchApplication
 from app.models.document import Document, DocumentStatus
 from app.models.document_revision import (
     DocumentRevision,
@@ -107,6 +108,7 @@ __all__ = [
     "FactValueSourceKind",
     "FactEvidenceLink",
     "FactEvidenceRole",
+    "FactExtractionBatchApplication",
     "Document",
     "DocumentStatus",
     "DocumentRevision",
