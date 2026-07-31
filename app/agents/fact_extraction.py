@@ -57,36 +57,38 @@ class AgentResponseError(AgentError):
     """
 
 
-def render_fact_extraction_messages(
-    *,
-    prompt: "PromptDefinition",
-    batch: "InferenceInputBatch",
-) -> tuple[LLMMessage, LLMMessage]:
-    # The prompt and the batch must both describe the same task, and the prompt
-    # must carry the exact contract this renderer knows how to send.
+def validate_fact_extraction_prompt(prompt: "PromptDefinition") -> None:
     if prompt.task_type != _FACT_EXTRACTION_TASK_TYPE:
         raise AgentContextError("prompt task_type must be fact_extraction")
     if prompt.response_model is not FactExtractionResponse:
         raise AgentContextError("prompt response_model must be FactExtractionResponse")
-    if batch.task_type != _FACT_EXTRACTION_TASK_TYPE:
-        raise AgentContextError("input batch task_type must be fact_extraction")
 
-    # Require blocks to be explicitly loaded; reading batch.blocks on an unloaded
-    # relationship would trigger an async lazy load. Checking __dict__ never does.
-    if "blocks" not in batch.__dict__:
-        raise AgentContextError("input batch blocks are not loaded")
-    blocks = list(batch.__dict__["blocks"])
+
+def render_fact_extraction_message_contents(
+    *,
+    prompt: "PromptDefinition",
+    snapshot_hash: str,
+    blocks: list[Any],
+    task_type: str = _FACT_EXTRACTION_TASK_TYPE,
+    expected_block_count: int | None = None,
+    expected_character_count: int | None = None,
+) -> tuple[str, str]:
+    # Shared pure serializer used by both the real renderer and the planner's
+    # budget estimation. Keeping one implementation prevents JSON envelope drift.
+    validate_fact_extraction_prompt(prompt)
+    if task_type != _FACT_EXTRACTION_TASK_TYPE:
+        raise AgentContextError("input batch task_type must be fact_extraction")
     if not blocks:
         raise AgentContextError("input batch has no blocks")
 
     ordered = sorted(blocks, key=lambda b: b.source_order)
     if [b.source_order for b in ordered] != list(range(len(ordered))):
         raise AgentContextError("input batch blocks are not contiguous from 0")
-    if len(ordered) != batch.block_count:
+
+    resolved_block_count = len(ordered) if expected_block_count is None else expected_block_count
+    if len(ordered) != resolved_block_count:
         raise AgentContextError("input batch block_count does not match loaded blocks")
 
-    # block_ref must be exactly the canonical sequence B0001, B0002, ... aligned
-    # to source_order — this also guarantees uniqueness.
     expected_refs = [f"B{index + 1:04d}" for index in range(len(ordered))]
     if [b.block_ref for b in ordered] != expected_refs:
         raise AgentContextError("input batch block_refs must be sequential B0001, B0002, ...")
@@ -96,20 +98,21 @@ def render_fact_extraction_messages(
         content = block.content_text
         if not isinstance(content, str):
             raise AgentContextError("block content_text must be a string")
-        # content_text is verbatim: it is never stripped or normalized here.
         total_characters += len(content)
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         if digest != block.content_hash:
             raise AgentContextError("block content_hash does not match content_text")
-    if total_characters != batch.character_count:
+
+    resolved_character_count = (
+        total_characters if expected_character_count is None else expected_character_count
+    )
+    if total_characters != resolved_character_count:
         raise AgentContextError("input batch character_count does not match block content")
 
     envelope = {
-        # The full response contract goes to the model verbatim; it is the only
-        # permitted output shape. Its values come straight from the prompt model.
         "response_contract": prompt.response_json_schema,
         "input_batch": {
-            "snapshot_hash": batch.snapshot_hash,
+            "snapshot_hash": snapshot_hash,
             "blocks": [
                 {
                     "block_ref": block.block_ref,
@@ -117,7 +120,6 @@ def render_fact_extraction_messages(
                     "location_key": block.location_key,
                     "page_no": block.page_no,
                     "heading_path": list(block.heading_path),
-                    # Verbatim block text, safely escaped as a JSON string value.
                     "content": block.content_text,
                 }
                 for block in ordered
@@ -125,12 +127,28 @@ def render_fact_extraction_messages(
         },
     }
     envelope_json = _canonical_json(envelope)
+    return prompt.system_template, f"{prompt.instruction_template}\n\n{envelope_json}"
 
-    system_message = LLMMessage(role="system", content=prompt.system_template)
-    user_message = LLMMessage(
-        role="user",
-        content=f"{prompt.instruction_template}\n\n{envelope_json}",
+
+def render_fact_extraction_messages(
+    *,
+    prompt: "PromptDefinition",
+    batch: "InferenceInputBatch",
+) -> tuple[LLMMessage, LLMMessage]:
+    # Require blocks to be explicitly loaded; reading batch.blocks on an unloaded
+    # relationship would trigger an async lazy load. Checking __dict__ never does.
+    if "blocks" not in batch.__dict__:
+        raise AgentContextError("input batch blocks are not loaded")
+    system_content, user_content = render_fact_extraction_message_contents(
+        prompt=prompt,
+        snapshot_hash=batch.snapshot_hash,
+        blocks=list(batch.__dict__["blocks"]),
+        task_type=batch.task_type,
+        expected_block_count=batch.block_count,
+        expected_character_count=batch.character_count,
     )
+    system_message = LLMMessage(role="system", content=system_content)
+    user_message = LLMMessage(role="user", content=user_content)
     return system_message, user_message
 
 
