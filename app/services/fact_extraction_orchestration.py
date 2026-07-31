@@ -625,9 +625,103 @@ def _resolve_reconciliation_application_identity(
     if context.batch_application_id is not None and context.run_application_id is not None:
         if context.batch_application_id != context.run_application_id:
             raise FactExtractionOrchestrationStateError(
-                "batch application binding conflicts with inference-run application"
+                "batch_application_binding_conflict"
             )
     return context.application_id, context.application_status
+
+
+async def _lock_batch_attempt_reconciliation_state(
+    session: AsyncSession,
+    *,
+    orchestration_id: uuid.UUID,
+    batch_index: int,
+) -> tuple[
+    FactExtractionOrchestration,
+    FactExtractionOrchestrationBatch,
+    Any | None,
+    FactExtractionBatchApplication | None,
+    FactExtractionBatchApplication | None,
+    orchestration_repository.BatchAttemptReconciliationContext,
+]:
+    orchestration = await orchestration_repository.get_orchestration_for_update(
+        session,
+        orchestration_id=orchestration_id,
+    )
+    if orchestration is None:
+        raise FactExtractionOrchestrationStateError("orchestration not found")
+    batch = await orchestration_repository.get_batch_for_update(
+        session,
+        orchestration_id=orchestration_id,
+        batch_index=batch_index,
+    )
+    if batch is None:
+        raise FactExtractionOrchestrationStateError("orchestration batch not found")
+
+    run = None
+    if batch.current_inference_run_id is not None:
+        run = await inference_repository.get_run_for_update(session, batch.current_inference_run_id)
+        if run is None:
+            raise FactExtractionOrchestrationStateError("current_inference_run_missing")
+        if run.id != batch.current_inference_run_id:
+            raise FactExtractionOrchestrationStateError("batch current inference run mismatch")
+        if run.project_id != orchestration.project_id:
+            raise FactExtractionOrchestrationStateError("inference run project mismatch")
+        if run.task_type != "fact_extraction":
+            raise FactExtractionOrchestrationStateError("inference run task_type mismatch")
+        if run.input_batch_id != batch.current_input_batch_id:
+            raise FactExtractionOrchestrationStateError("inference run input_batch_id mismatch")
+
+    batch_application = None
+    if batch.application_id is not None:
+        batch_application = await orchestration_repository.get_application_for_update(
+            session,
+            application_id=batch.application_id,
+        )
+        if batch_application is None:
+            raise FactExtractionOrchestrationStateError("batch application not found")
+
+    run_application = None
+    if run is not None:
+        run_application = await orchestration_repository.get_application_by_inference_run_for_update(
+            session,
+            inference_run_id=run.id,
+        )
+
+    if batch.current_inference_run_id is None and (batch_application is not None or run_application is not None):
+        raise FactExtractionOrchestrationStateError("batch application requires current inference run")
+    if batch_application is not None and run is None:
+        raise FactExtractionOrchestrationStateError("batch application requires current inference run")
+    if batch_application is not None and batch_application.inference_run_id != batch.current_inference_run_id:
+        raise FactExtractionOrchestrationStateError("batch application inference run mismatch")
+    if batch_application is not None and run_application is not None and batch_application.id != run_application.id:
+        raise FactExtractionOrchestrationStateError("batch_application_binding_conflict")
+
+    application = batch_application or run_application
+    context = orchestration_repository.BatchAttemptReconciliationContext(
+        orchestration_id=orchestration.id,
+        orchestration_status=orchestration.status,
+        orchestration_project_id=orchestration.project_id,
+        orchestration_extraction_run_id=orchestration.extraction_run_id,
+        batch_id=batch.id,
+        batch_index=batch.batch_index,
+        batch_status=batch.status,
+        attempt_count=batch.attempt_count,
+        lease_token=batch.lease_token,
+        input_batch_id=batch.current_input_batch_id,
+        inference_run_id=batch.current_inference_run_id,
+        inference_run_status=None if run is None else run.status,
+        inference_run_project_id=None if run is None else run.project_id,
+        inference_run_task_type=None if run is None else run.task_type,
+        inference_run_input_batch_id=None if run is None else run.input_batch_id,
+        inference_run_failure_code=None if run is None else run.failure_code,
+        application_id=None if application is None else application.id,
+        application_status=None if application is None else application.status,
+        batch_application_id=None if batch_application is None else batch_application.id,
+        batch_application_status=None if batch_application is None else batch_application.status,
+        run_application_id=None if run_application is None else run_application.id,
+        run_application_status=None if run_application is None else run_application.status,
+    )
+    return orchestration, batch, run, batch_application, run_application, context
 
 
 def _determine_reconciliation_status(
@@ -664,6 +758,26 @@ def _build_reconciliation_result(
         application_id=batch.application_id,
         failure_code=batch.failure_code,
     )
+
+
+def _finalize_batch_from_locked_completed_application(
+    *,
+    orchestration: FactExtractionOrchestration,
+    batch: FactExtractionOrchestrationBatch,
+    run: Any,
+    application: FactExtractionBatchApplication,
+    worker_token: uuid.UUID | None,
+) -> tuple[FactExtractionBatchPersistenceResult, FactExtractionOrchestrationBatchResult]:
+    ledger_result = validate_fact_extraction_application_result_envelope(application=application)
+    batch_result = _apply_completed_application_to_batch(
+        orchestration=orchestration,
+        batch=batch,
+        run=run,
+        application=application,
+        ledger_result=ledger_result,
+        worker_token=worker_token,
+    )
+    return ledger_result, batch_result
 
 
 def _validate_existing_batches(
@@ -1233,35 +1347,26 @@ async def finalize_batch_from_completed_application(
     application_id: uuid.UUID,
 ) -> FactExtractionOrchestrationBatchResult:
     try:
-        orchestration = await orchestration_repository.get_orchestration_for_update(
-            session,
-            orchestration_id=orchestration_id,
-        )
-        if orchestration is None:
-            raise FactExtractionOrchestrationStateError("orchestration not found")
-        batch = await orchestration_repository.get_batch_for_update(
+        orchestration, batch, run, _batch_application, _run_application, _context = await _lock_batch_attempt_reconciliation_state(
             session,
             orchestration_id=orchestration_id,
             batch_index=batch_index,
         )
-        if batch is None:
-            raise FactExtractionOrchestrationStateError("orchestration batch not found")
+        if run is None:
+            raise FactExtractionOrchestrationStateError("inference run not found")
+        if run.id != inference_run_id:
+            raise FactExtractionOrchestrationStateError("inference run mismatch")
         application = await orchestration_repository.get_application_for_update(
             session,
             application_id=application_id,
         )
         if application is None:
             raise FactExtractionOrchestrationStateError("batch application not found")
-        run = await inference_repository.get_run_for_update(session, inference_run_id)
-        if run is None:
-            raise FactExtractionOrchestrationStateError("inference run not found")
-        ledger_result = validate_fact_extraction_application_result_envelope(application=application)
-        result = _apply_completed_application_to_batch(
+        _ledger_result, result = _finalize_batch_from_locked_completed_application(
             orchestration=orchestration,
             batch=batch,
             run=run,
             application=application,
-            ledger_result=ledger_result,
             worker_token=worker_token,
         )
         await session.flush()
@@ -1496,25 +1601,16 @@ async def reconcile_fact_extraction_batch_after_interruption(
     max_batch_attempts: int,
 ) -> BatchInterruptionReconciliation:
     try:
-        context = await orchestration_repository.get_batch_attempt_reconciliation_context_for_update(
+        _orchestration, batch, run, batch_application, run_application, context = await _lock_batch_attempt_reconciliation_state(
             session,
             orchestration_id=orchestration_id,
             batch_index=batch_index,
         )
-        if context is None:
-            raise FactExtractionOrchestrationStateError("orchestration batch not found")
         if context.orchestration_status in {
             _ORCH_STATUS_COMPLETED,
             _ORCH_STATUS_PARTIAL,
             _ORCH_STATUS_FAILED,
         }:
-            batch = await orchestration_repository.get_batch_for_update(
-                session,
-                orchestration_id=orchestration_id,
-                batch_index=batch_index,
-            )
-            if batch is None:
-                raise FactExtractionOrchestrationStateError("orchestration batch not found")
             await session.commit()
             return _build_reconciliation_result(
                 reconciliation_status=_determine_reconciliation_status(context),
@@ -1543,14 +1639,6 @@ async def reconcile_fact_extraction_batch_after_interruption(
                 application_id=result.application_id,
                 failure_code=result.failure_code,
             )
-
-        batch = await orchestration_repository.get_batch_for_update(
-            session,
-            orchestration_id=orchestration_id,
-            batch_index=batch_index,
-        )
-        if batch is None:
-            raise FactExtractionOrchestrationStateError("orchestration batch not found")
 
         if context.batch_status == _BATCH_STATUS_RUNNING and batch.lease_token not in {None, worker_token}:
             await session.commit()
@@ -1664,6 +1752,9 @@ async def _finalize_batch_success(
             raise FactExtractionOrchestrationStateError("orchestration batch not found")
         if batch.batch_plan_hash != execution_result.batch_plan_hash:
             raise FactExtractionOrchestrationStateError("execution result batch hash mismatch")
+        run = await inference_repository.get_run_for_update(session, execution_result.inference_run_id)
+        if run is None:
+            raise FactExtractionOrchestrationStateError("inference run not found")
         application = await orchestration_repository.get_application_for_update(
             session,
             application_id=persistence_result.application_id,
@@ -1694,15 +1785,11 @@ async def _finalize_batch_success(
             raise FactExtractionOrchestrationStateError("batch current_input_batch_id mismatch")
         if batch.current_inference_run_id != execution_result.inference_run_id:
             raise FactExtractionOrchestrationStateError("batch current_inference_run_id mismatch")
-        run = await inference_repository.get_run_for_update(session, execution_result.inference_run_id)
-        if run is None:
-            raise FactExtractionOrchestrationStateError("inference run not found")
-        _apply_completed_application_to_batch(
+        _ledger_result, _batch_result = _finalize_batch_from_locked_completed_application(
             orchestration=orchestration,
             batch=batch,
             run=run,
             application=application,
-            ledger_result=ledger_result,
             worker_token=worker_token,
         )
         await session.flush()
@@ -1722,50 +1809,14 @@ async def _finalize_batch_failure(
     max_batch_attempts: int,
 ) -> None:
     try:
-        orchestration = await orchestration_repository.get_orchestration_for_update(
-            session,
-            orchestration_id=orchestration_id,
-        )
-        if orchestration is None:
-            raise FactExtractionOrchestrationStateError("orchestration not found")
-        batch = await orchestration_repository.get_batch_for_update(
+        await reconcile_fact_extraction_batch_after_interruption(
             session,
             orchestration_id=orchestration_id,
             batch_index=batch_index,
+            worker_token=worker_token,
+            failure_code=failure_code,
+            max_batch_attempts=max_batch_attempts,
         )
-        if batch is None:
-            raise FactExtractionOrchestrationStateError("orchestration batch not found")
-        if batch.status == _BATCH_STATUS_COMPLETED:
-            await session.commit()
-            return
-        if batch.lease_token != worker_token:
-            raise FactExtractionOrchestrationStateError("batch lease is not owned by the current worker")
-
-        retryable = _is_retryable_failure_code(failure_code) and batch.attempt_count < max_batch_attempts
-        if retryable:
-            batch.status = _BATCH_STATUS_PENDING
-            batch.current_inference_run_id = None
-            batch.application_id = None
-            batch.failure_code = None
-            batch.completed_at = None
-            batch.lease_token = None
-            batch.lease_expires_at = None
-            batch.started_at = None
-            batch.proposal_count = 0
-            batch.created_count = 0
-            batch.reused_count = 0
-            batch.withheld_count = 0
-            await session.flush()
-            await session.commit()
-            return
-
-        batch.status = _BATCH_STATUS_FAILED
-        batch.failure_code = failure_code
-        batch.completed_at = utc_now()
-        batch.lease_token = None
-        batch.lease_expires_at = None
-        await session.flush()
-        await session.commit()
     except BaseException:
         await session.rollback()
         raise
@@ -1882,38 +1933,7 @@ async def _finalize_orchestration(
             batches=batches,
             applications_by_id=applications_by_id,
         )
-        proposal_count = sum(item.result.proposal_count for item in authenticated_applications.values())
-        created_count = sum(item.result.created_count for item in authenticated_applications.values())
-        reused_count = sum(item.result.reused_count for item in authenticated_applications.values())
-        withheld_count = sum(item.result.withheld_count for item in authenticated_applications.values())
-
-        target_completed_batch_count = len(completed_batches)
-        target_failed_batch_count = len(failed_batches)
-        if len(completed_batches) == len(batches):
-            target_status = _ORCH_STATUS_COMPLETED
-            target_failure_code = None
-        elif completed_batches and len(completed_batches) + len(failed_batches) == len(batches):
-            target_status = _ORCH_STATUS_PARTIAL
-            target_failure_code = None
-        elif not completed_batches and failed_batches and not running_or_pending:
-            target_status = _ORCH_STATUS_FAILED
-            target_failure_code = failed_batches[0].failure_code
-        else:
-            target_status = _ORCH_STATUS_RUNNING
-            target_failure_code = None
-
-        unchanged_terminal = (
-            orchestration.status == target_status
-            and target_status in {_ORCH_STATUS_COMPLETED, _ORCH_STATUS_PARTIAL, _ORCH_STATUS_FAILED}
-            and orchestration.completed_batch_count == target_completed_batch_count
-            and orchestration.failed_batch_count == target_failed_batch_count
-            and orchestration.proposal_count == proposal_count
-            and orchestration.created_count == created_count
-            and orchestration.reused_count == reused_count
-            and orchestration.withheld_count == withheld_count
-            and orchestration.failure_code == target_failure_code
-        )
-        if unchanged_terminal:
+        if orchestration.status in {_ORCH_STATUS_COMPLETED, _ORCH_STATUS_PARTIAL, _ORCH_STATUS_FAILED}:
             validate_terminal_orchestration_state(
                 orchestration=orchestration,
                 batches=batches,
@@ -1935,6 +1955,25 @@ async def _finalize_orchestration(
                 withheld_count=orchestration.withheld_count,
                 batches=tuple(_build_batch_result(batch) for batch in batches),
             )
+        proposal_count = sum(item.result.proposal_count for item in authenticated_applications.values())
+        created_count = sum(item.result.created_count for item in authenticated_applications.values())
+        reused_count = sum(item.result.reused_count for item in authenticated_applications.values())
+        withheld_count = sum(item.result.withheld_count for item in authenticated_applications.values())
+
+        target_completed_batch_count = len(completed_batches)
+        target_failed_batch_count = len(failed_batches)
+        if len(completed_batches) == len(batches):
+            target_status = _ORCH_STATUS_COMPLETED
+            target_failure_code = None
+        elif completed_batches and len(completed_batches) + len(failed_batches) == len(batches):
+            target_status = _ORCH_STATUS_PARTIAL
+            target_failure_code = None
+        elif not completed_batches and failed_batches and not running_or_pending:
+            target_status = _ORCH_STATUS_FAILED
+            target_failure_code = failed_batches[0].failure_code
+        else:
+            target_status = _ORCH_STATUS_RUNNING
+            target_failure_code = None
 
         now = utc_now()
         orchestration.completed_batch_count = target_completed_batch_count

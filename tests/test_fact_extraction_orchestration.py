@@ -21,6 +21,8 @@ from app.models.fact_extraction_orchestration import (
     FactExtractionOrchestrationBatch,
 )
 from app.models.inference import InferenceRun, InferenceRunStatus
+from app.repositories import fact_extraction_orchestration as orchestration_repository
+from app.repositories import inference as inference_repository
 from app.schemas.fact_extraction_orchestration import (
     FactExtractionOrchestrationBatchStatus,
     FactExtractionOrchestrationResult,
@@ -86,6 +88,43 @@ class SessionFactory:
                 return False
 
         return _Context()
+
+
+class ExecuteResult:
+    def __init__(self, *, scalar=None, row=None, scalars=None) -> None:
+        self._scalar = scalar
+        self._row = row
+        self._scalars = scalars or []
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+    def one_or_none(self):
+        return self._row
+
+    def scalars(self):
+        values = self._scalars
+
+        class _Scalars:
+            def all(self_inner):
+                return list(values)
+
+            def first(self_inner):
+                return values[0] if values else None
+
+        return _Scalars()
+
+
+class StatementCaptureSession:
+    def __init__(self, result: ExecuteResult | list[ExecuteResult]) -> None:
+        self.result = result
+        self.statements = []
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        if isinstance(self.result, list):
+            return self.result.pop(0)
+        return self.result
 
 
 def _source_block(*, source_order: int, raw_text: str, extraction_run_id: uuid.UUID) -> DocumentBlock:
@@ -231,6 +270,49 @@ def test_orchestration_tables_constraints_and_active_index_exist() -> None:
     active_index = next(index for index in orch_table.indexes if index.name == "uq_feo_active_request")
     compiled = str(CreateIndex(active_index).compile(dialect=postgresql.dialect()))
     assert "WHERE status IN ('planned', 'running')" in compiled
+
+
+def test_repository_explicitly_separates_document_and_inference_runs() -> None:
+    repo_path = Path("app/repositories/fact_extraction_orchestration.py")
+    source = repo_path.read_text(encoding="utf-8")
+
+    assert "from app.models.document_content import ExtractionRun as DocumentExtractionRun" in source
+    assert "from app.models.inference import InferenceRun" in source
+    assert "get_batch_attempt_reconciliation_context_for_update" not in source
+
+
+def test_inference_run_lock_query_compiles_with_inference_table_fields() -> None:
+    run_id = uuid.uuid4()
+    session = StatementCaptureSession(ExecuteResult(scalar=None))
+
+    run_async(inference_repository.get_run_for_update(session, run_id))
+
+    sql = str(session.statements[0].compile(dialect=postgresql.dialect()))
+    assert "FROM inference_runs" in sql
+    assert "inference_runs.project_id" in sql
+    assert "inference_runs.task_type" in sql
+    assert "inference_runs.input_batch_id" in sql
+    assert "inference_runs.failure_code" in sql
+    assert "extraction_runs.task_type" not in sql
+    assert "FOR UPDATE" in sql
+
+
+def test_application_by_inference_run_query_uses_where_and_for_update() -> None:
+    run_id = uuid.uuid4()
+    session = StatementCaptureSession(ExecuteResult(scalar=None))
+
+    run_async(
+        orchestration_repository.get_application_by_inference_run_for_update(
+            session,
+            inference_run_id=run_id,
+        )
+    )
+
+    sql = str(session.statements[0].compile(dialect=postgresql.dialect()))
+    assert "FROM fact_extraction_batch_applications" in sql
+    assert "fact_extraction_batch_applications.inference_run_id" in sql
+    assert "FOR UPDATE" in sql
+    assert "LEFT OUTER JOIN" not in sql
 
 
 def test_orchestration_request_hash_is_stable_and_changes_with_policy_inputs() -> None:
@@ -613,8 +695,8 @@ def test_reconcile_completed_application_finalizes_batch_even_if_attempts_exhaus
     )
     finalized_calls: list[tuple[uuid.UUID | None, uuid.UUID, uuid.UUID]] = []
 
-    async def fake_context(*_args, **_kwargs):
-        return context
+    async def fake_lock_state(*_args, **_kwargs):
+        return orchestration, batch, None, None, None, context
 
     async def fake_finalize(*_args, worker_token, inference_run_id, application_id, **_kwargs):
         finalized_calls.append((worker_token, inference_run_id, application_id))
@@ -633,11 +715,7 @@ def test_reconcile_completed_application_finalizes_batch_even_if_attempts_exhaus
             failure_code=None,
         )
 
-    monkeypatch.setattr(
-        orchestration_service.orchestration_repository,
-        "get_batch_attempt_reconciliation_context_for_update",
-        fake_context,
-    )
+    monkeypatch.setattr(orchestration_service, "_lock_batch_attempt_reconciliation_state", fake_lock_state)
     monkeypatch.setattr(orchestration_service, "finalize_batch_from_completed_application", fake_finalize)
 
     result = run_async(
@@ -689,18 +767,19 @@ def test_reconcile_completed_run_without_application_keeps_run_anchor_and_expire
         run_application_status=None,
     )
 
-    async def fake_context(*_args, **_kwargs):
-        return context
-
-    async def fake_get_batch(*_args, **_kwargs):
-        return batch
-
-    monkeypatch.setattr(
-        orchestration_service.orchestration_repository,
-        "get_batch_attempt_reconciliation_context_for_update",
-        fake_context,
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.COMPLETED.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code=None,
     )
-    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+
+    async def fake_lock_state(*_args, **_kwargs):
+        return orchestration, batch, run, None, None, context
+
+    monkeypatch.setattr(orchestration_service, "_lock_batch_attempt_reconciliation_state", fake_lock_state)
 
     result = run_async(
         orchestration_service.reconcile_fact_extraction_batch_after_interruption(
@@ -751,18 +830,19 @@ def test_reconcile_completed_run_with_persistence_context_invalid_fails_batch_bu
         run_application_status=None,
     )
 
-    async def fake_context(*_args, **_kwargs):
-        return context
-
-    async def fake_get_batch(*_args, **_kwargs):
-        return batch
-
-    monkeypatch.setattr(
-        orchestration_service.orchestration_repository,
-        "get_batch_attempt_reconciliation_context_for_update",
-        fake_context,
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.COMPLETED.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code=None,
     )
-    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+
+    async def fake_lock_state(*_args, **_kwargs):
+        return orchestration, batch, run, None, None, context
+
+    monkeypatch.setattr(orchestration_service, "_lock_batch_attempt_reconciliation_state", fake_lock_state)
 
     result = run_async(
         orchestration_service.reconcile_fact_extraction_batch_after_interruption(
@@ -813,18 +893,19 @@ def test_reconcile_does_not_modify_batch_after_lease_is_taken_over(monkeypatch) 
         run_application_status=None,
     )
 
-    async def fake_context(*_args, **_kwargs):
-        return context
-
-    async def fake_get_batch(*_args, **_kwargs):
-        return batch
-
-    monkeypatch.setattr(
-        orchestration_service.orchestration_repository,
-        "get_batch_attempt_reconciliation_context_for_update",
-        fake_context,
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.RUNNING.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code=None,
     )
-    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+
+    async def fake_lock_state(*_args, **_kwargs):
+        return orchestration, batch, run, None, None, context
+
+    monkeypatch.setattr(orchestration_service, "_lock_batch_attempt_reconciliation_state", fake_lock_state)
 
     result = run_async(
         orchestration_service.reconcile_fact_extraction_batch_after_interruption(
@@ -840,6 +921,224 @@ def test_reconcile_does_not_modify_batch_after_lease_is_taken_over(monkeypatch) 
     assert result.batch_status == "running"
     assert batch.lease_token != context.lease_token
     assert batch.current_inference_run_id == context.inference_run_id
+
+
+def test_lock_batch_attempt_reconciliation_state_uses_ordered_lock_sequence(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.application_id = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.COMPLETED.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code=None,
+    )
+    application = SimpleNamespace(id=batch.application_id, status="completed", inference_run_id=run.id)
+    calls: list[str] = []
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        calls.append("orchestration")
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        calls.append("batch")
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        calls.append("inference_run")
+        return run
+
+    async def fake_get_application(*_args, **_kwargs):
+        calls.append("application")
+        return application
+
+    async def fake_get_application_by_run(*_args, **_kwargs):
+        calls.append("run_application")
+        return application
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_application_for_update", fake_get_application)
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_application_by_inference_run_for_update",
+        fake_get_application_by_run,
+    )
+
+    _, _, _, _, _, context = run_async(
+        orchestration_service._lock_batch_attempt_reconciliation_state(
+            session,
+            orchestration_id=orchestration.id,
+            batch_index=0,
+        )
+    )
+
+    assert calls == ["orchestration", "batch", "inference_run", "application", "run_application"]
+    assert context.inference_run_id == run.id
+    assert context.application_id == application.id
+
+
+def test_lock_batch_attempt_reconciliation_state_rejects_application_binding_conflict(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.application_id = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.COMPLETED.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code=None,
+    )
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        return run
+
+    async def fake_batch_application(*_args, **_kwargs):
+        return SimpleNamespace(id=batch.application_id, status="completed", inference_run_id=run.id)
+
+    async def fake_run_application(*_args, **_kwargs):
+        return SimpleNamespace(id=uuid.uuid4(), status="completed", inference_run_id=run.id)
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_application_for_update", fake_batch_application)
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_application_by_inference_run_for_update",
+        fake_run_application,
+    )
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match="batch_application_binding_conflict"):
+        run_async(
+            orchestration_service._lock_batch_attempt_reconciliation_state(
+                session,
+                orchestration_id=orchestration.id,
+                batch_index=0,
+            )
+        )
+
+
+def test_lock_batch_attempt_reconciliation_state_rejects_missing_current_run(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match="current_inference_run_missing"):
+        run_async(
+            orchestration_service._lock_batch_attempt_reconciliation_state(
+                session,
+                orchestration_id=orchestration.id,
+                batch_index=0,
+            )
+        )
+
+
+def test_lock_batch_attempt_reconciliation_state_rejects_run_project_mismatch(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.RUNNING.value,
+        project_id=uuid.uuid4(),
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code=None,
+    )
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        return run
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match="project mismatch"):
+        run_async(
+            orchestration_service._lock_batch_attempt_reconciliation_state(
+                session,
+                orchestration_id=orchestration.id,
+                batch_index=0,
+            )
+        )
+
+
+def test_lock_batch_attempt_reconciliation_state_rejects_run_input_batch_mismatch(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.RUNNING.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=uuid.uuid4(),
+        failure_code=None,
+    )
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        return run
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match="input_batch_id mismatch"):
+        run_async(
+            orchestration_service._lock_batch_attempt_reconciliation_state(
+                session,
+                orchestration_id=orchestration.id,
+                batch_index=0,
+            )
+        )
 
 
 def test_record_prepared_run_notice_rejects_failed_run_registration(monkeypatch) -> None:
@@ -1020,6 +1319,275 @@ def test_terminal_validation_is_shared_by_read_and_finalize(monkeypatch) -> None
 
     with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match="shared-terminal-validator"):
         run_async(orchestration_service._finalize_orchestration(session, orchestration_id=orchestration.id))
+
+
+def test_finalize_batch_from_completed_application_locks_run_before_application(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.application_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.COMPLETED.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code=None,
+    )
+    application = SimpleNamespace(
+        id=batch.application_id,
+        status="completed",
+        project_id=orchestration.project_id,
+        extraction_run_id=orchestration.extraction_run_id,
+        inference_run_id=run.id,
+        input_batch_id=batch.current_input_batch_id,
+    )
+    ledger = SimpleNamespace(
+        proposal_count=1,
+        created_count=1,
+        reused_count=0,
+        withheld_count=0,
+    )
+    calls: list[str] = []
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        calls.append("orchestration")
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        calls.append("batch")
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        calls.append("run")
+        return run
+
+    async def fake_get_application(*_args, **_kwargs):
+        calls.append("application")
+        return application
+
+    async def fake_get_application_by_run(*_args, **_kwargs):
+        calls.append("run_application")
+        return application
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_application_for_update", fake_get_application)
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_application_by_inference_run_for_update",
+        fake_get_application_by_run,
+    )
+    monkeypatch.setattr(
+        orchestration_service,
+        "validate_fact_extraction_application_result_envelope",
+        lambda *, application: ledger,
+    )
+
+    result = run_async(
+        orchestration_service.finalize_batch_from_completed_application(
+            session,
+            orchestration_id=orchestration.id,
+            batch_index=0,
+            worker_token=batch.lease_token,
+            inference_run_id=run.id,
+            application_id=application.id,
+        )
+    )
+
+    assert result.status == FactExtractionOrchestrationBatchStatus.COMPLETED
+    assert calls.index("run") < calls.index("application")
+
+
+def test_finalize_batch_success_locks_run_before_application(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.COMPLETED.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+    )
+    application = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="completed",
+        project_id=orchestration.project_id,
+        extraction_run_id=orchestration.extraction_run_id,
+        inference_run_id=run.id,
+        input_batch_id=batch.current_input_batch_id,
+    )
+    calls: list[str] = []
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        calls.append("orchestration")
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        calls.append("batch")
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        calls.append("run")
+        return run
+
+    async def fake_get_application(*_args, **_kwargs):
+        calls.append("application")
+        return application
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_application_for_update", fake_get_application)
+
+    persistence_result = SimpleNamespace(
+        application_id=application.id,
+        replayed_application=False,
+        model_dump=lambda mode="json": {
+            "application_id": str(application.id),
+            "project_id": str(orchestration.project_id),
+        },
+    )
+    ledger_result = SimpleNamespace(
+        application_id=application.id,
+        inference_run_id=run.id,
+        input_batch_id=batch.current_input_batch_id,
+        project_id=orchestration.project_id,
+        extraction_run_id=orchestration.extraction_run_id,
+        proposal_count=0,
+        created_count=0,
+        reused_count=0,
+        withheld_count=0,
+        model_dump=lambda mode="json": {
+            "application_id": str(application.id),
+            "project_id": str(orchestration.project_id),
+        },
+    )
+    execution_result = SimpleNamespace(
+        batch_index=0,
+        batch_plan_hash=batch.batch_plan_hash,
+        inference_run_id=run.id,
+        input_batch_id=batch.current_input_batch_id,
+        project_id=orchestration.project_id,
+        extraction_run_id=orchestration.extraction_run_id,
+    )
+
+    monkeypatch.setattr(
+        orchestration_service,
+        "validate_fact_extraction_application_result_envelope",
+        lambda *, application: ledger_result,
+    )
+
+    run_async(
+        orchestration_service._finalize_batch_success(
+            session,
+            orchestration_id=orchestration.id,
+            worker_token=batch.lease_token,
+            execution_result=execution_result,
+            persistence_result=persistence_result,
+        )
+    )
+
+    assert calls.index("run") < calls.index("application")
+
+
+@pytest.mark.parametrize(
+    ("status", "batch_statuses"),
+    [
+        ("completed", ["completed", "pending", "completed"]),
+        ("partial", ["completed", "running", "failed"]),
+        ("failed", ["completed", "failed", "failed"]),
+    ],
+)
+def test_terminal_orchestration_state_mismatch_rejects_without_mutation(
+    monkeypatch,
+    status: str,
+    batch_statuses: list[str],
+) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status=status)
+    original_completed_at = orchestration.completed_at
+    original_counts = (
+        orchestration.completed_batch_count,
+        orchestration.failed_batch_count,
+        orchestration.proposal_count,
+        orchestration.created_count,
+        orchestration.reused_count,
+        orchestration.withheld_count,
+    )
+    batches = [
+        _make_batch(orchestration.id, batch_index=index, status=batch_status)
+        for index, batch_status in enumerate(batch_statuses)
+    ]
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_list_batches(*_args, **_kwargs):
+        return batches
+
+    async def fake_list_applications(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "list_batches_for_orchestration_for_update", fake_list_batches)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "list_applications", fake_list_applications)
+    monkeypatch.setattr(orchestration_service, "_load_authenticated_completed_applications", lambda **_kwargs: {})
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError):
+        run_async(orchestration_service._finalize_orchestration(session, orchestration_id=orchestration.id))
+
+    assert orchestration.completed_at == original_completed_at
+    assert (
+        orchestration.completed_batch_count,
+        orchestration.failed_batch_count,
+        orchestration.proposal_count,
+        orchestration.created_count,
+        orchestration.reused_count,
+        orchestration.withheld_count,
+    ) == original_counts
+    assert session.rollback_count == 1
+
+
+def test_finalize_batch_failure_is_only_a_reconciliation_wrapper(monkeypatch) -> None:
+    session = FakeSession()
+    calls = []
+
+    async def fake_reconcile(*_args, **_kwargs):
+        calls.append(_kwargs)
+        return orchestration_service.BatchInterruptionReconciliation(
+            reconciliation_status=None,
+            batch_status="failed",
+            attempt_count=1,
+            input_batch_id=None,
+            inference_run_id=None,
+            application_id=None,
+            failure_code="llm_transport_error",
+        )
+
+    monkeypatch.setattr(orchestration_service, "reconcile_fact_extraction_batch_after_interruption", fake_reconcile)
+
+    run_async(
+        orchestration_service._finalize_batch_failure(
+            session,
+            orchestration_id=uuid.uuid4(),
+            batch_index=0,
+            worker_token=uuid.uuid4(),
+            failure_code="llm_transport_error",
+            max_batch_attempts=2,
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["failure_code"] == "llm_transport_error"
 
 
 def test_finalize_orchestration_aggregates_completed_application_counts(monkeypatch) -> None:

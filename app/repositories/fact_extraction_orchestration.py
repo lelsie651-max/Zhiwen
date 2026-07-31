@@ -5,21 +5,21 @@ import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 
 from app.models.document import Document
-from app.models.document_content import ExtractionRun
+from app.models.document_content import ExtractionRun as DocumentExtractionRun
 from app.models.document_revision import DocumentRevision
 from app.models.fact_extraction_application import FactExtractionBatchApplication
 from app.models.fact_extraction_orchestration import (
     FactExtractionOrchestration,
     FactExtractionOrchestrationBatch,
 )
+from app.models.inference import InferenceRun
 
 
 @dataclass(frozen=True, slots=True)
 class ExtractionRunProjectContext:
-    extraction_run: ExtractionRun
+    extraction_run: DocumentExtractionRun
     project_id: uuid.UUID
     revision_status: str
 
@@ -57,20 +57,20 @@ async def get_extraction_run_with_project_for_update(
 ) -> ExtractionRunProjectContext | None:
     result = await session.execute(
         select(
-            ExtractionRun,
+            DocumentExtractionRun,
             Document.project_id.label("project_id"),
             DocumentRevision.status.label("revision_status"),
         )
-        .join(DocumentRevision, ExtractionRun.revision_id == DocumentRevision.id)
+        .join(DocumentRevision, DocumentExtractionRun.revision_id == DocumentRevision.id)
         .join(Document, DocumentRevision.document_id == Document.id)
-        .where(ExtractionRun.id == extraction_run_id)
-        .with_for_update(of=ExtractionRun)
+        .where(DocumentExtractionRun.id == extraction_run_id)
+        .with_for_update(of=DocumentExtractionRun)
     )
     row = result.one_or_none()
     if row is None:
         return None
     return ExtractionRunProjectContext(
-        extraction_run=row.ExtractionRun,
+        extraction_run=row.DocumentExtractionRun,
         project_id=row.project_id,
         revision_status=row.revision_status,
     )
@@ -185,6 +185,19 @@ async def get_application_for_update(
     return result.scalar_one_or_none()
 
 
+async def get_application_by_inference_run_for_update(
+    session: AsyncSession,
+    *,
+    inference_run_id: uuid.UUID,
+) -> FactExtractionBatchApplication | None:
+    result = await session.execute(
+        select(FactExtractionBatchApplication)
+        .where(FactExtractionBatchApplication.inference_run_id == inference_run_id)
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
 async def list_applications(
     session: AsyncSession,
     *,
@@ -197,99 +210,3 @@ async def list_applications(
         .where(FactExtractionBatchApplication.id.in_(application_ids))
     )
     return list(result.scalars().all())
-
-
-async def get_batch_attempt_reconciliation_context_for_update(
-    session: AsyncSession,
-    *,
-    orchestration_id: uuid.UUID,
-    batch_index: int,
-) -> BatchAttemptReconciliationContext | None:
-    batch_application = aliased(FactExtractionBatchApplication)
-    run_application = aliased(FactExtractionBatchApplication)
-    result = await session.execute(
-        select(
-            FactExtractionOrchestration.id.label("orchestration_id"),
-            FactExtractionOrchestration.status.label("orchestration_status"),
-            FactExtractionOrchestration.project_id.label("orchestration_project_id"),
-            FactExtractionOrchestration.extraction_run_id.label("orchestration_extraction_run_id"),
-            FactExtractionOrchestrationBatch.id.label("batch_id"),
-            FactExtractionOrchestrationBatch.batch_index.label("batch_index"),
-            FactExtractionOrchestrationBatch.status.label("batch_status"),
-            FactExtractionOrchestrationBatch.attempt_count.label("attempt_count"),
-            FactExtractionOrchestrationBatch.lease_token.label("lease_token"),
-            FactExtractionOrchestrationBatch.current_input_batch_id.label("input_batch_id"),
-            FactExtractionOrchestrationBatch.current_inference_run_id.label("inference_run_id"),
-            ExtractionRun.status.label("inference_run_status"),
-            ExtractionRun.project_id.label("inference_run_project_id"),
-            ExtractionRun.task_type.label("inference_run_task_type"),
-            ExtractionRun.input_batch_id.label("inference_run_input_batch_id"),
-            ExtractionRun.failure_code.label("inference_run_failure_code"),
-            batch_application.id.label("batch_application_id"),
-            batch_application.status.label("batch_application_status"),
-            run_application.id.label("run_application_id"),
-            run_application.status.label("run_application_status"),
-        )
-        .select_from(FactExtractionOrchestration)
-        .join(
-            FactExtractionOrchestrationBatch,
-            FactExtractionOrchestrationBatch.orchestration_id == FactExtractionOrchestration.id,
-        )
-        .outerjoin(
-            ExtractionRun,
-            ExtractionRun.id == FactExtractionOrchestrationBatch.current_inference_run_id,
-        )
-        .outerjoin(
-            batch_application,
-            batch_application.id == FactExtractionOrchestrationBatch.application_id,
-        )
-        .outerjoin(
-            run_application,
-            run_application.inference_run_id == ExtractionRun.id,
-        )
-        .where(
-            FactExtractionOrchestration.id == orchestration_id,
-            FactExtractionOrchestrationBatch.batch_index == batch_index,
-        )
-        .with_for_update(
-            of=(
-                FactExtractionOrchestration,
-                FactExtractionOrchestrationBatch,
-                ExtractionRun,
-                batch_application,
-                run_application,
-            )
-        )
-    )
-    row = result.one_or_none()
-    if row is None:
-        return None
-    if row.batch_application_id is not None and row.run_application_id is not None:
-        if row.batch_application_id != row.run_application_id:
-            raise RuntimeError("batch application binding conflicts with inference-run application")
-    application_id = row.batch_application_id or row.run_application_id
-    application_status = row.batch_application_status or row.run_application_status
-    return BatchAttemptReconciliationContext(
-        orchestration_id=row.orchestration_id,
-        orchestration_status=row.orchestration_status,
-        orchestration_project_id=row.orchestration_project_id,
-        orchestration_extraction_run_id=row.orchestration_extraction_run_id,
-        batch_id=row.batch_id,
-        batch_index=row.batch_index,
-        batch_status=row.batch_status,
-        attempt_count=row.attempt_count,
-        lease_token=row.lease_token,
-        input_batch_id=row.input_batch_id,
-        inference_run_id=row.inference_run_id,
-        inference_run_status=row.inference_run_status,
-        inference_run_project_id=row.inference_run_project_id,
-        inference_run_task_type=row.inference_run_task_type,
-        inference_run_input_batch_id=row.inference_run_input_batch_id,
-        inference_run_failure_code=row.inference_run_failure_code,
-        application_id=application_id,
-        application_status=application_status,
-        batch_application_id=row.batch_application_id,
-        batch_application_status=row.batch_application_status,
-        run_application_id=row.run_application_id,
-        run_application_status=row.run_application_status,
-    )
