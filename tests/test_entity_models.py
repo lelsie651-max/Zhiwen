@@ -23,7 +23,7 @@ def test_single_migration_head_includes_entity_models() -> None:
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
 
-    assert list(script.get_heads()) == ["202607311230"]
+    assert list(script.get_heads()) == ["202607311430"]
 
 
 def test_entity_status_columns_use_string_and_check_not_native_enum() -> None:
@@ -83,6 +83,8 @@ def test_entity_merge_and_alias_constraints_exist() -> None:
 def test_relationships_are_wired_without_ambiguity() -> None:
     assert Entity.project.property.back_populates == "entities"
     assert Entity.aliases.property.back_populates == "entity"
+    assert Entity.subject_facts.property.back_populates == "subject_entity"
+    assert Entity.referenced_fact_values.property.back_populates == "referenced_entity"
     assert Entity.merged_into.property.back_populates == "merged_from"
     assert EntityAlias.entity.property.back_populates == "aliases"
     assert Entity.created_by.property.back_populates == "created_entities"

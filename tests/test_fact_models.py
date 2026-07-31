@@ -3,11 +3,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import CheckConstraint, UniqueConstraint
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.schema import CreateTable
 
 from app.models import Base
+from app.models.entity import Entity
 from app.models.fact import Fact, FactEvidenceLink, FactValue
-from app.schemas.fact import FactIdentityInput, FactValueInput, FactValueRead
+from app.schemas.fact import FactIdentityInput, FactRead, FactValueInput, FactValueRead
 
 
 def test_fact_tables_are_registered() -> None:
@@ -34,6 +37,19 @@ def test_fact_current_value_unique_constraint_exists() -> None:
 
 def test_fact_current_value_relationship_uses_post_update() -> None:
     assert Fact.current_value.property.post_update is True
+
+
+def test_fact_subject_entity_foreign_key_uses_restrict_and_is_indexed() -> None:
+    table = Base.metadata.tables["facts"]
+    subject_entity_fk = next(
+        constraint
+        for constraint in table.foreign_key_constraints
+        if tuple(constraint.column_keys) == ("subject_entity_id",)
+    )
+    indexes = {tuple(index.columns.keys()) for index in table.indexes}
+
+    assert subject_entity_fk.ondelete == "RESTRICT"
+    assert ("subject_entity_id",) in indexes
 
 
 def test_fact_value_version_unique_constraint_exists() -> None:
@@ -126,6 +142,19 @@ def test_fact_value_inference_run_column_is_indexed() -> None:
     assert ("inference_run_id",) in indexes
 
 
+def test_fact_value_referenced_entity_foreign_key_uses_restrict_and_is_indexed() -> None:
+    table = Base.metadata.tables["fact_values"]
+    referenced_entity_fk = next(
+        constraint
+        for constraint in table.foreign_key_constraints
+        if tuple(constraint.column_keys) == ("referenced_entity_id",)
+    )
+    indexes = {tuple(index.columns.keys()) for index in table.indexes}
+
+    assert referenced_entity_fk.ondelete == "RESTRICT"
+    assert ("referenced_entity_id",) in indexes
+
+
 def test_fact_value_and_inference_run_relationships_are_bidirectional() -> None:
     assert FactValue.inference_run.property.back_populates == "fact_values"
     assert FactValue.inference_run.property._user_defined_foreign_keys
@@ -134,11 +163,33 @@ def test_fact_value_and_inference_run_relationships_are_bidirectional() -> None:
     }
 
 
+def test_fact_and_entity_relationships_are_bidirectional_without_ambiguity() -> None:
+    assert Fact.subject_entity.property.back_populates == "subject_facts"
+    assert Entity.subject_facts.property.back_populates == "subject_entity"
+    assert Fact.subject_entity.property._user_defined_foreign_keys
+    assert "subject_entity_id" in {
+        column.key for column in Fact.subject_entity.property._user_defined_foreign_keys
+    }
+    assert FactValue.referenced_entity.property.back_populates == "referenced_fact_values"
+    assert Entity.referenced_fact_values.property.back_populates == "referenced_entity"
+    assert FactValue.referenced_entity.property._user_defined_foreign_keys
+    assert "referenced_entity_id" in {
+        column.key for column in FactValue.referenced_entity.property._user_defined_foreign_keys
+    }
+
+
 def test_fact_value_read_exposes_only_inference_run_id_for_ai_provenance() -> None:
     assert "inference_run_id" in FactValueRead.model_fields
+    assert "referenced_entity_id" in FactValueRead.model_fields
     assert "response_json" not in FactValueRead.model_fields
     assert "failure_message" not in FactValueRead.model_fields
     assert "prompt" not in FactValueRead.model_fields
+
+
+def test_fact_read_exposes_only_subject_entity_id_for_subject_link() -> None:
+    assert "subject_entity_id" in FactRead.model_fields
+    assert "aliases" not in FactRead.model_fields
+    assert "merged_from" not in FactRead.model_fields
 
 
 def test_fact_value_decision_constraints_exist() -> None:
@@ -151,6 +202,20 @@ def test_fact_value_decision_constraints_exist() -> None:
     assert any("decided_by_id IS NULL AND decided_at IS NULL" in sql for sql in check_sql)
     assert any("status <> 'proposed'" in sql for sql in check_sql)
     assert any("status NOT IN ('accepted', 'rejected')" in sql for sql in check_sql)
+
+
+def test_fact_value_entity_ref_pair_constraint_exists_and_matches_model_sql() -> None:
+    table = Base.metadata.tables["fact_values"]
+    pair_checks = [
+        str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint) and constraint.name.endswith("ck_fv_entity_ref_pair")
+    ]
+
+    assert pair_checks == [
+        "((value_type = 'entity_ref' AND referenced_entity_id IS NOT NULL) OR "
+        "(value_type <> 'entity_ref' AND referenced_entity_id IS NULL))"
+    ]
 
 
 def test_fact_evidence_link_unique_and_source_order_constraints_exist() -> None:
@@ -180,6 +245,18 @@ def test_fact_identity_input_rejects_identity_hash_and_status_fields() -> None:
             identity_hash="a" * 64,
             status="active",
         )
+
+
+def test_fact_identity_input_allows_nullable_subject_entity_id() -> None:
+    payload = FactIdentityInput(
+        subject_kind="company",
+        subject_key="acme",
+        subject_entity_id=None,
+        predicate_key="legal_name",
+        scope_key=None,
+    )
+
+    assert payload.subject_entity_id is None
 
 
 def test_fact_value_input_rejects_hash_status_version_and_actor_fields() -> None:
@@ -221,6 +298,26 @@ def test_fact_value_input_validates_value_type_and_null_rule() -> None:
         FactValueInput(
             value_type="string",
             value_json=None,
+            language_code=None,
+            confidence=None,
+        )
+
+
+def test_fact_value_input_validates_entity_ref_pair_rule() -> None:
+    with pytest.raises(ValidationError):
+        FactValueInput(
+            value_type="entity_ref",
+            value_json={"kind": "company", "key": "acme"},
+            referenced_entity_id=None,
+            language_code=None,
+            confidence=None,
+        )
+
+    with pytest.raises(ValidationError):
+        FactValueInput(
+            value_type="string",
+            value_json="Acme",
+            referenced_entity_id="00000000-0000-0000-0000-000000000000",
             language_code=None,
             confidence=None,
         )
@@ -302,6 +399,42 @@ def test_fact_value_inference_provenance_migration_downgrade_restores_old_constr
     assert 'op.drop_column("fact_values", "inference_run_id")' in content
 
 
+def test_fact_entity_links_migration_adds_columns_constraints_and_safe_abort() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202607311430_fact_entity_links.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert 'down_revision: str | None = "202607311230"' in content
+    assert 'sa.Column("subject_entity_id", sa.Uuid(), nullable=True)' in content
+    assert 'sa.Column("referenced_entity_id", sa.Uuid(), nullable=True)' in content
+    assert 'op.f("fk_facts_subject_entity_id_entities")' in content
+    assert 'op.f("fk_fact_values_referenced_entity_id_entities")' in content
+    assert "Cannot add fact entity links" in content
+    assert "explicit referenced_entity_id backfill" in content
+    assert "((value_type = 'entity_ref' AND referenced_entity_id IS NOT NULL) OR " in content
+
+
+def test_fact_entity_links_migration_downgrade_is_reversible() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202607311430_fact_entity_links.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert 'op.drop_constraint(op.f(_ENTITY_REF_PAIR_CHECK), "fact_values", type_="check")' in content
+    assert 'op.drop_constraint(' in content
+    assert 'op.drop_index(op.f("ix_fact_values_referenced_entity_id"), table_name="fact_values")' in content
+    assert 'op.drop_index(op.f("ix_facts_subject_entity_id"), table_name="facts")' in content
+    assert 'op.drop_column("fact_values", "referenced_entity_id")' in content
+    assert 'op.drop_column("facts", "subject_entity_id")' in content
+
+
 def test_fact_migrations_include_inference_provenance_followup() -> None:
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     fact_migrations = sorted(
@@ -313,4 +446,16 @@ def test_fact_migrations_include_inference_provenance_followup() -> None:
     assert fact_migrations == [
         "202607301630_fact_models.py",
         "202607311030_fact_value_inference_provenance.py",
+        "202607311430_fact_entity_links.py",
     ]
+
+
+def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
+    dialect = postgresql.dialect()
+
+    facts_sql = str(CreateTable(Fact.__table__).compile(dialect=dialect))
+    fact_values_sql = str(CreateTable(FactValue.__table__).compile(dialect=dialect))
+
+    assert "subject_entity_id" in facts_sql
+    assert "referenced_entity_id" in fact_values_sql
+    assert "ck_fv_entity_ref_pair" in fact_values_sql

@@ -13,6 +13,7 @@ from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.utils.validation import normalize_text
 
 if TYPE_CHECKING:
+    from app.models.fact import Fact, FactValue
     from app.models.project import Project
     from app.models.user import User
 
@@ -114,6 +115,14 @@ class Entity(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         foreign_keys="EntityAlias.entity_id",
+    )
+    subject_facts: Mapped[list["Fact"]] = relationship(
+        back_populates="subject_entity",
+        foreign_keys="Fact.subject_entity_id",
+    )
+    referenced_fact_values: Mapped[list["FactValue"]] = relationship(
+        back_populates="referenced_entity",
+        foreign_keys="FactValue.referenced_entity_id",
     )
     merged_into: Mapped["Entity | None"] = relationship(
         back_populates="merged_from",

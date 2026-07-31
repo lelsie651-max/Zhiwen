@@ -39,6 +39,7 @@ def _normalize_optional_text(value: str | None, *, field_name: str, max_length: 
 class FactIdentityInput(BaseModel):
     subject_kind: str
     subject_key: str
+    subject_entity_id: uuid.UUID | None = None
     predicate_key: str
     scope_key: str | None = None
 
@@ -63,6 +64,7 @@ class FactIdentityInput(BaseModel):
 class FactValueInput(BaseModel):
     value_type: FactValueType
     value_json: Any | None = None
+    referenced_entity_id: uuid.UUID | None = None
     language_code: str | None = None
     confidence: float | None = None
 
@@ -89,6 +91,16 @@ class FactValueInput(BaseModel):
                 raise ValueError("value_json must be null when value_type is null")
         elif self.value_json is None:
             raise ValueError("value_json must not be null unless value_type is null")
+
+        if self.value_type == FactValueType.ENTITY_REF:
+            if self.referenced_entity_id is None:
+                raise ValueError(
+                    "referenced_entity_id must not be null when value_type is entity_ref"
+                )
+        elif self.referenced_entity_id is not None:
+            raise ValueError(
+                "referenced_entity_id must be null unless value_type is entity_ref"
+            )
         return self
 
 
@@ -117,6 +129,7 @@ class FactValueRead(BaseModel):
     source_kind: FactValueSourceKind
     extraction_run_id: uuid.UUID | None = None
     inference_run_id: uuid.UUID | None = None
+    referenced_entity_id: uuid.UUID | None = None
     confidence: float | None = None
     created_by_id: uuid.UUID | None = None
     decided_by_id: uuid.UUID | None = None
@@ -131,6 +144,7 @@ class FactRead(BaseModel):
     project_id: uuid.UUID
     subject_kind: str
     subject_key: str
+    subject_entity_id: uuid.UUID | None = None
     predicate_key: str
     scope_key: str | None = None
     identity_hash: str

@@ -62,10 +62,17 @@ class FakeSession:
         return savepoint
 
 
-def build_identity(*, scope_key: str | None = None) -> FactIdentityInput:
+def build_identity(
+    *,
+    scope_key: str | None = None,
+    subject_kind: str = "company",
+    subject_key: str = "acme",
+    subject_entity_id: uuid.UUID | None = None,
+) -> FactIdentityInput:
     return FactIdentityInput(
-        subject_kind="company",
-        subject_key="acme",
+        subject_kind=subject_kind,
+        subject_key=subject_key,
+        subject_entity_id=subject_entity_id,
         predicate_key="legal_name",
         scope_key=scope_key,
     )
@@ -75,12 +82,14 @@ def build_value_input(
     *,
     value_type: str = "string",
     value_json="Acme Corp",
+    referenced_entity_id: uuid.UUID | None = None,
     language_code: str | None = "zh-CN",
     confidence: float | None = 0.9,
 ) -> FactValueInput:
     return FactValueInput(
         value_type=value_type,
         value_json=value_json,
+        referenced_entity_id=referenced_entity_id,
         language_code=language_code,
         confidence=confidence,
     )
@@ -221,6 +230,23 @@ def build_inference_run_context(
     )
 
 
+def build_entity_context(
+    *,
+    entity_id: uuid.UUID | None = None,
+    project_id: uuid.UUID,
+    entity_type: str = "company",
+    canonical_key: str = "acme",
+    status: str = "active",
+):
+    return SimpleNamespace(
+        entity_id=entity_id or uuid.uuid4(),
+        project_id=project_id,
+        entity_type=entity_type,
+        canonical_key=canonical_key,
+        status=status,
+    )
+
+
 async def fake_completed_context(_inference_run_id, context):
     assert _inference_run_id == context.run_id
     return context
@@ -230,14 +256,18 @@ def build_fact(
     *,
     project_id: uuid.UUID,
     identity_hash: str,
+    subject_kind: str = "company",
+    subject_key: str = "acme",
+    subject_entity_id: uuid.UUID | None = None,
     status: str = FactStatus.ACTIVE.value,
     current_value_id: uuid.UUID | None = None,
 ) -> Fact:
     return Fact(
         id=uuid.uuid4(),
         project_id=project_id,
-        subject_kind="company",
-        subject_key="acme",
+        subject_kind=subject_kind,
+        subject_key=subject_key,
+        subject_entity_id=subject_entity_id,
         predicate_key="legal_name",
         scope_key=None,
         identity_hash=identity_hash,
@@ -492,6 +522,84 @@ def test_value_hash_is_stable_for_equivalent_object_key_order() -> None:
     assert result_one.normalized_value_text == result_two.normalized_value_text
 
 
+def test_entity_ref_value_hash_binds_referenced_entity_id() -> None:
+    entity_one = uuid.uuid4()
+    entity_two = uuid.uuid4()
+
+    result_one = fact_service.normalize_fact_value_input(
+        build_value_input(
+            value_type="entity_ref",
+            value_json={"kind": "company", "key": " Acme "},
+            referenced_entity_id=entity_one,
+            language_code=None,
+            confidence=None,
+        )
+    )
+    result_two = fact_service.normalize_fact_value_input(
+        build_value_input(
+            value_type="entity_ref",
+            value_json={"kind": "company", "key": " Acme "},
+            referenced_entity_id=entity_two,
+            language_code=None,
+            confidence=None,
+        )
+    )
+
+    assert result_one.value_json == {"key": "Acme", "kind": "company"}
+    assert result_one.value_hash != result_two.value_hash
+
+
+def test_entity_ref_value_hash_normalizes_equivalent_entity_keys() -> None:
+    entity_id = uuid.uuid4()
+
+    result_one = fact_service.normalize_fact_value_input(
+        build_value_input(
+            value_type="entity_ref",
+            value_json={"kind": "company", "key": " ACME "},
+            referenced_entity_id=entity_id,
+            language_code=None,
+            confidence=None,
+        )
+    )
+    result_two = fact_service.normalize_fact_value_input(
+        build_value_input(
+            value_type="entity_ref",
+            value_json={"kind": "company", "key": "ａｃｍｅ"},
+            referenced_entity_id=entity_id,
+            language_code=None,
+            confidence=None,
+        )
+    )
+
+    assert result_one.value_hash == result_two.value_hash
+    assert result_one.normalized_value_text != result_two.normalized_value_text
+
+
+def test_non_entity_ref_value_hash_keeps_existing_algorithm() -> None:
+    result = fact_service.normalize_fact_value_input(
+        build_value_input(
+            value_type="string",
+            value_json="  Acme Corp  ",
+            language_code=None,
+            confidence=None,
+        )
+    )
+
+    expected = fact_service.hashlib.sha256(
+        fact_service.json.dumps(
+            {
+                "value": "Acme Corp",
+                "value_type": "string",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert result.value_hash == expected
+
+
 @pytest.mark.parametrize(
     ("value_type", "value_json", "expected_message"),
     [
@@ -507,11 +615,14 @@ def test_value_hash_is_stable_for_equivalent_object_key_order() -> None:
     ],
 )
 def test_value_types_are_strictly_validated(value_type: str, value_json, expected_message: str) -> None:
+    referenced_entity_id = uuid.uuid4() if value_type == "entity_ref" else None
+
     with pytest.raises((fact_service.InvalidFactProposalError, ValidationError)) as exc_info:
         fact_service.normalize_fact_value_input(
             build_value_input(
                 value_type=value_type,
                 value_json=value_json,
+                referenced_entity_id=referenced_entity_id,
                 language_code=None,
                 confidence=None,
             )
@@ -1330,8 +1441,20 @@ def test_concurrent_fact_creation_returns_existing_fact(monkeypatch) -> None:
             return None
         return existing_fact
 
+    class FakeDiag:
+        def __init__(self, constraint_name: str | None) -> None:
+            self.constraint_name = constraint_name
+
+    class FakeOrigError(Exception):
+        def __init__(self, *, constraint_name: str | None) -> None:
+            self.diag = FakeDiag(constraint_name)
+
     async def fake_create_fact(_session, _fact):
-        raise IntegrityError("insert", {}, Exception("duplicate key"))
+        raise IntegrityError(
+            "insert",
+            {},
+            FakeOrigError(constraint_name="uq_facts_project_id_identity_hash"),
+        )
 
     async def fake_get_next_fact_version_no(_session, _fact_id):
         return 4
@@ -2136,3 +2259,614 @@ def test_create_human_fact_value_rolls_back_on_failure(monkeypatch) -> None:
 
     assert session.rollback_called is True
     assert session.commit_called is False
+
+
+def test_new_fact_writes_subject_entity_and_referenced_entity(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
+    subject_entity = build_entity_context(project_id=project.id, entity_type="company", canonical_key="acme")
+    referenced_entity = build_entity_context(
+        project_id=project.id,
+        entity_type="company",
+        canonical_key="beta llc",
+    )
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
+    )
+    payload = build_ai_payload(
+        [evidence.id],
+        identity=build_identity(
+            subject_kind="company",
+            subject_key=" ACME ",
+            subject_entity_id=subject_entity.entity_id,
+        ),
+        value=build_value_input(
+            value_type="entity_ref",
+            value_json={"kind": "company", "key": " Beta LLC "},
+            referenced_entity_id=referenced_entity.entity_id,
+            language_code=None,
+            confidence=None,
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_get_extraction_run_with_project(_session, _extraction_run_id):
+        return run
+
+    async def fake_get_completed_fact_extraction_run_context(_session, *, inference_run_id):
+        assert inference_run_id == inference_context.run_id
+        return inference_context
+
+    async def fake_list_source_evidences_with_context(_session, _evidence_ids):
+        return [evidence]
+
+    async def fake_get_fact_entity_context(_session, *, entity_id):
+        if entity_id == subject_entity.entity_id:
+            return subject_entity
+        if entity_id == referenced_entity.entity_id:
+            return referenced_entity
+        return None
+
+    async def fake_get_fact_by_identity_for_update(_session, **_kwargs):
+        return None
+
+    async def fake_create_fact(_session, fact):
+        captured["fact"] = fact
+        return fact
+
+    async def fake_get_next_fact_version_no(_session, _fact_id):
+        return 1
+
+    async def fake_create_fact_value(_session, fact_value):
+        captured["fact_value"] = fact_value
+        return fact_value
+
+    async def fake_create_fact_evidence_links(_session, links):
+        return links
+
+    monkeypatch.setattr(fact_service.fact_repository, "get_extraction_run_with_project", fake_get_extraction_run_with_project)
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        fake_get_completed_fact_extraction_run_context,
+    )
+    monkeypatch.setattr(fact_service.fact_repository, "list_source_evidences_with_context", fake_list_source_evidences_with_context)
+    monkeypatch.setattr(fact_service.entity_repository, "get_fact_entity_context", fake_get_fact_entity_context)
+    monkeypatch.setattr(fact_service.fact_repository, "get_fact_by_identity_for_update", fake_get_fact_by_identity_for_update)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact", fake_create_fact)
+    monkeypatch.setattr(fact_service.fact_repository, "get_next_fact_version_no", fake_get_next_fact_version_no)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact_value", fake_create_fact_value)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact_evidence_links", fake_create_fact_evidence_links)
+
+    result = run_async(
+        fact_service.propose_ai_fact_value(
+            session,
+            project_id=project.id,
+            extraction_run_id=run.id,
+            inference_run_id=inference_context.run_id,
+            payload=payload,
+        )
+    )
+
+    created_fact = captured["fact"]
+    created_value = captured["fact_value"]
+    assert created_fact.subject_kind == "company"
+    assert created_fact.subject_key == "acme"
+    assert created_fact.subject_entity_id == subject_entity.entity_id
+    assert created_value.referenced_entity_id == referenced_entity.entity_id
+    assert result.referenced_entity_id == referenced_entity.entity_id
+
+
+def test_cross_project_subject_entity_is_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    other_project = build_project()
+    actor = build_user()
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+
+    async def fake_get_fact_entity_context(_session, *, entity_id):
+        return build_entity_context(
+            entity_id=entity_id,
+            project_id=other_project.id,
+            entity_type="company",
+            canonical_key="acme",
+        )
+
+    monkeypatch.setattr(fact_service.entity_repository, "get_fact_entity_context", fake_get_fact_entity_context)
+
+    with pytest.raises(fact_service.FactSubjectEntityNotEligibleError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    identity=build_identity(
+                        subject_kind="company",
+                        subject_key="acme",
+                        subject_entity_id=uuid.uuid4(),
+                    )
+                ),
+            )
+        )
+
+    assert session.rollback_count == 1
+
+
+@pytest.mark.parametrize("status", ["merged", "archived"])
+def test_inactive_subject_entity_is_rejected(monkeypatch, status: str) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    entity_id = uuid.uuid4()
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+
+    async def fake_get_fact_entity_context(_session, *, entity_id):
+        return build_entity_context(
+            entity_id=entity_id,
+            project_id=project.id,
+            entity_type="company",
+            canonical_key="acme",
+            status=status,
+        )
+
+    monkeypatch.setattr(fact_service.entity_repository, "get_fact_entity_context", fake_get_fact_entity_context)
+
+    with pytest.raises(fact_service.FactSubjectEntityNotEligibleError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    identity=build_identity(
+                        subject_kind="company",
+                        subject_key="acme",
+                        subject_entity_id=entity_id,
+                    )
+                ),
+            )
+        )
+
+
+def test_subject_entity_kind_and_key_mismatch_is_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    entity = build_entity_context(project_id=project.id, entity_type="company", canonical_key="acme")
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+    monkeypatch.setattr(
+        fact_service.entity_repository,
+        "get_fact_entity_context",
+        lambda _session, *, entity_id: asyncio.sleep(0, result=entity),
+    )
+
+    with pytest.raises(fact_service.FactSubjectEntityMismatchError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    identity=build_identity(
+                        subject_kind="person",
+                        subject_key="acme",
+                        subject_entity_id=entity.entity_id,
+                    )
+                ),
+            )
+        )
+
+    with pytest.raises(fact_service.FactSubjectEntityMismatchError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    identity=build_identity(
+                        subject_kind="company",
+                        subject_key="other",
+                        subject_entity_id=entity.entity_id,
+                    )
+                ),
+            )
+        )
+
+
+def test_existing_fact_without_subject_entity_is_upgraded_in_place(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    entity = build_entity_context(project_id=project.id, entity_type="company", canonical_key="acme")
+    identity = build_identity(subject_kind="company", subject_key="ACME", subject_entity_id=entity.entity_id)
+    identity_hash = fact_service.build_fact_identity_hash(
+        FactIdentityInput(
+            subject_kind="company",
+            subject_key="acme",
+            subject_entity_id=entity.entity_id,
+            predicate_key="legal_name",
+            scope_key=None,
+        )
+    )
+    existing_fact = build_fact(
+        project_id=project.id,
+        identity_hash=identity_hash,
+        subject_kind="company",
+        subject_key="acme",
+        subject_entity_id=None,
+    )
+    create_calls = {"count": 0}
+    updated: dict[str, object] = {}
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+    monkeypatch.setattr(
+        fact_service.entity_repository,
+        "get_fact_entity_context",
+        lambda _session, *, entity_id: asyncio.sleep(0, result=entity),
+    )
+
+    async def fake_get_fact_by_identity_for_update(_session, **_kwargs):
+        return existing_fact
+
+    async def fake_create_fact(_session, fact):
+        create_calls["count"] += 1
+        return fact
+
+    async def fake_update_fact(_session, fact):
+        updated["fact"] = fact
+        return fact
+
+    monkeypatch.setattr(fact_service.fact_repository, "get_fact_by_identity_for_update", fake_get_fact_by_identity_for_update)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact", fake_create_fact)
+    monkeypatch.setattr(fact_service.fact_repository, "update_fact", fake_update_fact)
+    monkeypatch.setattr(fact_service.fact_repository, "get_next_fact_version_no", lambda _s, _id: asyncio.sleep(0, result=1))
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact_value", lambda _s, fact_value: asyncio.sleep(0, result=fact_value))
+
+    result = run_async(
+        fact_service.create_human_fact_value(
+            session,
+            project_id=project.id,
+            actor_id=actor.id,
+            payload=build_human_payload(identity=identity),
+        )
+    )
+
+    assert result.fact_id == existing_fact.id
+    assert existing_fact.subject_entity_id == entity.entity_id
+    assert updated["fact"] is existing_fact
+    assert create_calls["count"] == 0
+    assert existing_fact.identity_hash == identity_hash
+
+
+def test_existing_fact_with_different_subject_entity_is_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    requested_entity = build_entity_context(project_id=project.id, entity_type="company", canonical_key="acme")
+    existing_fact = build_fact(
+        project_id=project.id,
+        identity_hash=fact_service.build_fact_identity_hash(
+            FactIdentityInput(
+                subject_kind="company",
+                subject_key="acme",
+                subject_entity_id=requested_entity.entity_id,
+                predicate_key="legal_name",
+                scope_key=None,
+            )
+        ),
+        subject_entity_id=uuid.uuid4(),
+    )
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+    monkeypatch.setattr(
+        fact_service.entity_repository,
+        "get_fact_entity_context",
+        lambda _session, *, entity_id: asyncio.sleep(0, result=requested_entity),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda _session, **_kwargs: asyncio.sleep(0, result=existing_fact),
+    )
+
+    with pytest.raises(fact_service.FactSubjectEntityConflictError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    identity=build_identity(
+                        subject_kind="company",
+                        subject_key="acme",
+                        subject_entity_id=requested_entity.entity_id,
+                    )
+                ),
+            )
+        )
+
+
+def test_missing_subject_entity_does_not_clear_existing_binding(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    existing_fact = build_fact(
+        project_id=project.id,
+        identity_hash=fact_service.build_fact_identity_hash(build_identity()),
+        subject_entity_id=uuid.uuid4(),
+    )
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda _session, **_kwargs: asyncio.sleep(0, result=existing_fact),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "update_fact",
+        lambda _session, fact: asyncio.sleep(0, result=fact),
+    )
+    monkeypatch.setattr(fact_service.fact_repository, "get_next_fact_version_no", lambda _s, _id: asyncio.sleep(0, result=1))
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact_value", lambda _s, fact_value: asyncio.sleep(0, result=fact_value))
+
+    result = run_async(
+        fact_service.create_human_fact_value(
+            session,
+            project_id=project.id,
+            actor_id=actor.id,
+            payload=build_human_payload(),
+        )
+    )
+
+    assert result.fact_id == existing_fact.id
+    assert existing_fact.subject_entity_id is not None
+
+
+def test_cross_project_and_inactive_referenced_entity_are_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    referenced_entity_id = uuid.uuid4()
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+
+    async def fake_cross_project(_session, *, entity_id):
+        return build_entity_context(
+            entity_id=entity_id,
+            project_id=uuid.uuid4(),
+            entity_type="company",
+            canonical_key="beta llc",
+        )
+
+    monkeypatch.setattr(fact_service.entity_repository, "get_fact_entity_context", fake_cross_project)
+
+    with pytest.raises(fact_service.FactReferencedEntityNotEligibleError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    value=build_value_input(
+                        value_type="entity_ref",
+                        value_json={"kind": "company", "key": "Beta LLC"},
+                        referenced_entity_id=referenced_entity_id,
+                        language_code=None,
+                        confidence=None,
+                    )
+                ),
+            )
+        )
+
+    async def fake_archived(_session, *, entity_id):
+        return build_entity_context(
+            entity_id=entity_id,
+            project_id=project.id,
+            entity_type="company",
+            canonical_key="beta llc",
+            status="archived",
+        )
+
+    monkeypatch.setattr(fact_service.entity_repository, "get_fact_entity_context", fake_archived)
+
+    with pytest.raises(fact_service.FactReferencedEntityNotEligibleError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    value=build_value_input(
+                        value_type="entity_ref",
+                        value_json={"kind": "company", "key": "Beta LLC"},
+                        referenced_entity_id=referenced_entity_id,
+                        language_code=None,
+                        confidence=None,
+                    )
+                ),
+            )
+        )
+
+
+def test_referenced_entity_kind_and_key_mismatch_are_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    referenced_entity = build_entity_context(
+        project_id=project.id,
+        entity_type="company",
+        canonical_key="beta llc",
+    )
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+    monkeypatch.setattr(
+        fact_service.entity_repository,
+        "get_fact_entity_context",
+        lambda _session, *, entity_id: asyncio.sleep(0, result=referenced_entity),
+    )
+
+    with pytest.raises(fact_service.FactReferencedEntityMismatchError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    value=build_value_input(
+                        value_type="entity_ref",
+                        value_json={"kind": "person", "key": "Beta LLC"},
+                        referenced_entity_id=referenced_entity.entity_id,
+                        language_code=None,
+                        confidence=None,
+                    )
+                ),
+            )
+        )
+
+    with pytest.raises(fact_service.FactReferencedEntityMismatchError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(
+                    value=build_value_input(
+                        value_type="entity_ref",
+                        value_json={"kind": "company", "key": "Other"},
+                        referenced_entity_id=referenced_entity.entity_id,
+                        language_code=None,
+                        confidence=None,
+                    )
+                ),
+            )
+        )
+
+
+def test_non_target_integrity_error_with_matching_text_is_not_swallowed(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda _session, **_kwargs: asyncio.sleep(0, result=None),
+    )
+
+    class FakeDiag:
+        def __init__(self, constraint_name: str | None) -> None:
+            self.constraint_name = constraint_name
+
+    class FakeOrigError(Exception):
+        def __init__(self, message: str, *, constraint_name: str | None = None) -> None:
+            super().__init__(message)
+            if constraint_name is not None:
+                self.diag = FakeDiag(constraint_name)
+
+    async def fake_create_fact(_session, _fact):
+        raise IntegrityError(
+            "insert",
+            {},
+            FakeOrigError(
+                "uq_facts_project_id_identity_hash appears in the text",
+                constraint_name="uq_some_other_constraint",
+            ),
+        )
+
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact", fake_create_fact)
+
+    with pytest.raises(IntegrityError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(),
+            )
+        )
+
+
+def test_integrity_error_without_diag_is_reraised(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda _session, **_kwargs: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "create_fact",
+        lambda _session, _fact: asyncio.sleep(
+            0,
+            result=(_ for _ in ()).throw(IntegrityError("insert", {}, Exception("duplicate"))),
+        ),
+    )
+
+    with pytest.raises(IntegrityError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(),
+            )
+        )
+
+
+def test_concurrent_requery_with_mismatched_identity_is_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    actor = build_user()
+    mismatched_fact = build_fact(
+        project_id=project.id,
+        identity_hash=fact_service.build_fact_identity_hash(build_identity()),
+        subject_kind="person",
+        subject_key="acme",
+    )
+    lookup_count = {"count": 0}
+
+    patch_actor_permission(monkeypatch, project_id=project.id, actor=actor, role="owner")
+
+    async def fake_get_fact_by_identity_for_update(_session, **_kwargs):
+        lookup_count["count"] += 1
+        if lookup_count["count"] == 1:
+            return None
+        return mismatched_fact
+
+    class FakeDiag:
+        def __init__(self, constraint_name: str | None) -> None:
+            self.constraint_name = constraint_name
+
+    class FakeOrigError(Exception):
+        def __init__(self, *, constraint_name: str | None) -> None:
+            self.diag = FakeDiag(constraint_name)
+
+    async def fake_create_fact(_session, _fact):
+        raise IntegrityError("insert", {}, FakeOrigError(constraint_name="uq_facts_project_id_identity_hash"))
+
+    monkeypatch.setattr(fact_service.fact_repository, "get_fact_by_identity_for_update", fake_get_fact_by_identity_for_update)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact", fake_create_fact)
+
+    with pytest.raises(fact_service.FactIdentityConflictError):
+        run_async(
+            fact_service.create_human_fact_value(
+                session,
+                project_id=project.id,
+                actor_id=actor.id,
+                payload=build_human_payload(),
+            )
+        )

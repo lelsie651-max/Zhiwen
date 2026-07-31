@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import uuid
 
 from sqlalchemy import select
@@ -9,6 +10,15 @@ from sqlalchemy.orm import joinedload
 from app.models.entity import Entity, EntityAlias
 from app.models.project import Project
 from app.models.project_member import ProjectMember
+
+
+@dataclass(frozen=True, slots=True)
+class FactEntityContext:
+    entity_id: uuid.UUID
+    project_id: uuid.UUID
+    entity_type: str
+    canonical_key: str
+    status: str
 
 
 async def get_project_by_id(session: AsyncSession, project_id: uuid.UUID) -> Project | None:
@@ -81,6 +91,33 @@ async def get_entity_by_id_for_update(
         .with_for_update()
     )
     return result.scalar_one_or_none()
+
+
+async def get_fact_entity_context(
+    session: AsyncSession,
+    *,
+    entity_id: uuid.UUID,
+) -> FactEntityContext | None:
+    result = await session.execute(
+        select(
+            Entity.id,
+            Entity.project_id,
+            Entity.entity_type,
+            Entity.canonical_key,
+            Entity.status,
+        ).where(Entity.id == entity_id)
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+
+    return FactEntityContext(
+        entity_id=row.id,
+        project_id=row.project_id,
+        entity_type=row.entity_type,
+        canonical_key=row.canonical_key,
+        status=row.status,
+    )
 
 
 async def get_entity_alias_by_id_for_update(

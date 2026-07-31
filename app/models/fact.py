@@ -15,6 +15,7 @@ from app.utils.validation import normalize_text
 
 if TYPE_CHECKING:
     from app.models.document_content import ExtractionRun, SourceEvidence
+    from app.models.entity import Entity
     from app.models.inference import InferenceRun
     from app.models.project import Project
     from app.models.user import User
@@ -89,6 +90,11 @@ class Fact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     subject_kind: Mapped[str] = mapped_column(String(64), nullable=False)
     subject_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    subject_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("entities.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     predicate_key: Mapped[str] = mapped_column(String(255), nullable=False)
     scope_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -112,6 +118,10 @@ class Fact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     project: Mapped["Project"] = relationship(
         back_populates="facts",
         foreign_keys=[project_id],
+    )
+    subject_entity: Mapped["Entity | None"] = relationship(
+        back_populates="subject_facts",
+        foreign_keys=[subject_entity_id],
     )
     current_value: Mapped["FactValue | None"] = relationship(
         back_populates="current_for_fact",
@@ -202,6 +212,11 @@ class FactValue(UUIDPrimaryKeyMixin, Base):
             "(source_kind = 'ai' OR inference_run_id IS NULL)",
             name="fact_values_non_ai_forbids_inference_run",
         ),
+        CheckConstraint(
+            "((value_type = 'entity_ref' AND referenced_entity_id IS NOT NULL) OR "
+            "(value_type <> 'entity_ref' AND referenced_entity_id IS NULL))",
+            name="ck_fv_entity_ref_pair",
+        ),
     )
 
     fact_id: Mapped[uuid.UUID] = mapped_column(
@@ -229,6 +244,11 @@ class FactValue(UUIDPrimaryKeyMixin, Base):
     )
     inference_run_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("inference_runs.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    referenced_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("entities.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -267,6 +287,10 @@ class FactValue(UUIDPrimaryKeyMixin, Base):
     inference_run: Mapped["InferenceRun | None"] = relationship(
         back_populates="fact_values",
         foreign_keys=[inference_run_id],
+    )
+    referenced_entity: Mapped["Entity | None"] = relationship(
+        back_populates="referenced_fact_values",
+        foreign_keys=[referenced_entity_id],
     )
     created_by: Mapped["User | None"] = relationship(
         back_populates="created_fact_values",

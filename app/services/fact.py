@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document_content import ExtractionRunOutcome, ExtractionRunStatus
+from app.models.entity import EntityStatus, normalize_entity_alias
 from app.models.fact import (
     Fact,
     FactEvidenceLink,
@@ -23,6 +24,7 @@ from app.models.fact import (
 from app.models.inference import InferenceRunStatus, InferenceTaskType
 from app.models.project_member import ProjectMemberRole
 from app.models.user import UserStatus
+from app.repositories import entity as entity_repository
 from app.repositories import fact as fact_repository
 from app.repositories import inference as inference_repository
 from app.repositories import user as user_repository
@@ -63,6 +65,30 @@ class FactInferenceEvidenceMismatchError(FactProposalError):
     """Raised when evidence blocks are not present in the inference input batch."""
 
 
+class FactSubjectEntityNotEligibleError(FactProposalError):
+    """Raised when the supplied subject entity cannot be used for the fact."""
+
+
+class FactSubjectEntityMismatchError(FactProposalError):
+    """Raised when subject identity fields do not match the supplied entity."""
+
+
+class FactSubjectEntityConflictError(FactProposalError):
+    """Raised when an existing fact is already bound to another subject entity."""
+
+
+class FactReferencedEntityNotEligibleError(FactProposalError):
+    """Raised when the supplied referenced entity cannot be used for entity_ref."""
+
+
+class FactReferencedEntityMismatchError(FactProposalError):
+    """Raised when entity_ref snapshot fields do not match the supplied entity."""
+
+
+class FactIdentityConflictError(FactProposalError):
+    """Raised when a locked fact no longer matches the expected identity."""
+
+
 class RetiredFactError(FactProposalError):
     """Raised when a proposal targets a retired fact."""
 
@@ -85,6 +111,10 @@ class NormalizedFactValue:
     value_json: object | None
     normalized_value_text: str
     value_hash: str
+    referenced_entity_id: uuid.UUID | None
+
+
+_FACT_IDENTITY_CONSTRAINT_NAME = "uq_facts_project_id_identity_hash"
 
 
 async def propose_ai_fact_value(
@@ -155,14 +185,25 @@ async def propose_ai_fact_value(
                     "All evidences must come from source blocks present in the inference input batch."
                 )
 
-        identity_hash = build_fact_identity_hash(payload.identity)
         normalized_value = normalize_fact_value_input(payload.value)
+        validated_identity = await _validate_subject_entity(
+            session,
+            project_id=project_id,
+            identity=payload.identity,
+        )
+        validated_value = await _validate_referenced_entity(
+            session,
+            project_id=project_id,
+            normalized_value=normalized_value,
+        )
+        identity_hash = build_fact_identity_hash(validated_identity)
 
         fact = await _get_or_create_fact_for_update(
             session,
             project_id=project_id,
-            identity=payload.identity,
+            identity=validated_identity,
             identity_hash=identity_hash,
+            subject_entity_id=validated_identity.subject_entity_id,
             created_by_id=None,
         )
         if fact.status == FactStatus.RETIRED.value:
@@ -172,15 +213,16 @@ async def propose_ai_fact_value(
         fact_value = FactValue(
             fact_id=fact.id,
             version_no=version_no,
-            value_type=normalized_value.value_type,
-            value_json=normalized_value.value_json,
-            normalized_value_text=normalized_value.normalized_value_text,
-            value_hash=normalized_value.value_hash,
+            value_type=validated_value.value_type,
+            value_json=validated_value.value_json,
+            normalized_value_text=validated_value.normalized_value_text,
+            value_hash=validated_value.value_hash,
             language_code=payload.value.language_code,
             status=FactValueStatus.PROPOSED.value,
             source_kind=FactValueSourceKind.AI.value,
             extraction_run_id=extraction_run_id,
             inference_run_id=inference_run_id,
+            referenced_entity_id=validated_value.referenced_entity_id,
             confidence=payload.value.confidence,
             created_by_id=None,
             decided_by_id=None,
@@ -216,46 +258,58 @@ async def create_human_fact_value(
     actor_id: uuid.UUID,
     payload: HumanFactValueInput,
 ) -> FactValue:
-    actor = await _require_fact_actor(session, project_id=project_id, actor_id=actor_id)
-    normalized_value = normalize_fact_value_input(payload.value)
-    identity_hash = build_fact_identity_hash(payload.identity)
-    evidence_records = await _load_project_evidences(
-        session,
-        project_id=project_id,
-        evidence_ids=[evidence.evidence_id for evidence in payload.evidences],
-    )
-
-    fact = await _get_or_create_fact_for_update(
-        session,
-        project_id=project_id,
-        identity=payload.identity,
-        identity_hash=identity_hash,
-        created_by_id=actor.id,
-    )
-    if fact.status == FactStatus.RETIRED.value:
-        raise RetiredFactError("Retired facts cannot accept new human values.")
-
-    current_timestamp = datetime.now(timezone.utc)
-    version_no = await fact_repository.get_next_fact_version_no(session, fact.id)
-    fact_value = FactValue(
-        fact_id=fact.id,
-        version_no=version_no,
-        value_type=normalized_value.value_type,
-        value_json=normalized_value.value_json,
-        normalized_value_text=normalized_value.normalized_value_text,
-        value_hash=normalized_value.value_hash,
-        language_code=payload.value.language_code,
-        status=FactValueStatus.ACCEPTED.value,
-        source_kind=FactValueSourceKind.HUMAN.value,
-        extraction_run_id=None,
-        inference_run_id=None,
-        confidence=payload.value.confidence,
-        created_by_id=actor.id,
-        decided_by_id=actor.id,
-        decided_at=current_timestamp,
-    )
-
     try:
+        actor = await _require_fact_actor(session, project_id=project_id, actor_id=actor_id)
+        normalized_value = normalize_fact_value_input(payload.value)
+        await _load_project_evidences(
+            session,
+            project_id=project_id,
+            evidence_ids=[evidence.evidence_id for evidence in payload.evidences],
+        )
+        validated_identity = await _validate_subject_entity(
+            session,
+            project_id=project_id,
+            identity=payload.identity,
+        )
+        validated_value = await _validate_referenced_entity(
+            session,
+            project_id=project_id,
+            normalized_value=normalized_value,
+        )
+        identity_hash = build_fact_identity_hash(validated_identity)
+
+        fact = await _get_or_create_fact_for_update(
+            session,
+            project_id=project_id,
+            identity=validated_identity,
+            identity_hash=identity_hash,
+            subject_entity_id=validated_identity.subject_entity_id,
+            created_by_id=actor.id,
+        )
+        if fact.status == FactStatus.RETIRED.value:
+            raise RetiredFactError("Retired facts cannot accept new human values.")
+
+        current_timestamp = datetime.now(timezone.utc)
+        version_no = await fact_repository.get_next_fact_version_no(session, fact.id)
+        fact_value = FactValue(
+            fact_id=fact.id,
+            version_no=version_no,
+            value_type=validated_value.value_type,
+            value_json=validated_value.value_json,
+            normalized_value_text=validated_value.normalized_value_text,
+            value_hash=validated_value.value_hash,
+            language_code=payload.value.language_code,
+            status=FactValueStatus.ACCEPTED.value,
+            source_kind=FactValueSourceKind.HUMAN.value,
+            extraction_run_id=None,
+            inference_run_id=None,
+            referenced_entity_id=validated_value.referenced_entity_id,
+            confidence=payload.value.confidence,
+            created_by_id=actor.id,
+            decided_by_id=actor.id,
+            decided_at=current_timestamp,
+        )
+
         await fact_repository.create_fact_value(session, fact_value)
         evidence_links = _build_evidence_links(
             fact_value_id=fact_value.id,
@@ -272,11 +326,10 @@ async def create_human_fact_value(
         )
         fact.values.append(fact_value)
         await session.commit()
-    except Exception:
+        return fact_value
+    except BaseException:
         await session.rollback()
         raise
-
-    return fact_value
 
 
 async def accept_fact_value(
@@ -325,7 +378,7 @@ async def accept_fact_value(
         )
         await fact_repository.update_fact_value(session, fact_value)
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
 
@@ -370,7 +423,7 @@ async def reject_fact_value(
     try:
         await fact_repository.update_fact_value(session, fact_value)
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
 
@@ -399,15 +452,28 @@ def normalize_fact_value_input(value: FactValueInput) -> NormalizedFactValue:
         value_type=value.value_type.value,
         normalized_value=normalized_value,
     )
-    serialized_payload = json.dumps(
-        {
-            "value": normalized_value,
-            "value_type": value.value_type.value,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    if value.value_type == FactValueType.ENTITY_REF:
+        serialized_payload = json.dumps(
+            {
+                "referenced_entity_id": str(value.referenced_entity_id),
+                "value_json": _build_entity_ref_hash_value_json(normalized_value),
+                "value_type": value.value_type.value,
+            },
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        serialized_payload = json.dumps(
+            {
+                "value": normalized_value,
+                "value_type": value.value_type.value,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     value_hash = hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()
 
     return NormalizedFactValue(
@@ -415,6 +481,7 @@ def normalize_fact_value_input(value: FactValueInput) -> NormalizedFactValue:
         value_json=normalized_value,
         normalized_value_text=normalized_value_text,
         value_hash=value_hash,
+        referenced_entity_id=value.referenced_entity_id,
     )
 
 
@@ -567,6 +634,7 @@ async def _get_or_create_fact_for_update(
     project_id: uuid.UUID,
     identity: FactIdentityInput,
     identity_hash: str,
+    subject_entity_id: uuid.UUID | None,
     created_by_id: uuid.UUID | None,
 ) -> Fact:
     fact = await fact_repository.get_fact_by_identity_for_update(
@@ -575,6 +643,17 @@ async def _get_or_create_fact_for_update(
         identity_hash=identity_hash,
     )
     if fact is not None:
+        _validate_locked_fact_identity(
+            fact,
+            project_id=project_id,
+            identity=identity,
+            identity_hash=identity_hash,
+        )
+        await _reconcile_fact_subject_entity(
+            session,
+            fact=fact,
+            subject_entity_id=subject_entity_id,
+        )
         return fact
 
     savepoint = await session.begin_nested()
@@ -583,6 +662,7 @@ async def _get_or_create_fact_for_update(
             project_id=project_id,
             subject_kind=identity.subject_kind,
             subject_key=identity.subject_key,
+            subject_entity_id=subject_entity_id,
             predicate_key=identity.predicate_key,
             scope_key=identity.scope_key,
             identity_hash=identity_hash,
@@ -590,7 +670,11 @@ async def _get_or_create_fact_for_update(
             created_by_id=created_by_id,
         )
         await fact_repository.create_fact(session, fact)
-    except IntegrityError:
+    except IntegrityError as exc:
+        constraint_name = _get_integrity_constraint_name(exc)
+        if constraint_name != _FACT_IDENTITY_CONSTRAINT_NAME:
+            await savepoint.rollback()
+            raise
         await savepoint.rollback()
         fact = await fact_repository.get_fact_by_identity_for_update(
             session,
@@ -598,10 +682,117 @@ async def _get_or_create_fact_for_update(
             identity_hash=identity_hash,
         )
         if fact is None:
-            raise
+            raise exc
+        _validate_locked_fact_identity(
+            fact,
+            project_id=project_id,
+            identity=identity,
+            identity_hash=identity_hash,
+        )
+        await _reconcile_fact_subject_entity(
+            session,
+            fact=fact,
+            subject_entity_id=subject_entity_id,
+        )
     else:
         await savepoint.commit()
     return fact
+
+
+async def _validate_subject_entity(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    identity: FactIdentityInput,
+) -> FactIdentityInput:
+    if identity.subject_entity_id is None:
+        return identity
+
+    entity_context = await entity_repository.get_fact_entity_context(
+        session,
+        entity_id=identity.subject_entity_id,
+    )
+    if (
+        entity_context is None
+        or entity_context.project_id != project_id
+        or entity_context.status != EntityStatus.ACTIVE.value
+    ):
+        raise FactSubjectEntityNotEligibleError(
+            "Subject entity must exist, belong to the target project, and be active."
+        )
+
+    if entity_context.entity_type != identity.subject_kind:
+        raise FactSubjectEntityMismatchError(
+            "subject_kind must match the subject entity type."
+        )
+
+    normalized_subject_key = normalize_entity_alias(identity.subject_key)
+    if entity_context.canonical_key != normalized_subject_key:
+        raise FactSubjectEntityMismatchError(
+            "subject_key must match the subject entity canonical key."
+        )
+
+    return FactIdentityInput(
+        subject_kind=entity_context.entity_type,
+        subject_key=entity_context.canonical_key,
+        subject_entity_id=entity_context.entity_id,
+        predicate_key=identity.predicate_key,
+        scope_key=identity.scope_key,
+    )
+
+
+async def _validate_referenced_entity(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    normalized_value: NormalizedFactValue,
+) -> NormalizedFactValue:
+    if normalized_value.value_type != FactValueType.ENTITY_REF.value:
+        if normalized_value.referenced_entity_id is not None:
+            raise FactReferencedEntityMismatchError(
+                "referenced_entity_id is only allowed for entity_ref values."
+            )
+        return normalized_value
+
+    if normalized_value.referenced_entity_id is None:
+        raise FactReferencedEntityNotEligibleError(
+            "entity_ref values must include referenced_entity_id."
+        )
+
+    entity_context = await entity_repository.get_fact_entity_context(
+        session,
+        entity_id=normalized_value.referenced_entity_id,
+    )
+    if (
+        entity_context is None
+        or entity_context.project_id != project_id
+        or entity_context.status != EntityStatus.ACTIVE.value
+    ):
+        raise FactReferencedEntityNotEligibleError(
+            "Referenced entity must exist, belong to the target project, and be active."
+        )
+
+    if not isinstance(normalized_value.value_json, dict):
+        raise FactReferencedEntityMismatchError(
+            "entity_ref values must use a kind/key object."
+        )
+
+    snapshot_kind = normalized_value.value_json.get("kind")
+    snapshot_key = normalized_value.value_json.get("key")
+    if snapshot_kind != entity_context.entity_type:
+        raise FactReferencedEntityMismatchError(
+            "entity_ref kind must match the referenced entity type."
+        )
+    if not isinstance(snapshot_key, str):
+        raise FactReferencedEntityMismatchError(
+            "entity_ref key must be a string."
+        )
+    if normalize_entity_alias(snapshot_key) != entity_context.canonical_key:
+        raise FactReferencedEntityMismatchError(
+            "entity_ref key must match the referenced entity canonical key."
+        )
+
+    return normalized_value
 
 
 def _build_evidence_links(
@@ -658,3 +849,67 @@ async def _replace_current_value(
     fact.current_value_id = new_current_value.id
     fact.current_value = new_current_value
     await fact_repository.update_fact(session, fact)
+
+
+def _get_integrity_constraint_name(error: IntegrityError) -> str | None:
+    diag = getattr(error.orig, "diag", None)
+    constraint_name = getattr(diag, "constraint_name", None)
+    if constraint_name is None or not isinstance(constraint_name, str):
+        return None
+    return constraint_name
+
+
+def _validate_locked_fact_identity(
+    fact: Fact,
+    *,
+    project_id: uuid.UUID,
+    identity: FactIdentityInput,
+    identity_hash: str,
+) -> None:
+    if (
+        fact.project_id != project_id
+        or fact.subject_kind != identity.subject_kind
+        or fact.subject_key != identity.subject_key
+        or fact.predicate_key != identity.predicate_key
+        or fact.scope_key != identity.scope_key
+        or fact.identity_hash != identity_hash
+    ):
+        raise FactIdentityConflictError(
+            "Stored fact identity does not match the normalized request."
+        )
+
+
+async def _reconcile_fact_subject_entity(
+    session: AsyncSession,
+    *,
+    fact: Fact,
+    subject_entity_id: uuid.UUID | None,
+) -> None:
+    if fact.subject_entity_id is None:
+        if subject_entity_id is None:
+            return
+        fact.subject_entity_id = subject_entity_id
+        await fact_repository.update_fact(session, fact)
+        return
+
+    if subject_entity_id is None or fact.subject_entity_id == subject_entity_id:
+        return
+
+    raise FactSubjectEntityConflictError(
+        "Stored fact is already bound to a different subject entity."
+    )
+
+
+def _build_entity_ref_hash_value_json(normalized_value: object | None) -> dict[str, str]:
+    if not isinstance(normalized_value, dict):
+        raise InvalidFactProposalError("entity_ref values must be objects.")
+
+    kind = normalized_value.get("kind")
+    key = normalized_value.get("key")
+    if not isinstance(kind, str) or not isinstance(key, str):
+        raise InvalidFactProposalError("entity_ref kind and key must be strings.")
+
+    return {
+        "key": normalize_entity_alias(key),
+        "kind": kind,
+    }
