@@ -447,6 +447,7 @@ def test_fact_migrations_include_inference_provenance_followup() -> None:
         "202607301630_fact_models.py",
         "202607311030_fact_value_inference_provenance.py",
         "202607311430_fact_entity_links.py",
+        "202607311800_fact_value_inference_replay.py",
     ]
 
 

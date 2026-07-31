@@ -131,6 +131,39 @@ async def get_fact_value_for_update(
     return result.scalar_one_or_none()
 
 
+async def get_ai_fact_value_by_replay_key_for_update(
+    session: AsyncSession,
+    *,
+    fact_id: uuid.UUID,
+    inference_run_id: uuid.UUID,
+    value_hash: str,
+) -> FactValue | None:
+    result = await session.execute(
+        select(FactValue)
+        .where(
+            FactValue.fact_id == fact_id,
+            FactValue.inference_run_id == inference_run_id,
+            FactValue.value_hash == value_hash,
+        )
+        .options(joinedload(FactValue.fact))
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_fact_evidence_links_for_value(
+    session: AsyncSession,
+    *,
+    fact_value_id: uuid.UUID,
+) -> list[FactEvidenceLink]:
+    result = await session.execute(
+        select(FactEvidenceLink)
+        .where(FactEvidenceLink.fact_value_id == fact_value_id)
+        .order_by(FactEvidenceLink.source_order.asc(), FactEvidenceLink.id.asc())
+    )
+    return list(result.scalars().all())
+
+
 async def create_fact(
     session: AsyncSession,
     fact: Fact,

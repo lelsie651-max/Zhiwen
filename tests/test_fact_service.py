@@ -28,6 +28,11 @@ def run_async(awaitable):
     return asyncio.run(awaitable)
 
 
+def make_integrity_error(constraint_name: str | None) -> IntegrityError:
+    orig = SimpleNamespace(diag=SimpleNamespace(constraint_name=constraint_name))
+    return IntegrityError("stmt", {}, orig)
+
+
 class FakeSavepoint:
     def __init__(self) -> None:
         self.commit_called = False
@@ -2868,5 +2873,414 @@ def test_concurrent_requery_with_mismatched_identity_is_rejected(monkeypatch) ->
                 project_id=project.id,
                 actor_id=actor.id,
                 payload=build_human_payload(),
+            )
+        )
+
+
+@pytest.mark.parametrize("status", ["proposed", "accepted", "rejected"])
+def test_same_inference_run_reuses_existing_ai_fact_value(monkeypatch, status: str) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
+    )
+    payload = build_ai_payload([evidence.id])
+    identity_hash = fact_service.build_fact_identity_hash(payload.identity)
+    fact = build_fact(project_id=project.id, identity_hash=identity_hash)
+    normalized_value = fact_service.normalize_fact_value_input(payload.value)
+    existing = FactValue(
+        id=uuid.uuid4(),
+        fact_id=fact.id,
+        version_no=3,
+        value_type="string",
+        value_json="Acme Corp",
+        normalized_value_text=normalized_value.normalized_value_text,
+        value_hash=normalized_value.value_hash,
+        language_code=payload.value.language_code,
+        status=status,
+        source_kind="ai",
+        extraction_run_id=run.id,
+        inference_run_id=inference_context.run_id,
+        referenced_entity_id=None,
+        confidence=payload.value.confidence,
+        created_by_id=None,
+        decided_by_id=None,
+        decided_at=None,
+    )
+
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_extraction_run_with_project",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=run),
+    )
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=inference_context),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "list_source_evidences_with_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=[evidence]),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=fact),
+    )
+    monkeypatch.setattr(
+        fact_service.entity_repository,
+        "get_fact_entity_context",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=build_entity_context(
+                entity_id=referenced_entity_id,
+                project_id=project.id,
+                entity_type="company",
+                canonical_key="acme",
+                status="active",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        fact_service,
+        "_get_replayed_ai_fact_value",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=existing),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "list_fact_evidence_links_for_value",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=[
+                fact_service.FactEvidenceLink(
+                    fact_value_id=existing.id,
+                    evidence_id=evidence.id,
+                    role="supporting",
+                    is_primary=True,
+                    source_order=0,
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_next_fact_version_no",
+        lambda *_args, **_kwargs: pytest.fail("version_no should not be allocated on replay"),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "create_fact_value",
+        lambda *_args, **_kwargs: pytest.fail("replay should not create a new fact value"),
+    )
+
+    result = run_async(
+        fact_service.propose_ai_fact_value_in_transaction(
+            session,
+            project_id=project.id,
+            extraction_run_id=run.id,
+            inference_run_id=inference_context.run_id,
+            payload=payload,
+        )
+    )
+
+    assert result.created is False
+    assert result.fact_value is existing
+    assert result.fact_value.status == status
+    assert result.fact_value.version_no == 3
+
+
+@pytest.mark.parametrize(
+    ("mutator", "role", "is_primary"),
+    [
+        (lambda value, payload, evidence: setattr(value, "confidence", 0.1), "supporting", True),
+        (lambda value, payload, evidence: setattr(value, "language_code", "en"), "supporting", True),
+        (
+            lambda value, payload, evidence: setattr(value, "referenced_entity_id", uuid.uuid4()),
+            "supporting",
+            True,
+        ),
+        (lambda value, payload, evidence: None, "supporting", False),
+    ],
+)
+def test_replay_mismatch_is_rejected(monkeypatch, mutator, role: str, is_primary: bool) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
+    referenced_entity_id = uuid.uuid4()
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
+    )
+    payload = build_ai_payload(
+        [evidence.id],
+        value=build_value_input(
+            value_type="entity_ref",
+            value_json={"kind": "company", "key": "Acme"},
+            referenced_entity_id=referenced_entity_id,
+        ),
+    )
+    identity_hash = fact_service.build_fact_identity_hash(payload.identity)
+    fact = build_fact(project_id=project.id, identity_hash=identity_hash)
+    normalized_value = fact_service.normalize_fact_value_input(payload.value)
+    existing = FactValue(
+        id=uuid.uuid4(),
+        fact_id=fact.id,
+        version_no=2,
+        value_type="entity_ref",
+        value_json=normalized_value.value_json,
+        normalized_value_text=normalized_value.normalized_value_text,
+        value_hash=normalized_value.value_hash,
+        language_code=payload.value.language_code,
+        status="accepted",
+        source_kind="ai",
+        extraction_run_id=run.id,
+        inference_run_id=inference_context.run_id,
+        referenced_entity_id=referenced_entity_id,
+        confidence=payload.value.confidence,
+        created_by_id=None,
+        decided_by_id=uuid.uuid4(),
+        decided_at=datetime.now(timezone.utc),
+    )
+    mutator(existing, payload, evidence)
+
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_extraction_run_with_project",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=run),
+    )
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=inference_context),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "list_source_evidences_with_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=[evidence]),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=fact),
+    )
+    monkeypatch.setattr(
+        fact_service.entity_repository,
+        "get_fact_entity_context",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=build_entity_context(
+                entity_id=referenced_entity_id,
+                project_id=project.id,
+                entity_type="company",
+                    canonical_key="acme",
+                status="active",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        fact_service,
+        "_get_replayed_ai_fact_value",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=existing),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "list_fact_evidence_links_for_value",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=[
+                fact_service.FactEvidenceLink(
+                    fact_value_id=existing.id,
+                    evidence_id=evidence.id,
+                    role=role,
+                    is_primary=is_primary,
+                    source_order=0,
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(fact_service.FactAIProposalReplayConflictError):
+        run_async(
+            fact_service.propose_ai_fact_value_in_transaction(
+                session,
+                project_id=project.id,
+                extraction_run_id=run.id,
+                inference_run_id=inference_context.run_id,
+                payload=payload,
+            )
+        )
+
+
+def test_concurrent_ai_replay_conflict_reuses_existing_value(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
+    )
+    payload = build_ai_payload([evidence.id])
+    identity_hash = fact_service.build_fact_identity_hash(payload.identity)
+    fact = build_fact(project_id=project.id, identity_hash=identity_hash)
+    normalized_value = fact_service.normalize_fact_value_input(payload.value)
+    existing = FactValue(
+        id=uuid.uuid4(),
+        fact_id=fact.id,
+        version_no=2,
+        value_type="string",
+        value_json="Acme Corp",
+        normalized_value_text=normalized_value.normalized_value_text,
+        value_hash=normalized_value.value_hash,
+        language_code=payload.value.language_code,
+        status="accepted",
+        source_kind="ai",
+        extraction_run_id=run.id,
+        inference_run_id=inference_context.run_id,
+        referenced_entity_id=None,
+        confidence=payload.value.confidence,
+        created_by_id=None,
+        decided_by_id=uuid.uuid4(),
+        decided_at=datetime.now(timezone.utc),
+    )
+    replay_lookup = {"count": 0}
+
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_extraction_run_with_project",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=run),
+    )
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=inference_context),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "list_source_evidences_with_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=[evidence]),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=fact),
+    )
+
+    async def fake_replayed(*_args, **_kwargs):
+        replay_lookup["count"] += 1
+        if replay_lookup["count"] == 1:
+            return None
+        return existing
+
+    monkeypatch.setattr(fact_service, "_get_replayed_ai_fact_value", fake_replayed)
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "list_fact_evidence_links_for_value",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=[
+                fact_service.FactEvidenceLink(
+                    fact_value_id=existing.id,
+                    evidence_id=evidence.id,
+                    role="supporting",
+                    is_primary=True,
+                    source_order=0,
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_next_fact_version_no",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=3),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "create_fact_value",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=(_ for _ in ()).throw(make_integrity_error("uq_fv_fact_ir_value_hash"))),
+    )
+
+    result = run_async(
+        fact_service.propose_ai_fact_value_in_transaction(
+            session,
+            project_id=project.id,
+            extraction_run_id=run.id,
+            inference_run_id=inference_context.run_id,
+            payload=payload,
+        )
+    )
+
+    assert result.created is False
+    assert result.fact_value is existing
+    assert len(session.savepoints) == 1
+    assert session.savepoints[0].rollback_called is True
+
+
+def test_non_target_ai_replay_integrity_error_is_not_swallowed(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
+    )
+    payload = build_ai_payload([evidence.id])
+    identity_hash = fact_service.build_fact_identity_hash(payload.identity)
+    fact = build_fact(project_id=project.id, identity_hash=identity_hash)
+
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_extraction_run_with_project",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=run),
+    )
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=inference_context),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "list_source_evidences_with_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=[evidence]),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_fact_by_identity_for_update",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=fact),
+    )
+    monkeypatch.setattr(
+        fact_service,
+        "_get_replayed_ai_fact_value",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "get_next_fact_version_no",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=3),
+    )
+    monkeypatch.setattr(
+        fact_service.fact_repository,
+        "create_fact_value",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=(_ for _ in ()).throw(make_integrity_error("other_constraint"))),
+    )
+
+    with pytest.raises(IntegrityError):
+        run_async(
+            fact_service.propose_ai_fact_value_in_transaction(
+                session,
+                project_id=project.id,
+                extraction_run_id=run.id,
+                inference_run_id=inference_context.run_id,
+                payload=payload,
             )
         )

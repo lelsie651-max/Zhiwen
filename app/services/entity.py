@@ -75,7 +75,7 @@ async def create_entity_with_primary_alias(
 ) -> Entity:
     try:
         actor = await _require_entity_actor(session, project_id=project_id, actor_id=actor_id)
-        entity_type = _normalize_entity_type(payload.entity_type)
+        entity_type = normalize_entity_type(payload.entity_type)
         canonical_key = normalize_entity_alias(payload.canonical_key)
         display_name = _normalize_display_name(payload.display_name)
         identity_hash = build_entity_identity_hash(
@@ -199,7 +199,7 @@ async def resolve_entity_alias(
 ) -> tuple[EntityAlias, ...]:
     try:
         await _require_project_available(session, project_id=project_id)
-        normalized_entity_type = _normalize_entity_type(entity_type)
+        normalized_entity_type = normalize_entity_type(entity_type)
         normalized_alias = normalize_entity_alias(alias_text)
         matches = await entity_repository.resolve_entity_alias(
             session,
@@ -223,7 +223,7 @@ def build_entity_identity_hash(
     if type(project_id) is not uuid.UUID:
         raise ValueError("project_id must be a UUID")
 
-    normalized_entity_type = _normalize_entity_type(entity_type)
+    normalized_entity_type = normalize_entity_type(entity_type)
     normalized_canonical_key = normalize_entity_alias(canonical_key)
     payload = {
         "canonical_key": normalized_canonical_key,
@@ -378,7 +378,7 @@ def _validate_entity_identity_match(
         )
 
 
-def _normalize_entity_type(value: str) -> str:
+def normalize_entity_type(value: str) -> str:
     normalized = normalize_text(value)
     if not normalized:
         raise ValueError("entity_type must not be empty")

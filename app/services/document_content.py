@@ -39,6 +39,13 @@ class EvidenceOffsetError(ExtractionPersistenceError):
     """Raised when evidence offsets are invalid."""
 
 
+class SourceEvidenceReplayConflictError(ExtractionPersistenceError):
+    """Raised when a replayed source evidence conflicts with stored data."""
+
+
+_SOURCE_EVIDENCE_UNIQUE_CONSTRAINT = "uq_source_evidences_block_id_start_offset_end_offset"
+
+
 async def persist_extraction_result(
     session: AsyncSession,
     *,
@@ -151,51 +158,91 @@ async def create_source_evidence(
     session: AsyncSession,
     payload: SourceEvidenceCreate,
 ) -> SourceEvidence:
-    block = await document_content_repository.get_document_block_by_id(session, payload.block_id)
-    if block is None:
-        raise DocumentBlockNotFoundError("Target block not found.")
+    try:
+        block = await document_content_repository.get_document_block_by_id(session, payload.block_id)
+        if block is None:
+            raise DocumentBlockNotFoundError("Target block not found.")
 
-    _validate_evidence_offsets(block.raw_text, payload.start_offset, payload.end_offset)
-    excerpt = block.raw_text[payload.start_offset : payload.end_offset]
+        evidence, _created = await get_or_create_source_evidence_in_transaction(
+            session,
+            block_id=payload.block_id,
+            raw_text=block.raw_text,
+            start_offset=payload.start_offset,
+            end_offset=payload.end_offset,
+        )
+        await session.commit()
+        return evidence
+    except BaseException:
+        await session.rollback()
+        raise
+
+async def get_or_create_source_evidence_in_transaction(
+    session: AsyncSession,
+    *,
+    block_id: uuid.UUID,
+    raw_text: str,
+    start_offset: int,
+    end_offset: int,
+) -> tuple[SourceEvidence, bool]:
+    _validate_evidence_offsets(raw_text, start_offset, end_offset)
+    excerpt = raw_text[start_offset:end_offset]
     if excerpt == "":
         raise EvidenceOffsetError("Evidence excerpt must not be empty.")
+    excerpt_hash = _hash_text(excerpt)
 
     existing = await document_content_repository.get_source_evidence_by_offsets(
         session,
-        payload.block_id,
-        payload.start_offset,
-        payload.end_offset,
+        block_id,
+        start_offset,
+        end_offset,
     )
     if existing is not None:
-        return existing
+        _validate_source_evidence_replay(
+            existing,
+            block_id=block_id,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            excerpt=excerpt,
+            excerpt_hash=excerpt_hash,
+        )
+        return existing, False
 
-    evidence = SourceEvidence(
-        block_id=payload.block_id,
-        start_offset=payload.start_offset,
-        end_offset=payload.end_offset,
-        excerpt=excerpt,
-        excerpt_hash=_hash_text(excerpt),
-    )
-
+    savepoint = await session.begin_nested()
     try:
+        evidence = SourceEvidence(
+            block_id=block_id,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            excerpt=excerpt,
+            excerpt_hash=excerpt_hash,
+        )
         await document_content_repository.create_source_evidence(session, evidence)
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
+    except IntegrityError as exc:
+        constraint_name = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+        if constraint_name != _SOURCE_EVIDENCE_UNIQUE_CONSTRAINT:
+            await savepoint.rollback()
+            raise
+        await savepoint.rollback()
         existing = await document_content_repository.get_source_evidence_by_offsets(
             session,
-            payload.block_id,
-            payload.start_offset,
-            payload.end_offset,
+            block_id,
+            start_offset,
+            end_offset,
         )
-        if existing is not None:
-            return existing
-        raise
-    except Exception:
-        await session.rollback()
-        raise
-
-    return evidence
+        if existing is None:
+            raise exc
+        _validate_source_evidence_replay(
+            existing,
+            block_id=block_id,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            excerpt=excerpt,
+            excerpt_hash=excerpt_hash,
+        )
+        return existing, False
+    else:
+        await savepoint.commit()
+        return evidence, True
 
 
 def _validate_extracted_document(extracted_document: ExtractedDocument) -> None:
@@ -246,6 +293,27 @@ def _validate_evidence_offsets(raw_text: str, start_offset: int, end_offset: int
 
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _validate_source_evidence_replay(
+    evidence: SourceEvidence,
+    *,
+    block_id: uuid.UUID,
+    start_offset: int,
+    end_offset: int,
+    excerpt: str,
+    excerpt_hash: str,
+) -> None:
+    if (
+        evidence.block_id != block_id
+        or evidence.start_offset != start_offset
+        or evidence.end_offset != end_offset
+        or evidence.excerpt != excerpt
+        or evidence.excerpt_hash != excerpt_hash
+    ):
+        raise SourceEvidenceReplayConflictError(
+            "Stored source evidence does not match the requested offsets."
+        )
 
 
 def _build_anchor_hash(*, detected_format: str, location_key: str, raw_text: str) -> str:

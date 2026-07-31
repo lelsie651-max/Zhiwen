@@ -42,6 +42,16 @@ from app.schemas.fact_extraction_execution import (
     InferenceInputBlockSnapshot,
     MaterializedFactExtractionBatch,
 )
+from app.schemas.fact_extraction_persistence import (
+    CompletedFactExtractionPersistenceContext,
+    EntityMentionResolution,
+    EntityMentionResolutionStatus,
+    FactExtractionBatchPersistenceResult,
+    FactExtractionPersistenceBlock,
+    FactProposalPersistenceItem,
+    FactProposalPersistenceOutcome,
+    FactProposalWithheldReason,
+)
 from app.schemas.fact_commands import (
     AIProposalInput,
     FactEvidenceInput,
@@ -127,6 +137,14 @@ __all__ = [
     "InferenceInputBlockSnapshot",
     "MaterializedFactExtractionBatch",
     "FactExtractionBatchExecutionResult",
+    "FactExtractionPersistenceBlock",
+    "CompletedFactExtractionPersistenceContext",
+    "EntityMentionResolutionStatus",
+    "EntityMentionResolution",
+    "FactProposalPersistenceOutcome",
+    "FactProposalWithheldReason",
+    "FactProposalPersistenceItem",
+    "FactExtractionBatchPersistenceResult",
     "ExtractionOutcome",
     "ExtractedBlockType",
     "ExtractedBlock",

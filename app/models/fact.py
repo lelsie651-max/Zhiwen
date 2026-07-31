@@ -163,6 +163,7 @@ class FactValue(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "fact_values"
     __table_args__ = (
         UniqueConstraint("fact_id", "version_no", name="uq_fact_values_fact_id_version_no"),
+        UniqueConstraint("fact_id", "inference_run_id", "value_hash", name="uq_fv_fact_ir_value_hash"),
         CheckConstraint("version_no > 0", name="fact_values_version_no_positive"),
         CheckConstraint(
             "value_type IN ('string', 'number', 'boolean', 'date', 'datetime', 'entity_ref', 'list', 'object', 'null')",

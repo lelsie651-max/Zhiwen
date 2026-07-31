@@ -105,6 +105,16 @@ class FactValueNotFoundError(FactProposalError):
     """Raised when the target fact value does not exist within the project."""
 
 
+class FactAIProposalReplayConflictError(FactProposalError):
+    """Raised when a replayed AI fact proposal conflicts with stored data."""
+
+
+@dataclass(frozen=True, slots=True)
+class AIFactProposalPersistence:
+    fact_value: FactValue
+    created: bool
+
+
 @dataclass(frozen=True)
 class NormalizedFactValue:
     value_type: str
@@ -115,6 +125,7 @@ class NormalizedFactValue:
 
 
 _FACT_IDENTITY_CONSTRAINT_NAME = "uq_facts_project_id_identity_hash"
+_AI_PROPOSAL_REPLAY_CONSTRAINT_NAME = "uq_fv_fact_ir_value_hash"
 
 
 async def propose_ai_fact_value(
@@ -126,129 +137,187 @@ async def propose_ai_fact_value(
     payload: AIProposalInput,
 ) -> FactValue:
     try:
-        extraction_run = await fact_repository.get_extraction_run_with_project(session, extraction_run_id)
-        if extraction_run is None:
-            raise FactProposalRunNotFoundError("Target extraction run not found.")
-
-        run_project = extraction_run.revision.document.project
-        if run_project.id != project_id:
-            raise InvalidFactProposalError("Extraction run does not belong to the requested project.")
-
-        if extraction_run.status != ExtractionRunStatus.COMPLETED.value:
-            raise InvalidFactProposalError("Only completed extraction runs can produce AI fact proposals.")
-
-        if extraction_run.outcome not in {
-            ExtractionRunOutcome.SUCCESS.value,
-            ExtractionRunOutcome.PARTIAL.value,
-        }:
-            raise InvalidFactProposalError("Only successful or partial extraction runs can produce AI fact proposals.")
-
-        inference_context = await inference_repository.get_completed_fact_extraction_run_context(
-            session,
-            inference_run_id=inference_run_id,
-        )
-        if inference_context is None:
-            raise InferenceRunNotEligibleForFactError("Inference run not found.")
-        if inference_context.status != InferenceRunStatus.COMPLETED.value:
-            raise InferenceRunNotEligibleForFactError(
-                "Only completed inference runs can produce AI fact proposals."
-            )
-        if inference_context.task_type != InferenceTaskType.FACT_EXTRACTION.value:
-            raise InferenceRunNotEligibleForFactError(
-                "Only fact_extraction inference runs can produce AI fact proposals."
-            )
-        if inference_context.project_id != project_id:
-            raise FactInferenceProjectMismatchError(
-                "Inference run does not belong to the requested project."
-            )
-        if extraction_run_id not in inference_context.extraction_run_id_snapshots:
-            raise FactInferenceSourceMismatchError(
-                "Inference run input batch does not include the requested extraction run."
-            )
-
-        evidence_ids = [evidence.evidence_id for evidence in payload.evidences]
-        evidence_records = await fact_repository.list_source_evidences_with_context(session, evidence_ids)
-        if len(evidence_records) != len(evidence_ids):
-            raise InvalidFactProposalError("All evidences must exist.")
-
-        evidence_by_id = {evidence.id: evidence for evidence in evidence_records}
-        for evidence_id in evidence_ids:
-            evidence = evidence_by_id[evidence_id]
-            evidence_run = evidence.block.extraction_run
-            evidence_project = evidence_run.revision.document.project
-            if evidence_project.id != project_id:
-                raise InvalidFactProposalError("All evidences must belong to the requested project.")
-            if evidence_run.id != extraction_run_id:
-                raise InvalidFactProposalError("All evidences must belong to the current extraction run.")
-            if evidence.block.id not in inference_context.source_block_id_snapshots:
-                raise FactInferenceEvidenceMismatchError(
-                    "All evidences must come from source blocks present in the inference input batch."
-                )
-
-        normalized_value = normalize_fact_value_input(payload.value)
-        validated_identity = await _validate_subject_entity(
+        result = await propose_ai_fact_value_in_transaction(
             session,
             project_id=project_id,
-            identity=payload.identity,
-        )
-        validated_value = await _validate_referenced_entity(
-            session,
-            project_id=project_id,
-            normalized_value=normalized_value,
-        )
-        identity_hash = build_fact_identity_hash(validated_identity)
-
-        fact = await _get_or_create_fact_for_update(
-            session,
-            project_id=project_id,
-            identity=validated_identity,
-            identity_hash=identity_hash,
-            subject_entity_id=validated_identity.subject_entity_id,
-            created_by_id=None,
-        )
-        if fact.status == FactStatus.RETIRED.value:
-            raise RetiredFactError("Retired facts cannot accept new AI proposals.")
-
-        version_no = await fact_repository.get_next_fact_version_no(session, fact.id)
-        fact_value = FactValue(
-            fact_id=fact.id,
-            version_no=version_no,
-            value_type=validated_value.value_type,
-            value_json=validated_value.value_json,
-            normalized_value_text=validated_value.normalized_value_text,
-            value_hash=validated_value.value_hash,
-            language_code=payload.value.language_code,
-            status=FactValueStatus.PROPOSED.value,
-            source_kind=FactValueSourceKind.AI.value,
             extraction_run_id=extraction_run_id,
             inference_run_id=inference_run_id,
-            referenced_entity_id=validated_value.referenced_entity_id,
-            confidence=payload.value.confidence,
-            created_by_id=None,
-            decided_by_id=None,
-            decided_at=None,
+            payload=payload,
+        )
+        await session.commit()
+        return result.fact_value
+    except BaseException:
+        await session.rollback()
+        raise
+
+
+async def propose_ai_fact_value_in_transaction(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+    inference_run_id: uuid.UUID,
+    payload: AIProposalInput,
+) -> AIFactProposalPersistence:
+    extraction_run = await fact_repository.get_extraction_run_with_project(session, extraction_run_id)
+    if extraction_run is None:
+        raise FactProposalRunNotFoundError("Target extraction run not found.")
+
+    run_project = extraction_run.revision.document.project
+    if run_project.id != project_id:
+        raise InvalidFactProposalError("Extraction run does not belong to the requested project.")
+
+    if extraction_run.status != ExtractionRunStatus.COMPLETED.value:
+        raise InvalidFactProposalError("Only completed extraction runs can produce AI fact proposals.")
+
+    if extraction_run.outcome not in {
+        ExtractionRunOutcome.SUCCESS.value,
+        ExtractionRunOutcome.PARTIAL.value,
+    }:
+        raise InvalidFactProposalError("Only successful or partial extraction runs can produce AI fact proposals.")
+
+    inference_context = await inference_repository.get_completed_fact_extraction_run_context(
+        session,
+        inference_run_id=inference_run_id,
+    )
+    if inference_context is None:
+        raise InferenceRunNotEligibleForFactError("Inference run not found.")
+    if inference_context.status != InferenceRunStatus.COMPLETED.value:
+        raise InferenceRunNotEligibleForFactError(
+            "Only completed inference runs can produce AI fact proposals."
+        )
+    if inference_context.task_type != InferenceTaskType.FACT_EXTRACTION.value:
+        raise InferenceRunNotEligibleForFactError(
+            "Only fact_extraction inference runs can produce AI fact proposals."
+        )
+    if inference_context.project_id != project_id:
+        raise FactInferenceProjectMismatchError(
+            "Inference run does not belong to the requested project."
+        )
+    if extraction_run_id not in inference_context.extraction_run_id_snapshots:
+        raise FactInferenceSourceMismatchError(
+            "Inference run input batch does not include the requested extraction run."
         )
 
-        await fact_repository.create_fact_value(session, fact_value)
-        evidence_links = [
-            FactEvidenceLink(
-                fact_value_id=fact_value.id,
-                evidence_id=evidence_input.evidence_id,
-                role=evidence_input.role.value,
-                is_primary=evidence_input.is_primary,
-                source_order=index,
+    evidence_ids = [evidence.evidence_id for evidence in payload.evidences]
+    evidence_records = await fact_repository.list_source_evidences_with_context(session, evidence_ids)
+    if len(evidence_records) != len(evidence_ids):
+        raise InvalidFactProposalError("All evidences must exist.")
+
+    evidence_by_id = {evidence.id: evidence for evidence in evidence_records}
+    for evidence_id in evidence_ids:
+        evidence = evidence_by_id[evidence_id]
+        evidence_run = evidence.block.extraction_run
+        evidence_project = evidence_run.revision.document.project
+        if evidence_project.id != project_id:
+            raise InvalidFactProposalError("All evidences must belong to the requested project.")
+        if evidence_run.id != extraction_run_id:
+            raise InvalidFactProposalError("All evidences must belong to the current extraction run.")
+        if evidence.block.id not in inference_context.source_block_id_snapshots:
+            raise FactInferenceEvidenceMismatchError(
+                "All evidences must come from source blocks present in the inference input batch."
             )
-            for index, evidence_input in enumerate(payload.evidences)
-        ]
+
+    normalized_value = normalize_fact_value_input(payload.value)
+    validated_identity = await _validate_subject_entity(
+        session,
+        project_id=project_id,
+        identity=payload.identity,
+    )
+    validated_value = await _validate_referenced_entity(
+        session,
+        project_id=project_id,
+        normalized_value=normalized_value,
+    )
+    identity_hash = build_fact_identity_hash(validated_identity)
+
+    fact = await _get_or_create_fact_for_update(
+        session,
+        project_id=project_id,
+        identity=validated_identity,
+        identity_hash=identity_hash,
+        subject_entity_id=validated_identity.subject_entity_id,
+        created_by_id=None,
+    )
+    replayed = await _get_replayed_ai_fact_value(
+        session,
+        fact_id=fact.id,
+        inference_run_id=inference_run_id,
+        value_hash=validated_value.value_hash,
+    )
+    if replayed is not None:
+        await _validate_ai_fact_value_replay(
+            session,
+            fact_value=replayed,
+            fact=fact,
+            extraction_run_id=extraction_run_id,
+            inference_run_id=inference_run_id,
+            normalized_value=validated_value,
+            payload=payload,
+        )
+        return AIFactProposalPersistence(fact_value=replayed, created=False)
+
+    if fact.status == FactStatus.RETIRED.value:
+        raise RetiredFactError("Retired facts cannot accept new AI proposals.")
+
+    version_no = await fact_repository.get_next_fact_version_no(session, fact.id)
+    fact_value = FactValue(
+        fact_id=fact.id,
+        version_no=version_no,
+        value_type=validated_value.value_type,
+        value_json=validated_value.value_json,
+        normalized_value_text=validated_value.normalized_value_text,
+        value_hash=validated_value.value_hash,
+        language_code=payload.value.language_code,
+        status=FactValueStatus.PROPOSED.value,
+        source_kind=FactValueSourceKind.AI.value,
+        extraction_run_id=extraction_run_id,
+        inference_run_id=inference_run_id,
+        referenced_entity_id=validated_value.referenced_entity_id,
+        confidence=payload.value.confidence,
+        created_by_id=None,
+        decided_by_id=None,
+        decided_at=None,
+    )
+    evidence_links = _build_evidence_links(
+        fact_value_id=fact_value.id,
+        evidences=payload.evidences,
+    )
+
+    savepoint = await session.begin_nested()
+    try:
+        await fact_repository.create_fact_value(session, fact_value)
         if evidence_links:
             await fact_repository.create_fact_evidence_links(session, evidence_links)
             fact_value.evidence_links.extend(evidence_links)
         fact.values.append(fact_value)
-        await session.commit()
-        return fact_value
-    except BaseException:
-        await session.rollback()
-        raise
+    except IntegrityError as exc:
+        constraint_name = _get_integrity_constraint_name(exc)
+        if constraint_name != _AI_PROPOSAL_REPLAY_CONSTRAINT_NAME:
+            await savepoint.rollback()
+            raise
+        await savepoint.rollback()
+        replayed = await _get_replayed_ai_fact_value(
+            session,
+            fact_id=fact.id,
+            inference_run_id=inference_run_id,
+            value_hash=validated_value.value_hash,
+        )
+        if replayed is None:
+            raise exc
+        await _validate_ai_fact_value_replay(
+            session,
+            fact_value=replayed,
+            fact=fact,
+            extraction_run_id=extraction_run_id,
+            inference_run_id=inference_run_id,
+            normalized_value=validated_value,
+            payload=payload,
+        )
+        return AIFactProposalPersistence(fact_value=replayed, created=False)
+    else:
+        await savepoint.commit()
+        return AIFactProposalPersistence(fact_value=fact_value, created=True)
 
 
 async def create_human_fact_value(
@@ -810,6 +879,79 @@ def _build_evidence_links(
         )
         for index, evidence_input in enumerate(evidences)
     ]
+
+
+async def _get_replayed_ai_fact_value(
+    session: AsyncSession,
+    *,
+    fact_id: uuid.UUID,
+    inference_run_id: uuid.UUID,
+    value_hash: str,
+) -> FactValue | None:
+    if not hasattr(session, "execute"):
+        return None
+    return await fact_repository.get_ai_fact_value_by_replay_key_for_update(
+        session,
+        fact_id=fact_id,
+        inference_run_id=inference_run_id,
+        value_hash=value_hash,
+    )
+
+
+async def _validate_ai_fact_value_replay(
+    session: AsyncSession,
+    *,
+    fact_value: FactValue,
+    fact: Fact,
+    extraction_run_id: uuid.UUID,
+    inference_run_id: uuid.UUID,
+    normalized_value: NormalizedFactValue,
+    payload: AIProposalInput,
+) -> None:
+    if fact_value.fact_id != fact.id:
+        raise FactAIProposalReplayConflictError(
+            "Stored AI fact value does not belong to the expected fact."
+        )
+    if fact_value.source_kind != FactValueSourceKind.AI.value:
+        raise FactAIProposalReplayConflictError(
+            "Stored replay value is not an AI proposal."
+        )
+    if fact_value.extraction_run_id != extraction_run_id or fact_value.inference_run_id != inference_run_id:
+        raise FactAIProposalReplayConflictError(
+            "Stored AI fact provenance does not match the replay request."
+        )
+    if (
+        fact_value.value_type != normalized_value.value_type
+        or fact_value.value_json != normalized_value.value_json
+        or fact_value.value_hash != normalized_value.value_hash
+        or fact_value.referenced_entity_id != normalized_value.referenced_entity_id
+        or fact_value.confidence != payload.value.confidence
+        or fact_value.language_code != payload.value.language_code
+    ):
+        raise FactAIProposalReplayConflictError(
+            "Stored AI fact value does not match the replay payload."
+        )
+
+    existing_links = await fact_repository.list_fact_evidence_links_for_value(
+        session,
+        fact_value_id=fact_value.id,
+    )
+    requested_links = _build_evidence_links(
+        fact_value_id=fact_value.id,
+        evidences=payload.evidences,
+    )
+    existing_signature = [
+        (link.evidence_id, link.role, link.is_primary, link.source_order)
+        for link in existing_links
+    ]
+    requested_signature = [
+        (link.evidence_id, link.role, link.is_primary, link.source_order)
+        for link in requested_links
+    ]
+    if existing_signature != requested_signature:
+        raise FactAIProposalReplayConflictError(
+            "Stored AI evidence links do not match the replay payload."
+        )
 
 
 async def _replace_current_value(

@@ -59,6 +59,39 @@ async def get_entity_by_identity_for_update(
     return result.scalar_one_or_none()
 
 
+async def get_entity_context_by_identity(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    entity_type: str,
+    canonical_key: str,
+) -> FactEntityContext | None:
+    result = await session.execute(
+        select(
+            Entity.id,
+            Entity.project_id,
+            Entity.entity_type,
+            Entity.canonical_key,
+            Entity.status,
+        ).where(
+            Entity.project_id == project_id,
+            Entity.entity_type == entity_type,
+            Entity.canonical_key == canonical_key,
+        )
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+
+    return FactEntityContext(
+        entity_id=row.id,
+        project_id=row.project_id,
+        entity_type=row.entity_type,
+        canonical_key=row.canonical_key,
+        status=row.status,
+    )
+
+
 async def get_entity_by_identity_hash_for_update(
     session: AsyncSession,
     *,
@@ -186,3 +219,47 @@ async def resolve_entity_alias(
         .order_by(Entity.created_at.asc(), Entity.id.asc(), EntityAlias.created_at.asc(), EntityAlias.id.asc())
     )
     return list(result.scalars().unique().all())
+
+
+async def list_active_entity_contexts_by_alias(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    entity_type: str,
+    normalized_alias: str,
+) -> list[FactEntityContext]:
+    result = await session.execute(
+        select(
+            Entity.id,
+            Entity.project_id,
+            Entity.entity_type,
+            Entity.canonical_key,
+            Entity.status,
+        )
+        .join(EntityAlias, EntityAlias.entity_id == Entity.id)
+        .where(
+            Entity.project_id == project_id,
+            Entity.entity_type == entity_type,
+            Entity.status == "active",
+            EntityAlias.normalized_alias == normalized_alias,
+            EntityAlias.status == "active",
+        )
+        .order_by(Entity.id.asc())
+    )
+    rows = list(result.all())
+    contexts: list[FactEntityContext] = []
+    seen_entity_ids: set[uuid.UUID] = set()
+    for row in rows:
+        if row.id in seen_entity_ids:
+            continue
+        seen_entity_ids.add(row.id)
+        contexts.append(
+            FactEntityContext(
+                entity_id=row.id,
+                project_id=row.project_id,
+                entity_type=row.entity_type,
+                canonical_key=row.canonical_key,
+                status=row.status,
+            )
+        )
+    return contexts

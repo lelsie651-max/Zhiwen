@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from types import SimpleNamespace
 import uuid
 from datetime import datetime, timezone
 
@@ -28,6 +29,11 @@ from app.services import document_content as document_content_service
 
 def run_async(awaitable):
     return asyncio.run(awaitable)
+
+
+def make_integrity_error(constraint_name: str | None) -> IntegrityError:
+    orig = SimpleNamespace(diag=SimpleNamespace(constraint_name=constraint_name))
+    return IntegrityError("stmt", {}, orig)
 
 
 def build_anchor_hash(*, detected_format: str, location_key: str, raw_text: str) -> str:
@@ -83,12 +89,26 @@ class FakeSession:
     def __init__(self) -> None:
         self.commit_called = False
         self.rollback_called = False
+        self.savepoint_commit_count = 0
+        self.savepoint_rollback_count = 0
 
     async def commit(self) -> None:
         self.commit_called = True
 
     async def rollback(self) -> None:
         self.rollback_called = True
+
+    async def begin_nested(self):
+        session = self
+
+        class _Savepoint:
+            async def commit(self_nonlocal) -> None:
+                session.savepoint_commit_count += 1
+
+            async def rollback(self_nonlocal) -> None:
+                session.savepoint_rollback_count += 1
+
+        return _Savepoint()
 
 
 def test_document_block_preserves_raw_text_and_normalized_text_whitespace() -> None:
@@ -255,6 +275,275 @@ def test_persist_extraction_result_auto_generates_attempt_no(monkeypatch) -> Non
     assert result.attempt_no == 3
     assert captured["run"].attempt_no == 3
     assert len(captured["blocks"]) == 1
+    assert session.commit_called is True
+
+
+def test_get_or_create_source_evidence_uses_half_open_excerpt(monkeypatch) -> None:
+    session = FakeSession()
+    created: dict[str, object] = {}
+
+    async def fake_get_source_evidence_by_offsets(_session, _block_id, _start, _end):
+        return None
+
+    async def fake_create_source_evidence(_session, evidence):
+        created["evidence"] = evidence
+        return evidence
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_source_evidence_by_offsets",
+        fake_get_source_evidence_by_offsets,
+    )
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "create_source_evidence",
+        fake_create_source_evidence,
+    )
+
+    evidence, created_flag = run_async(
+        document_content_service.get_or_create_source_evidence_in_transaction(
+            session,
+            block_id=uuid.uuid4(),
+            raw_text="alpha beta",
+            start_offset=0,
+            end_offset=len("alpha beta"),
+        )
+    )
+
+    assert created_flag is True
+    assert evidence.excerpt == "alpha beta"
+    assert created["evidence"].excerpt == "alpha beta"
+    assert session.savepoint_commit_count == 1
+
+
+def test_get_or_create_source_evidence_reuses_matching_existing(monkeypatch) -> None:
+    session = FakeSession()
+    block_id = uuid.uuid4()
+    existing = SourceEvidence(
+        id=uuid.uuid4(),
+        block_id=block_id,
+        start_offset=0,
+        end_offset=5,
+        excerpt="alpha",
+        excerpt_hash=hashlib.sha256("alpha".encode("utf-8")).hexdigest(),
+    )
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_source_evidence_by_offsets",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=existing),
+    )
+
+    evidence, created_flag = run_async(
+        document_content_service.get_or_create_source_evidence_in_transaction(
+            session,
+            block_id=block_id,
+            raw_text="alpha beta",
+            start_offset=0,
+            end_offset=5,
+        )
+    )
+
+    assert created_flag is False
+    assert evidence is existing
+    assert session.savepoint_commit_count == 0
+
+
+def test_get_or_create_source_evidence_rejects_replay_conflict(monkeypatch) -> None:
+    session = FakeSession()
+    block_id = uuid.uuid4()
+    existing = SourceEvidence(
+        id=uuid.uuid4(),
+        block_id=block_id,
+        start_offset=0,
+        end_offset=5,
+        excerpt="omega",
+        excerpt_hash=hashlib.sha256("omega".encode("utf-8")).hexdigest(),
+    )
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_source_evidence_by_offsets",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=existing),
+    )
+
+    with pytest.raises(document_content_service.SourceEvidenceReplayConflictError):
+        run_async(
+            document_content_service.get_or_create_source_evidence_in_transaction(
+                session,
+                block_id=block_id,
+                raw_text="alpha beta",
+                start_offset=0,
+                end_offset=5,
+            )
+        )
+
+
+def test_get_or_create_source_evidence_handles_exact_constraint_conflict(monkeypatch) -> None:
+    session = FakeSession()
+    block_id = uuid.uuid4()
+    existing = SourceEvidence(
+        id=uuid.uuid4(),
+        block_id=block_id,
+        start_offset=0,
+        end_offset=5,
+        excerpt="alpha",
+        excerpt_hash=hashlib.sha256("alpha".encode("utf-8")).hexdigest(),
+    )
+    lookups = {"count": 0}
+
+    async def fake_get_source_evidence_by_offsets(_session, _block_id, _start, _end):
+        lookups["count"] += 1
+        if lookups["count"] == 1:
+            return None
+        return existing
+
+    async def fake_create_source_evidence(_session, _evidence):
+        raise make_integrity_error("uq_source_evidences_block_id_start_offset_end_offset")
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_source_evidence_by_offsets",
+        fake_get_source_evidence_by_offsets,
+    )
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "create_source_evidence",
+        fake_create_source_evidence,
+    )
+
+    evidence, created_flag = run_async(
+        document_content_service.get_or_create_source_evidence_in_transaction(
+            session,
+            block_id=block_id,
+            raw_text="alpha beta",
+            start_offset=0,
+            end_offset=5,
+        )
+    )
+
+    assert created_flag is False
+    assert evidence is existing
+    assert session.savepoint_rollback_count == 1
+
+
+def test_get_or_create_source_evidence_does_not_swallow_non_target_integrity_error(monkeypatch) -> None:
+    session = FakeSession()
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_source_evidence_by_offsets",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+    )
+
+    async def fake_create_source_evidence(_session, _evidence):
+        raise make_integrity_error("some_other_constraint")
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "create_source_evidence",
+        fake_create_source_evidence,
+    )
+
+    with pytest.raises(IntegrityError):
+        run_async(
+            document_content_service.get_or_create_source_evidence_in_transaction(
+                session,
+                block_id=uuid.uuid4(),
+                raw_text="alpha beta",
+                start_offset=0,
+                end_offset=5,
+            )
+        )
+
+    assert session.savepoint_rollback_count == 1
+
+
+def test_get_or_create_source_evidence_raises_original_error_when_requery_misses(monkeypatch) -> None:
+    session = FakeSession()
+    original_error = make_integrity_error("uq_source_evidences_block_id_start_offset_end_offset")
+    lookups = {"count": 0}
+
+    async def fake_get_source_evidence_by_offsets(_session, _block_id, _start, _end):
+        lookups["count"] += 1
+        return None
+
+    async def fake_create_source_evidence(_session, _evidence):
+        raise original_error
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_source_evidence_by_offsets",
+        fake_get_source_evidence_by_offsets,
+    )
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "create_source_evidence",
+        fake_create_source_evidence,
+    )
+
+    with pytest.raises(IntegrityError) as exc_info:
+        run_async(
+            document_content_service.get_or_create_source_evidence_in_transaction(
+                session,
+                block_id=uuid.uuid4(),
+                raw_text="alpha beta",
+                start_offset=0,
+                end_offset=5,
+            )
+        )
+
+    assert exc_info.value is original_error
+
+
+def test_create_source_evidence_idempotent_existing_still_commits(monkeypatch) -> None:
+    session = FakeSession()
+    block_id = uuid.uuid4()
+    block = DocumentBlock(
+        id=block_id,
+        extraction_run_id=uuid.uuid4(),
+        source_order=0,
+        block_type="paragraph",
+        raw_text="alpha beta",
+        normalized_text="alpha beta",
+        location_key="loc-0",
+        anchor_hash="a" * 64,
+        block_index=0,
+        heading_path=[],
+        block_metadata={},
+    )
+    existing = SourceEvidence(
+        id=uuid.uuid4(),
+        block_id=block_id,
+        start_offset=0,
+        end_offset=5,
+        excerpt="alpha",
+        excerpt_hash=hashlib.sha256("alpha".encode("utf-8")).hexdigest(),
+    )
+
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_document_block_by_id",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=block),
+    )
+    monkeypatch.setattr(
+        document_content_service.document_content_repository,
+        "get_source_evidence_by_offsets",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=existing),
+    )
+
+    result = run_async(
+        document_content_service.create_source_evidence(
+            session,
+            SourceEvidenceCreate(
+                block_id=block_id,
+                start_offset=0,
+                end_offset=5,
+            ),
+        )
+    )
+
+    assert result is existing
     assert session.commit_called is True
 
 
@@ -698,7 +987,7 @@ def test_create_source_evidence_returns_existing_record(monkeypatch) -> None:
 
     assert result is existing
     assert called["create"] is False
-    assert session.commit_called is False
+    assert session.commit_called is True
 
 
 def test_create_source_evidence_returns_existing_record_after_integrity_error(monkeypatch) -> None:
@@ -736,7 +1025,7 @@ def test_create_source_evidence_returns_existing_record_after_integrity_error(mo
         return existing
 
     async def fake_create_source_evidence(_session, _evidence):
-        raise IntegrityError("insert", {}, Exception("duplicate key"))
+        raise make_integrity_error("uq_source_evidences_block_id_start_offset_end_offset")
 
     monkeypatch.setattr(
         document_content_service.document_content_repository,
@@ -762,8 +1051,9 @@ def test_create_source_evidence_returns_existing_record_after_integrity_error(mo
     )
 
     assert result is existing
-    assert session.rollback_called is True
-    assert session.commit_called is False
+    assert session.rollback_called is False
+    assert session.savepoint_rollback_count == 1
+    assert session.commit_called is True
     assert lookup_count["count"] == 2
 
 
