@@ -73,6 +73,21 @@ class FactExtractionEvidenceBoundsError(FactExtractionExecutionError):
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedFactExtractionRunNotice:
+    project_id: uuid.UUID
+    extraction_run_id: uuid.UUID
+    plan_hash: str
+    batch_index: int
+    batch_plan_hash: str
+    input_batch_id: uuid.UUID
+    inference_run_id: uuid.UUID
+    inference_request_hash: str
+
+
+FactExtractionPreparedRunObserver = Callable[[PreparedFactExtractionRunNotice], Any]
+
+
+@dataclass(frozen=True, slots=True)
 class _InferenceRunSnapshot:
     run_id: uuid.UUID
     input_batch_id: uuid.UUID
@@ -397,7 +412,7 @@ def _build_execution_result(
     )
 
 
-def _map_failure_code(error: BaseException) -> str:
+def classify_fact_extraction_batch_failure(error: BaseException) -> str:
     if isinstance(error, LLMTransportError):
         if error.error_code == "authentication_failed":
             return "llm_authentication_failed"
@@ -487,6 +502,7 @@ async def execute_fact_extraction_batch(
     llm_client: LLMClient,
     provider: str,
     requested_model: str,
+    prepared_run_observer: FactExtractionPreparedRunObserver | None = None,
 ) -> FactExtractionBatchExecutionResult:
     batch_plan = _validate_plan_inputs(
         project_id=project_id,
@@ -571,6 +587,23 @@ async def execute_fact_extraction_batch(
             except BaseException:
                 await session.rollback()
                 raise
+
+        if prepared_run_observer is not None:
+            if prepared_snapshot.request_hash is None:
+                raise FactExtractionExecutionError("prepared inference run request_hash is missing")
+            notice = PreparedFactExtractionRunNotice(
+                project_id=project_id,
+                extraction_run_id=extraction_run_id,
+                plan_hash=plan.plan_hash,
+                batch_index=batch_plan.batch_index,
+                batch_plan_hash=batch_plan.plan_hash,
+                input_batch_id=prepared_snapshot.input_batch_id,
+                inference_run_id=prepared_snapshot.run_id,
+                inference_request_hash=prepared_snapshot.request_hash,
+            )
+            observer_result = prepared_run_observer(notice)
+            if hasattr(observer_result, "__await__"):
+                await observer_result
 
         if prepared.reused_completed:
             response = parse_fact_extraction_response_object(prepared_snapshot.response_json or {})
@@ -676,6 +709,6 @@ async def execute_fact_extraction_batch(
             await _safe_record_failed_run(
                 session_factory,
                 run_id=claimed_run_id,
-                failure_code=_map_failure_code(error),
+                failure_code=classify_fact_extraction_batch_failure(error),
             )
         raise

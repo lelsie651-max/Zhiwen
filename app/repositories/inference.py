@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.engine import Row
@@ -26,6 +28,26 @@ class CompletedFactExtractionRunContext:
     batch_id: uuid.UUID
     extraction_run_id_snapshots: frozenset[uuid.UUID]
     source_block_id_snapshots: frozenset[uuid.UUID]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedInferenceRunRegistrationContext:
+    inference_run_id: uuid.UUID
+    input_batch_id: uuid.UUID
+    project_id: uuid.UUID
+    task_type: str
+    status: str
+    inference_request_hash: str
+    agent_name: str
+    agent_version: str
+    prompt_name: str
+    prompt_version: str
+    prompt_contract_hash: str | None
+    provider: str
+    requested_model: str
+    batch_project_id: uuid.UUID
+    batch_task_type: str
+    request_metadata: dict[str, Any]
 
 
 async def get_project(session: AsyncSession, project_id: uuid.UUID) -> Project | None:
@@ -227,4 +249,55 @@ async def get_completed_fact_extraction_run_context(
         batch_id=first.batch_id,
         extraction_run_id_snapshots=extraction_run_id_snapshots,
         source_block_id_snapshots=source_block_id_snapshots,
+    )
+
+
+async def get_prepared_inference_run_registration_context(
+    session: AsyncSession,
+    *,
+    inference_run_id: uuid.UUID,
+) -> PreparedInferenceRunRegistrationContext | None:
+    result = await session.execute(
+        select(
+            InferenceRun.id.label("inference_run_id"),
+            InferenceRun.input_batch_id.label("input_batch_id"),
+            InferenceRun.project_id.label("project_id"),
+            InferenceRun.task_type.label("task_type"),
+            InferenceRun.status.label("status"),
+            InferenceRun.request_hash.label("inference_request_hash"),
+            InferenceRun.agent_name.label("agent_name"),
+            InferenceRun.agent_version.label("agent_version"),
+            InferenceRun.prompt_name.label("prompt_name"),
+            InferenceRun.prompt_version.label("prompt_version"),
+            InferenceRun.prompt_contract_hash.label("prompt_contract_hash"),
+            InferenceRun.provider.label("provider"),
+            InferenceRun.requested_model.label("requested_model"),
+            InferenceRun.request_metadata.label("request_metadata"),
+            InferenceInputBatch.project_id.label("batch_project_id"),
+            InferenceInputBatch.task_type.label("batch_task_type"),
+        )
+        .join(InferenceInputBatch, InferenceRun.input_batch_id == InferenceInputBatch.id)
+        .where(InferenceRun.id == inference_run_id)
+        .with_for_update(of=InferenceRun)
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+    return PreparedInferenceRunRegistrationContext(
+        inference_run_id=row.inference_run_id,
+        input_batch_id=row.input_batch_id,
+        project_id=row.project_id,
+        task_type=row.task_type,
+        status=row.status,
+        inference_request_hash=row.inference_request_hash,
+        agent_name=row.agent_name,
+        agent_version=row.agent_version,
+        prompt_name=row.prompt_name,
+        prompt_version=row.prompt_version,
+        prompt_contract_hash=row.prompt_contract_hash,
+        provider=row.provider,
+        requested_model=row.requested_model,
+        batch_project_id=row.batch_project_id,
+        batch_task_type=row.batch_task_type,
+        request_metadata=copy.deepcopy(row.request_metadata),
     )

@@ -36,6 +36,10 @@ from app.models.fact import (
     FactValueType,
 )
 from app.models.fact_extraction_application import FactExtractionBatchApplication
+from app.models.fact_extraction_orchestration import (
+    FactExtractionOrchestration,
+    FactExtractionOrchestrationBatch,
+)
 from app.models.document import Document, DocumentStatus
 from app.models.document_revision import (
     DocumentRevision,
@@ -109,6 +113,8 @@ __all__ = [
     "FactEvidenceLink",
     "FactEvidenceRole",
     "FactExtractionBatchApplication",
+    "FactExtractionOrchestration",
+    "FactExtractionOrchestrationBatch",
     "Document",
     "DocumentStatus",
     "DocumentRevision",

@@ -52,6 +52,14 @@ from app.schemas.fact_extraction_persistence import (
     FactProposalPersistenceOutcome,
     FactProposalWithheldReason,
 )
+from app.schemas.fact_extraction_orchestration import (
+    FactExtractionOrchestrationBatchResult,
+    FactExtractionOrchestrationBatchStatus,
+    FactExtractionOrchestrationResult,
+    FactExtractionOrchestrationStatus,
+    StaleInferenceRecoveryResult,
+    StaleInferenceRecoveryStatus,
+)
 from app.schemas.fact_commands import (
     AIProposalInput,
     FactEvidenceInput,
@@ -145,6 +153,12 @@ __all__ = [
     "FactProposalWithheldReason",
     "FactProposalPersistenceItem",
     "FactExtractionBatchPersistenceResult",
+    "FactExtractionOrchestrationStatus",
+    "FactExtractionOrchestrationBatchStatus",
+    "FactExtractionOrchestrationBatchResult",
+    "FactExtractionOrchestrationResult",
+    "StaleInferenceRecoveryStatus",
+    "StaleInferenceRecoveryResult",
     "ExtractionOutcome",
     "ExtractedBlockType",
     "ExtractedBlock",

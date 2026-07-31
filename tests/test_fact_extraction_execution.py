@@ -638,3 +638,163 @@ def async_lambda(result):
         return result
 
     return _wrapper
+
+
+def test_prepared_run_observer_runs_after_prepare_and_before_claim_and_llm(monkeypatch):
+    session_factory = SessionFactory()
+    project_id, extraction_run_id, blocks, plan, batch_plan = _planned_fixture()
+    orm_batch = _materialized_orm_batch(
+        project_id=project_id,
+        extraction_run_id=extraction_run_id,
+        blocks=blocks,
+        batch_plan=batch_plan,
+    )
+    request_hash = sha256("req")
+    pending_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=request_hash,
+        status=InferenceRunStatus.PENDING.value,
+    )
+    completed_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=request_hash,
+        status=InferenceRunStatus.COMPLETED.value,
+        response_json=_valid_response_payload(),
+    )
+    events: list[str] = []
+
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", async_lambda(orm_batch))
+    monkeypatch.setattr(
+        execution_service.inference_repository,
+        "get_batch_by_identity",
+        async_lambda(orm_batch),
+    )
+
+    async def fake_prepare(*_args, **_kwargs):
+        events.append("prepare")
+        return PreparedInferenceRun(run=pending_run, created=True, reused_completed=False)
+
+    async def fake_claim(*_args, **_kwargs):
+        assert events == ["prepare", "observer"]
+        events.append("claim")
+        return InferenceRunClaim(
+            run_id=pending_run.id,
+            status=InferenceRunStatus.RUNNING.value,
+            claimed=True,
+        )
+
+    async def fake_complete(*_args, **_kwargs):
+        events.append("complete")
+        return completed_run
+
+    monkeypatch.setattr(execution_service, "prepare_inference_run", fake_prepare)
+    monkeypatch.setattr(execution_service, "claim_inference_run_for_execution", fake_claim)
+    monkeypatch.setattr(execution_service, "complete_inference_run", fake_complete)
+
+    async def observer(notice):
+        assert session_factory.open_count == 0
+        assert notice.project_id == project_id
+        assert notice.extraction_run_id == extraction_run_id
+        assert notice.plan_hash == plan.plan_hash
+        assert notice.batch_index == 0
+        assert notice.batch_plan_hash == batch_plan.plan_hash
+        assert notice.input_batch_id == orm_batch.id
+        assert notice.inference_run_id == pending_run.id
+        assert notice.inference_request_hash == request_hash
+        assert not hasattr(notice, "messages")
+        assert not hasattr(notice, "prompt")
+        events.append("observer")
+
+    client = MockLLMClient(
+        handler=lambda _messages: (
+            events.append("llm"),
+            make_stub_completion(
+                json.dumps(_valid_response_payload(), ensure_ascii=False),
+                provider="deepseek",
+                model="deepseek-v4-flash",
+            ),
+        )[1]
+    )
+
+    result = run_async(
+        execution_service.execute_fact_extraction_batch(
+            session_factory,
+            project_id=project_id,
+            extraction_run_id=extraction_run_id,
+            plan=plan,
+            batch_index=0,
+            prompt=PROMPT,
+            llm_client=client,
+            provider="deepseek",
+            requested_model="deepseek-v4-flash",
+            prepared_run_observer=observer,
+        )
+    )
+
+    assert result.inference_run_id == completed_run.id
+    assert events == ["prepare", "observer", "claim", "llm", "complete"]
+
+
+def test_prepared_run_observer_failure_prevents_claim_and_llm(monkeypatch):
+    session_factory = SessionFactory()
+    project_id, extraction_run_id, blocks, plan, batch_plan = _planned_fixture()
+    orm_batch = _materialized_orm_batch(
+        project_id=project_id,
+        extraction_run_id=extraction_run_id,
+        blocks=blocks,
+        batch_plan=batch_plan,
+    )
+    pending_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=sha256("req"),
+        status=InferenceRunStatus.PENDING.value,
+    )
+    claim_calls = {"count": 0}
+
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", async_lambda(orm_batch))
+    monkeypatch.setattr(
+        execution_service.inference_repository,
+        "get_batch_by_identity",
+        async_lambda(orm_batch),
+    )
+    monkeypatch.setattr(
+        execution_service,
+        "prepare_inference_run",
+        async_lambda(PreparedInferenceRun(run=pending_run, created=True, reused_completed=False)),
+    )
+
+    async def fake_claim(*_args, **_kwargs):
+        claim_calls["count"] += 1
+        return InferenceRunClaim(
+            run_id=pending_run.id,
+            status=InferenceRunStatus.RUNNING.value,
+            claimed=True,
+        )
+
+    monkeypatch.setattr(execution_service, "claim_inference_run_for_execution", fake_claim)
+    client = MockLLMClient(["{}"])
+
+    async def observer(_notice):
+        raise RuntimeError("observer failed")
+
+    with pytest.raises(RuntimeError):
+        run_async(
+            execution_service.execute_fact_extraction_batch(
+                session_factory,
+                project_id=project_id,
+                extraction_run_id=extraction_run_id,
+                plan=plan,
+                batch_index=0,
+                prompt=PROMPT,
+                llm_client=client,
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+                prepared_run_observer=observer,
+            )
+        )
+
+    assert claim_calls["count"] == 0
+    assert client.calls == []

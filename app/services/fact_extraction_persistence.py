@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.fact_extraction import parse_fact_extraction_response_object
 from app.models.base import utc_now
 from app.models.entity import EntityStatus, normalize_entity_alias
-from app.models.fact import FactValueType
+from app.models.fact import FactValueSourceKind, FactValueType
 from app.models.fact_extraction_application import FactExtractionBatchApplication
 from app.models.inference import InferenceRunStatus, InferenceTaskType
 from app.repositories import entity as entity_repository
@@ -167,21 +167,132 @@ def _validate_result_counts(result: FactExtractionBatchPersistenceResult) -> Non
         raise FactExtractionApplicationReplayConflictError("application result withheld_count is inconsistent")
 
 
-def _validate_replay_item_shape(item: FactProposalPersistenceItem) -> None:
+def validate_fact_extraction_application_result_envelope(
+    *,
+    application: FactExtractionBatchApplication,
+) -> FactExtractionBatchPersistenceResult:
+    if application.status != _APPLICATION_STATUS_COMPLETED:
+        raise FactExtractionApplicationReplayConflictError("application status must be completed")
+    if application.result_json is None or application.result_hash is None:
+        raise FactExtractionApplicationReplayConflictError("completed application is missing its result snapshot")
+    if build_fact_extraction_application_result_hash(application.result_json) != application.result_hash:
+        raise FactExtractionApplicationReplayConflictError("application result_hash does not match result_json")
+
+    result = FactExtractionBatchPersistenceResult.model_validate(application.result_json)
+    if result.replayed_application:
+        raise FactExtractionApplicationReplayConflictError("application result snapshot must be canonical, not replayed")
+    if result.application_id != application.id:
+        raise FactExtractionApplicationReplayConflictError("application_id mismatch")
+    if result.project_id != application.project_id:
+        raise FactExtractionApplicationReplayConflictError("application project_id mismatch")
+    if result.extraction_run_id != application.extraction_run_id:
+        raise FactExtractionApplicationReplayConflictError("application extraction_run_id mismatch")
+    if result.inference_run_id != application.inference_run_id:
+        raise FactExtractionApplicationReplayConflictError("application inference_run_id mismatch")
+    if result.input_batch_id != application.input_batch_id:
+        raise FactExtractionApplicationReplayConflictError("application input_batch_id mismatch")
+    if result.response_hash != application.response_hash:
+        raise FactExtractionApplicationReplayConflictError("application response_hash mismatch")
+    if result.persistence_name != application.persistence_name:
+        raise FactExtractionApplicationReplayConflictError("application persistence_name mismatch")
+    if result.persistence_version != application.persistence_version:
+        raise FactExtractionApplicationReplayConflictError("application persistence_version mismatch")
+    if result.entity_resolution_policy_name != application.entity_resolution_policy_name:
+        raise FactExtractionApplicationReplayConflictError(
+            "application entity_resolution_policy_name mismatch"
+        )
+    if result.entity_resolution_policy_version != application.entity_resolution_policy_version:
+        raise FactExtractionApplicationReplayConflictError(
+            "application entity_resolution_policy_version mismatch"
+        )
+    _validate_result_counts(result)
+    return result
+
+
+def _validate_replay_item_shape(
+    item: FactProposalPersistenceItem,
+    *,
+    proposal: FactProposal,
+) -> None:
     if item.outcome == FactProposalPersistenceOutcome.WITHHELD:
+        if item.withheld_reason is None:
+            raise FactExtractionApplicationReplayConflictError("withheld application item is missing withheld_reason")
         if (
             item.fact_id is not None
             or item.fact_value_id is not None
+            or item.subject_entity_id is not None
+            or item.referenced_entity_id is not None
             or item.evidence_ids
         ):
             raise FactExtractionApplicationReplayConflictError(
                 "withheld application item carries persisted identifiers"
             )
         return
+    if item.withheld_reason is not None:
+        raise FactExtractionApplicationReplayConflictError(
+            "persisted application item must not carry withheld_reason"
+        )
     if item.fact_id is None or item.fact_value_id is None:
         raise FactExtractionApplicationReplayConflictError(
             "persisted application item is missing fact identifiers"
         )
+    if len(item.evidence_ids) != len(proposal.evidence):
+        raise FactExtractionApplicationReplayConflictError(
+            "persisted application item evidence_ids do not match the original proposal"
+        )
+
+
+def _validate_resolution_consistency(
+    item: FactProposalPersistenceItem,
+    *,
+    proposal: FactProposal,
+) -> None:
+    if item.subject_resolution_status == EntityMentionResolutionStatus.RESOLVED:
+        if item.subject_entity_id is None:
+            raise FactExtractionApplicationReplayConflictError("resolved subject must carry subject_entity_id")
+    elif item.subject_resolution_status == EntityMentionResolutionStatus.UNRESOLVED:
+        if item.subject_entity_id is not None:
+            raise FactExtractionApplicationReplayConflictError("unresolved subject must not carry subject_entity_id")
+    else:
+        if item.outcome != FactProposalPersistenceOutcome.WITHHELD:
+            raise FactExtractionApplicationReplayConflictError(
+                "ambiguous or ineligible subject must be withheld"
+            )
+        if item.subject_entity_id is not None:
+            raise FactExtractionApplicationReplayConflictError(
+                "withheld subject must not carry subject_entity_id"
+            )
+
+    if proposal.value_type != FactValueType.ENTITY_REF:
+        if item.referenced_resolution_status is not None or item.referenced_entity_id is not None:
+            raise FactExtractionApplicationReplayConflictError(
+                "non-entity_ref proposal must not carry referenced entity replay state"
+            )
+        return
+
+    if item.referenced_resolution_status is None:
+        raise FactExtractionApplicationReplayConflictError(
+            "entity_ref replay item must carry referenced resolution status"
+        )
+    if item.referenced_resolution_status == EntityMentionResolutionStatus.RESOLVED:
+        if item.referenced_entity_id is None:
+            raise FactExtractionApplicationReplayConflictError(
+                "resolved entity_ref must carry referenced_entity_id"
+            )
+    elif item.referenced_resolution_status == EntityMentionResolutionStatus.UNRESOLVED:
+        if item.referenced_entity_id is not None:
+            raise FactExtractionApplicationReplayConflictError(
+                "unresolved entity_ref must not carry referenced_entity_id"
+            )
+    else:
+        if item.outcome != FactProposalPersistenceOutcome.WITHHELD:
+            raise FactExtractionApplicationReplayConflictError(
+                "ambiguous or ineligible entity_ref must be withheld"
+            )
+        if item.referenced_entity_id is not None:
+            raise FactExtractionApplicationReplayConflictError(
+                "withheld entity_ref must not carry referenced_entity_id"
+            )
 
 
 def _validate_persistence_context(
@@ -462,11 +573,21 @@ async def _validate_replayed_result_against_database(
     session: AsyncSession,
     *,
     result: FactExtractionBatchPersistenceResult,
-    inference_run_id: uuid.UUID,
+    application: FactExtractionBatchApplication,
+    response: FactExtractionResponse,
 ) -> None:
     _validate_result_counts(result)
-    for item in result.items:
-        _validate_replay_item_shape(item)
+    if len(result.items) != len(response.facts):
+        raise FactExtractionApplicationReplayConflictError(
+            "application result item count does not match the original response"
+        )
+    for proposal_index, (item, proposal) in enumerate(zip(result.items, response.facts, strict=True)):
+        if item.proposal_index != proposal_index:
+            raise FactExtractionApplicationReplayConflictError("application result proposal_index mismatch")
+        if item.proposal_hash != _proposal_hash(proposal):
+            raise FactExtractionApplicationReplayConflictError("application result proposal_hash mismatch")
+        _validate_replay_item_shape(item, proposal=proposal)
+        _validate_resolution_consistency(item, proposal=proposal)
         if item.outcome == FactProposalPersistenceOutcome.WITHHELD:
             continue
 
@@ -476,24 +597,43 @@ async def _validate_replayed_result_against_database(
         )
         if fact_value is None:
             raise FactExtractionApplicationReplayConflictError("application fact_value record is missing")
-        if fact_value.inference_run_id != inference_run_id:
+        if fact_value.source_kind != FactValueSourceKind.AI.value:
+            raise FactExtractionApplicationReplayConflictError("application fact_value must remain an AI source")
+        if fact_value.extraction_run_id != application.extraction_run_id:
+            raise FactExtractionApplicationReplayConflictError("application fact_value extraction_run_id mismatch")
+        if fact_value.inference_run_id != application.inference_run_id:
             raise FactExtractionApplicationReplayConflictError("application fact_value inference_run_id mismatch")
         if fact_value.fact_id != item.fact_id:
             raise FactExtractionApplicationReplayConflictError("application fact_value fact_id mismatch")
         if fact_value.referenced_entity_id != item.referenced_entity_id:
             raise FactExtractionApplicationReplayConflictError("application referenced_entity_id mismatch")
-        if fact_value.fact is None or fact_value.fact.subject_entity_id != item.subject_entity_id:
+        if fact_value.fact is None:
+            raise FactExtractionApplicationReplayConflictError("application fact record is missing")
+        if fact_value.fact.project_id != application.project_id:
+            raise FactExtractionApplicationReplayConflictError("application fact project_id mismatch")
+        if fact_value.fact.subject_entity_id != item.subject_entity_id:
             raise FactExtractionApplicationReplayConflictError("application subject_entity_id mismatch")
 
         ordered_links = sorted(
             fact_value.evidence_links,
             key=lambda link: (link.source_order, str(link.id)),
         )
-        evidence_ids = tuple(link.evidence_id for link in ordered_links)
-        if evidence_ids != item.evidence_ids:
-            raise FactExtractionApplicationReplayConflictError("application evidence link ids do not match")
-        if [link.source_order for link in ordered_links] != list(range(len(ordered_links))):
-            raise FactExtractionApplicationReplayConflictError("application evidence link source_order is inconsistent")
+        if len(ordered_links) != len(proposal.evidence):
+            raise FactExtractionApplicationReplayConflictError("application evidence link count mismatch")
+        supporting_seen = 0
+        for evidence_index, (link, expected) in enumerate(zip(ordered_links, proposal.evidence, strict=True)):
+            if link.evidence_id != item.evidence_ids[evidence_index]:
+                raise FactExtractionApplicationReplayConflictError("application evidence link ids do not match")
+            if link.source_order != evidence_index:
+                raise FactExtractionApplicationReplayConflictError("application evidence link source_order is inconsistent")
+            if link.role != expected.role:
+                raise FactExtractionApplicationReplayConflictError("application evidence link role mismatch")
+            expected_is_primary = False
+            if expected.role == "supporting":
+                supporting_seen += 1
+                expected_is_primary = supporting_seen == 1
+            if link.is_primary != expected_is_primary:
+                raise FactExtractionApplicationReplayConflictError("application evidence link is_primary mismatch")
 
 
 async def _replay_completed_application(
@@ -503,6 +643,7 @@ async def _replay_completed_application(
     context: CompletedFactExtractionPersistenceContext,
     project_id: uuid.UUID,
     extraction_run_id: uuid.UUID,
+    response: FactExtractionResponse,
 ) -> FactExtractionBatchPersistenceResult:
     if application.status != _APPLICATION_STATUS_COMPLETED:
         raise FactExtractionApplicationReplayConflictError("application is not completed")
@@ -556,7 +697,8 @@ async def _replay_completed_application(
     await _validate_replayed_result_against_database(
         session,
         result=stored_result,
-        inference_run_id=context.inference_run_id,
+        application=application,
+        response=response,
     )
     return stored_result.model_copy(update={"replayed_application": True})
 
@@ -567,6 +709,7 @@ async def _prepare_batch_application(
     project_id: uuid.UUID,
     extraction_run_id: uuid.UUID,
     context: CompletedFactExtractionPersistenceContext,
+    response: FactExtractionResponse,
 ) -> PreparedBatchApplication:
     existing = await persistence_repository.get_batch_application_for_update(
         session,
@@ -579,6 +722,7 @@ async def _prepare_batch_application(
             context=context,
             project_id=project_id,
             extraction_run_id=extraction_run_id,
+            response=response,
         )
         return PreparedBatchApplication(application=existing, replay_result=replay)
 
@@ -618,6 +762,7 @@ async def _prepare_batch_application(
             context=context,
             project_id=project_id,
             extraction_run_id=extraction_run_id,
+            response=response,
         )
         return PreparedBatchApplication(application=existing, replay_result=replay)
 
@@ -679,6 +824,7 @@ async def persist_completed_fact_extraction_batch(
             project_id=project_id,
             extraction_run_id=extraction_run_id,
             context=context,
+            response=response,
         )
         if prepared_application.replay_result is not None:
             await session.commit()

@@ -17,6 +17,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import AddConstraint
 
+from app.agents.fact_extraction import parse_fact_extraction_response_object
 from app.models import Base
 from app.models.entity import EntityStatus
 from app.models.fact import FactValue, FactValueStatus, FactValueType
@@ -300,7 +301,7 @@ def build_resolution(
 def patch_application_prepare(monkeypatch):
     state: dict[str, object | None] = {"application": None}
 
-    async def fake_prepare(_session, *, project_id, extraction_run_id, context):
+    async def fake_prepare(_session, *, project_id, extraction_run_id, context, response):
         application = state["application"]
         if application is None:
             application = SimpleNamespace(
@@ -337,6 +338,126 @@ def patch_application_prepare(monkeypatch):
 
     monkeypatch.setattr(persistence_service, "_prepare_batch_application", fake_prepare)
     return state
+
+
+def _build_replay_fixture(
+    *,
+    item_overrides: dict | None = None,
+    fact_value_overrides: dict | None = None,
+    fact_overrides: dict | None = None,
+    link_overrides: dict[int, dict] | None = None,
+):
+    context = build_context()
+    response = parse_fact_extraction_response_object(context.response_json)
+    evidence_ids = (uuid.uuid4(), uuid.uuid4())
+    item = {
+        "proposal_index": 0,
+        "proposal_hash": sha256(response.facts[0].dedupe_signature),
+        "outcome": FactProposalPersistenceOutcome.CREATED.value,
+        "withheld_reason": None,
+        "subject_resolution_status": EntityMentionResolutionStatus.UNRESOLVED.value,
+        "referenced_resolution_status": None,
+        "fact_id": str(uuid.uuid4()),
+        "fact_value_id": str(uuid.uuid4()),
+        "subject_entity_id": None,
+        "referenced_entity_id": None,
+        "evidence_ids": [str(evidence_id) for evidence_id in evidence_ids],
+    }
+    if item_overrides:
+        item.update(item_overrides)
+
+    created_count = 1 if item["outcome"] == FactProposalPersistenceOutcome.CREATED.value else 0
+    reused_count = 1 if item["outcome"] == FactProposalPersistenceOutcome.REUSED.value else 0
+    withheld_count = 1 if item["outcome"] == FactProposalPersistenceOutcome.WITHHELD.value else 0
+
+    application = FactExtractionBatchApplication(
+        id=uuid.uuid4(),
+        inference_run_id=context.inference_run_id,
+        project_id=context.project_id,
+        extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+        input_batch_id=context.input_batch_id,
+        response_hash=context.response_hash,
+        response_json_hash=context.response_json_hash,
+        status="completed",
+        persistence_name=persistence_service.FACT_EXTRACTION_PERSISTENCE_NAME,
+        persistence_version=persistence_service.FACT_EXTRACTION_PERSISTENCE_VERSION,
+        entity_resolution_policy_name=persistence_service.ENTITY_RESOLUTION_POLICY_NAME,
+        entity_resolution_policy_version=persistence_service.ENTITY_RESOLUTION_POLICY_VERSION,
+        result_json={
+            "application_id": "",
+            "replayed_application": False,
+            "project_id": str(context.project_id),
+            "extraction_run_id": str(context.blocks[0].extraction_run_id_snapshot),
+            "inference_run_id": str(context.inference_run_id),
+            "input_batch_id": str(context.input_batch_id),
+            "response_hash": context.response_hash,
+            "persistence_name": persistence_service.FACT_EXTRACTION_PERSISTENCE_NAME,
+            "persistence_version": persistence_service.FACT_EXTRACTION_PERSISTENCE_VERSION,
+            "entity_resolution_policy_name": persistence_service.ENTITY_RESOLUTION_POLICY_NAME,
+            "entity_resolution_policy_version": persistence_service.ENTITY_RESOLUTION_POLICY_VERSION,
+            "proposal_count": 1,
+            "created_count": created_count,
+            "reused_count": reused_count,
+            "withheld_count": withheld_count,
+            "items": [item],
+        },
+        result_hash="a" * 64,
+        completed_at=object(),
+    )
+    application.result_json["application_id"] = str(application.id)
+    application.result_hash = persistence_service.build_fact_extraction_application_result_hash(
+        application.result_json
+    )
+
+    fact = SimpleNamespace(
+        project_id=context.project_id,
+        subject_entity_id=item.get("subject_entity_id"),
+    )
+    if fact_overrides:
+        for key, value in fact_overrides.items():
+            setattr(fact, key, value)
+
+    link_evidence_ids = item["evidence_ids"]
+    if len(link_evidence_ids) < 2:
+        link_evidence_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    links = [
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            evidence_id=uuid.UUID(link_evidence_ids[0]),
+            source_order=0,
+            role="supporting",
+            is_primary=True,
+        ),
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            evidence_id=uuid.UUID(link_evidence_ids[1]),
+            source_order=1,
+            role="context",
+            is_primary=False,
+        ),
+    ]
+    if link_overrides:
+        for index, overrides in link_overrides.items():
+            for key, value in overrides.items():
+                setattr(links[index], key, value)
+
+    fact_value = SimpleNamespace(
+        id=uuid.UUID(item["fact_value_id"]) if item["fact_value_id"] is not None else None,
+        fact_id=uuid.UUID(item["fact_id"]) if item["fact_id"] is not None else None,
+        source_kind="ai",
+        extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+        inference_run_id=context.inference_run_id,
+        referenced_entity_id=(
+            uuid.UUID(item["referenced_entity_id"]) if item["referenced_entity_id"] is not None else None
+        ),
+        fact=fact,
+        evidence_links=links,
+    )
+    if fact_value_overrides:
+        for key, value in fact_value_overrides.items():
+            setattr(fact_value, key, value)
+
+    return context, response, application, fact_value
 
 
 def test_completed_fact_extraction_run_context_can_load_and_deepcopy_response() -> None:
@@ -1339,7 +1460,8 @@ def test_application_model_constraints_exist_and_compile() -> None:
 
 
 def test_prepare_batch_application_recovers_only_exact_constraint(monkeypatch) -> None:
-    context = build_context()
+    context = build_context(response_json={"facts": [], "batch_summary": "ok", "uncertainties": []})
+    response = parse_fact_extraction_response_object(context.response_json)
     existing_application = FactExtractionBatchApplication(
         id=uuid.uuid4(),
         inference_run_id=context.inference_run_id,
@@ -1404,6 +1526,7 @@ def test_prepare_batch_application_recovers_only_exact_constraint(monkeypatch) -
             project_id=context.project_id,
             extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
             context=context,
+            response=response,
         )
     )
 
@@ -1432,6 +1555,121 @@ def test_prepare_batch_application_recovers_only_exact_constraint(monkeypatch) -
                 project_id=context.project_id,
                 extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
                 context=context,
+                response=response,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("item_overrides", "fact_value_overrides", "fact_overrides", "link_overrides", "expected_message"),
+    [
+        (
+            {"proposal_index": 1},
+            None,
+            None,
+            None,
+            "proposal_index mismatch",
+        ),
+        (
+            {"proposal_hash": "b" * 64},
+            None,
+            None,
+            None,
+            "proposal_hash mismatch",
+        ),
+        (
+            {
+                "outcome": FactProposalPersistenceOutcome.WITHHELD.value,
+                "withheld_reason": None,
+                "fact_id": None,
+                "fact_value_id": None,
+                "evidence_ids": [],
+            },
+            None,
+            None,
+            None,
+            "missing withheld_reason",
+        ),
+        (
+            {"withheld_reason": FactProposalWithheldReason.SUBJECT_AMBIGUOUS.value},
+            None,
+            None,
+            None,
+            "must not carry withheld_reason",
+        ),
+        (
+            None,
+            None,
+            None,
+            {0: {"role": "context"}},
+            "role mismatch",
+        ),
+        (
+            None,
+            None,
+            None,
+            {0: {"is_primary": False}},
+            "is_primary mismatch",
+        ),
+        (
+            None,
+            {"source_kind": "human"},
+            None,
+            None,
+            "must remain an AI source",
+        ),
+        (
+            None,
+            {"extraction_run_id": uuid.uuid4()},
+            None,
+            None,
+            "extraction_run_id mismatch",
+        ),
+        (
+            None,
+            None,
+            {"project_id": uuid.uuid4()},
+            None,
+            "project_id mismatch",
+        ),
+    ],
+)
+def test_replay_completed_application_rejects_tampering(
+    monkeypatch,
+    item_overrides,
+    fact_value_overrides,
+    fact_overrides,
+    link_overrides,
+    expected_message,
+) -> None:
+    context, response, application, fact_value = _build_replay_fixture(
+        item_overrides=item_overrides,
+        fact_value_overrides=fact_value_overrides,
+        fact_overrides=fact_overrides,
+        link_overrides=link_overrides,
+    )
+
+    async def fake_get_fact_value_with_links(*_args, **_kwargs):
+        return fact_value
+
+    monkeypatch.setattr(
+        persistence_service.fact_repository,
+        "get_fact_value_with_links",
+        fake_get_fact_value_with_links,
+    )
+
+    with pytest.raises(
+        persistence_service.FactExtractionApplicationReplayConflictError,
+        match=expected_message,
+    ):
+        run_async(
+            persistence_service._replay_completed_application(
+                FakeSession(),
+                application=application,
+                context=context,
+                project_id=context.project_id,
+                extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+                response=response,
             )
         )
 
@@ -1472,7 +1710,7 @@ def test_single_migration_head_is_fact_value_replay() -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202607311900"]
+    assert list(script.get_heads()) == ["202607312230"]
 
 
 def test_postgresql_offline_ddl_for_new_unique_constraint_compiles() -> None:

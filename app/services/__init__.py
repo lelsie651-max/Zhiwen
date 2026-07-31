@@ -141,7 +141,6 @@ from app.services.processing_job import (
 )
 from app.services.processing_job_executor import execute_revision_extraction_job
 from app.services.processing_job_dispatch import dispatch_revision_extraction_job
-
 __all__ = [
     "ExtractionPersistenceError",
     "ExtractionRevisionNotFoundError",

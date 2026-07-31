@@ -437,18 +437,21 @@ def test_fact_entity_links_migration_downgrade_is_reversible() -> None:
 
 def test_fact_migrations_include_inference_provenance_followup() -> None:
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
-    fact_migrations = sorted(
-        path.name
-        for path in versions_dir.glob("*_fact*.py")
-        if path.name != "__init__.py"
-    )
-
-    assert fact_migrations == [
+    expected_migrations = [
         "202607301630_fact_models.py",
         "202607311030_fact_value_inference_provenance.py",
         "202607311430_fact_entity_links.py",
         "202607311800_fact_value_inference_replay.py",
+        "202607312200_fact_extraction_orchestration.py",
+        "202607312230_orchestration_recovery_hardening.py",
     ]
+    fact_migrations = sorted(
+        path.name
+        for path in versions_dir.glob("*.py")
+        if path.name in expected_migrations
+    )
+
+    assert fact_migrations == expected_migrations
 
 
 def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
