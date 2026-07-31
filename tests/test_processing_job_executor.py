@@ -214,27 +214,26 @@ def test_queued_job_is_claimed_and_completed_for_all_run_outcomes(
             lease_token=job.lease_token,
         )
 
-    async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage):
+    async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage, finalizer=None):
         run_calls.append(revision_id)
         revision.status = revision_status
-        return build_execution_result(
+        result = build_execution_result(
             revision_id=revision_id,
             outcome=outcome,
             revision_status=revision_status,
         )
-
-    async def fake_complete_processing_job(_session, *, project_id, job_id, lease_token, extraction_run_id):
-        complete_calls.append((job_id, extraction_run_id))
-        assert lease_token == job.lease_token
-        job.status = ProcessingJobStatus.COMPLETED.value
-        job.result_extraction_run_id = extraction_run_id
-        job.lease_token = None
-        job.lease_expires_at = None
-        return job
+        if finalizer is not None:
+            complete_calls.append((job.id, result.extraction_run_id))
+            await finalizer(_session, revision, type("Run", (), {"id": result.extraction_run_id})())
+        return result
 
     monkeypatch.setattr(processing_job_executor_service, "claim_processing_job", fake_claim_processing_job)
     monkeypatch.setattr(processing_job_executor_service, "run_revision_extraction", fake_run_revision_extraction)
-    monkeypatch.setattr(processing_job_executor_service, "complete_processing_job", fake_complete_processing_job)
+    monkeypatch.setattr(
+        processing_job_executor_service,
+        "complete_processing_job_in_transaction",
+        lambda _session, **kwargs: asyncio.sleep(0, result=job),
+    )
 
     result = run_async(
         execute_revision_extraction_job(
@@ -252,6 +251,59 @@ def test_queued_job_is_claimed_and_completed_for_all_run_outcomes(
     assert claim_calls == [job.id]
     assert run_calls == [revision.id]
     assert len(complete_calls) == 1
+
+
+def test_executor_finalizes_job_in_same_session_as_revision_persistence(monkeypatch) -> None:
+    session_factory = FakeSessionFactory()
+    project_id = uuid.uuid4()
+    revision = build_revision(status=DocumentRevisionStatus.ACCEPTED.value)
+    job = build_processing_job(project_id=project_id, revision_id=revision.id)
+    patch_job_snapshot_repository(monkeypatch, job=job, revision=revision)
+    recorded: dict[str, str] = {}
+
+    async def fake_claim_processing_job(_session, *, project_id, job_id, lease_seconds):
+        job.status = ProcessingJobStatus.RUNNING.value
+        job.lease_token = uuid.uuid4()
+        job.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+        return DetachedClaimedJob(
+            job_id=job.id,
+            project_id=project_id,
+            revision_id=job.revision_id,
+            lease_token=job.lease_token,
+        )
+
+    async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage, finalizer=None):
+        recorded["run_session"] = _session.name
+        result = build_execution_result(revision_id=revision_id)
+        if finalizer is not None:
+            await finalizer(_session, revision, type("Run", (), {"id": result.extraction_run_id})())
+        return result
+
+    async def fake_complete_processing_job_in_transaction(_session, **kwargs):
+        recorded["finalize_session"] = _session.name
+        job.status = ProcessingJobStatus.COMPLETED.value
+        job.result_extraction_run_id = kwargs["extraction_run_id"]
+        return job
+
+    monkeypatch.setattr(processing_job_executor_service, "claim_processing_job", fake_claim_processing_job)
+    monkeypatch.setattr(processing_job_executor_service, "run_revision_extraction", fake_run_revision_extraction)
+    monkeypatch.setattr(
+        processing_job_executor_service,
+        "complete_processing_job_in_transaction",
+        fake_complete_processing_job_in_transaction,
+    )
+
+    result = run_async(
+        execute_revision_extraction_job(
+            session_factory,
+            job_id=job.id,
+            storage=object(),
+            heartbeat_seconds=0.01,
+        )
+    )
+
+    assert result.execution_status == ProcessingJobExecutionStatus.COMPLETED
+    assert recorded["run_session"] == recorded["finalize_session"]
 
 
 def test_ordinary_execution_exception_marks_job_failed_without_leaking_raw_error(monkeypatch, caplog) -> None:
@@ -273,7 +325,7 @@ def test_ordinary_execution_exception_marks_job_failed_without_leaking_raw_error
             lease_token=job.lease_token,
         )
 
-    async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage):
+    async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage, finalizer=None):
         raise RuntimeError("storage_key=secret lease_token=topsecret 正文 body")
 
     async def fake_fail_processing_job(_session, *, project_id, job_id, lease_token, failure_code, failure_message):
@@ -380,25 +432,27 @@ def test_concurrent_execution_of_same_job_runs_extraction_only_once(monkeypatch)
                     lease_token=job.lease_token,
                 )
 
-        async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage):
+        async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage, finalizer=None):
             nonlocal run_count
             run_count += 1
             await asyncio.sleep(0.02)
             revision.status = DocumentRevisionStatus.AWAITING_REVIEW.value
-            return build_execution_result(
+            result = build_execution_result(
                 revision_id=revision_id,
                 outcome="success",
                 revision_status=DocumentRevisionStatus.AWAITING_REVIEW.value,
             )
-
-        async def fake_complete_processing_job(_session, *, project_id, job_id, lease_token, extraction_run_id):
-            job.status = ProcessingJobStatus.COMPLETED.value
-            job.result_extraction_run_id = extraction_run_id
-            return job
+            if finalizer is not None:
+                await finalizer(_session, revision, type("Run", (), {"id": result.extraction_run_id})())
+            return result
 
         monkeypatch.setattr(processing_job_executor_service, "claim_processing_job", fake_claim_processing_job)
         monkeypatch.setattr(processing_job_executor_service, "run_revision_extraction", fake_run_revision_extraction)
-        monkeypatch.setattr(processing_job_executor_service, "complete_processing_job", fake_complete_processing_job)
+        monkeypatch.setattr(
+            processing_job_executor_service,
+            "complete_processing_job_in_transaction",
+            lambda _session, **kwargs: asyncio.sleep(0, result=job),
+        )
 
         first, second = await asyncio.gather(
             execute_revision_extraction_job(session_factory, job_id=job.id, storage=object(), heartbeat_seconds=0.01),
@@ -440,25 +494,27 @@ def test_heartbeat_uses_independent_sessions_and_renews_periodically(monkeypatch
             renew_session_names.append(_session.name)
             return job
 
-        async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage):
+        async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage, finalizer=None):
             run_session_names.append(_session.name)
             await asyncio.sleep(0.035)
             revision.status = DocumentRevisionStatus.AWAITING_REVIEW.value
-            return build_execution_result(
+            result = build_execution_result(
                 revision_id=revision_id,
                 outcome="success",
                 revision_status=DocumentRevisionStatus.AWAITING_REVIEW.value,
             )
-
-        async def fake_complete_processing_job(_session, *, project_id, job_id, lease_token, extraction_run_id):
-            job.status = ProcessingJobStatus.COMPLETED.value
-            job.result_extraction_run_id = extraction_run_id
-            return job
+            if finalizer is not None:
+                await finalizer(_session, revision, type("Run", (), {"id": result.extraction_run_id})())
+            return result
 
         monkeypatch.setattr(processing_job_executor_service, "claim_processing_job", fake_claim_processing_job)
         monkeypatch.setattr(processing_job_executor_service, "renew_processing_job_lease", fake_renew_processing_job_lease)
         monkeypatch.setattr(processing_job_executor_service, "run_revision_extraction", fake_run_revision_extraction)
-        monkeypatch.setattr(processing_job_executor_service, "complete_processing_job", fake_complete_processing_job)
+        monkeypatch.setattr(
+            processing_job_executor_service,
+            "complete_processing_job_in_transaction",
+            lambda _session, **kwargs: asyncio.sleep(0, result=job),
+        )
 
         result = await execute_revision_extraction_job(
             session_factory,
@@ -556,20 +612,27 @@ def test_completion_lease_loss_does_not_overwrite_job(monkeypatch) -> None:
             lease_token=job.lease_token,
         )
 
-    async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage):
+    async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage, finalizer=None):
         revision.status = DocumentRevisionStatus.AWAITING_REVIEW.value
-        return build_execution_result(
+        result = build_execution_result(
             revision_id=revision_id,
             outcome="success",
             revision_status=DocumentRevisionStatus.AWAITING_REVIEW.value,
         )
-
-    async def fake_complete_processing_job(_session, *, project_id, job_id, lease_token, extraction_run_id):
-        raise processing_job_service.ProcessingJobLeaseError("lease lost")
+        if finalizer is not None:
+            await finalizer(_session, revision, type("Run", (), {"id": result.extraction_run_id})())
+        return result
 
     monkeypatch.setattr(processing_job_executor_service, "claim_processing_job", fake_claim_processing_job)
     monkeypatch.setattr(processing_job_executor_service, "run_revision_extraction", fake_run_revision_extraction)
-    monkeypatch.setattr(processing_job_executor_service, "complete_processing_job", fake_complete_processing_job)
+    monkeypatch.setattr(
+        processing_job_executor_service,
+        "complete_processing_job_in_transaction",
+        lambda _session, **kwargs: asyncio.sleep(
+            0,
+            result=(_ for _ in ()).throw(processing_job_service.ProcessingJobLeaseError("lease lost")),
+        ),
+    )
 
     result = run_async(
         execute_revision_extraction_job(
@@ -605,7 +668,7 @@ def test_cancelled_error_propagates_and_does_not_mark_job_finished(monkeypatch) 
                 lease_token=job.lease_token,
             )
 
-        async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage):
+        async def fake_run_revision_extraction(_session, *, project_id, revision_id, storage, finalizer=None):
             raise asyncio.CancelledError
 
         async def fake_fail_processing_job(_session, *, project_id, job_id, lease_token, failure_code, failure_message):

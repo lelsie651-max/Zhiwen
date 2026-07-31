@@ -21,7 +21,7 @@ from app.services.processing_job import (
     ProcessingJobNotFoundError,
     ProcessingJobStateError,
     claim_processing_job,
-    complete_processing_job,
+    complete_processing_job_in_transaction,
     fail_processing_job,
     renew_processing_job_lease,
 )
@@ -99,39 +99,15 @@ async def execute_revision_extraction_job(
             session_factory,
             project_id=copied_project_id,
             revision_id=copied_revision_id,
+            job_id=copied_job_id,
+            lease_token=copied_lease_token,
             storage=storage,
         )
     except asyncio.CancelledError:
         await _cancel_heartbeat_task(heartbeat_task)
         raise
-    except Exception:
-        await _stop_heartbeat_task(heartbeat_task, heartbeat_stop)
-        logger.warning(
-            "Processing job execution failed before a persisted result was produced: "
-            "job_id=%s revision_id=%s failure_code=%s",
-            copied_job_id,
-            copied_revision_id,
-            WORKER_FAILURE_CODE,
-        )
-        return await _handle_execution_failure(
-            session_factory,
-            job_id=copied_job_id,
-            project_id=copied_project_id,
-            revision_id=copied_revision_id,
-            lease_token=copied_lease_token,
-        )
-
-    await _stop_heartbeat_task(heartbeat_task, heartbeat_stop)
-    try:
-        async with session_factory() as session:
-            completed_job = await complete_processing_job(
-                session,
-                project_id=copied_project_id,
-                job_id=copied_job_id,
-                lease_token=copied_lease_token,
-                extraction_run_id=extraction_result.extraction_run_id,
-            )
     except (ProcessingJobLeaseError, ProcessingJobStateError):
+        await _stop_heartbeat_task(heartbeat_task, heartbeat_stop)
         logger.warning(
             "Processing job completion lost its lease or state precondition: "
             "job_id=%s revision_id=%s failure_code=%s",
@@ -150,12 +126,30 @@ async def execute_revision_extraction_job(
             failure_code=current_snapshot.failure_code or LEASE_LOST_DURING_COMPLETION,
             skip_reason=None,
         )
+    except Exception:
+        await _stop_heartbeat_task(heartbeat_task, heartbeat_stop)
+        logger.warning(
+            "Processing job execution failed before a persisted result was produced: "
+            "job_id=%s revision_id=%s failure_code=%s",
+            copied_job_id,
+            copied_revision_id,
+            WORKER_FAILURE_CODE,
+        )
+        return await _handle_execution_failure(
+            session_factory,
+            job_id=copied_job_id,
+            project_id=copied_project_id,
+            revision_id=copied_revision_id,
+            lease_token=copied_lease_token,
+        )
+
+    await _stop_heartbeat_task(heartbeat_task, heartbeat_stop)
 
     return ProcessingJobExecutionResult(
         job_id=copied_job_id,
         revision_id=copied_revision_id,
         execution_status=ProcessingJobExecutionStatus.COMPLETED,
-        job_status=ProcessingJobStatus(completed_job.status),
+        job_status=ProcessingJobStatus.COMPLETED,
         extraction_run_id=extraction_result.extraction_run_id,
         revision_status=DocumentRevisionStatus(extraction_result.revision_status),
         failure_code=None,
@@ -184,6 +178,8 @@ async def _run_revision_extraction(
     *,
     project_id: uuid.UUID,
     revision_id: uuid.UUID,
+    job_id: uuid.UUID,
+    lease_token: uuid.UUID,
     storage: FileStorage,
 ):
     async with session_factory() as session:
@@ -192,6 +188,13 @@ async def _run_revision_extraction(
             project_id=project_id,
             revision_id=revision_id,
             storage=storage,
+            finalizer=lambda finalize_session, _revision, extraction_run: complete_processing_job_in_transaction(
+                finalize_session,
+                project_id=project_id,
+                job_id=job_id,
+                lease_token=lease_token,
+                extraction_run_id=extraction_run.id,
+            ),
         )
 
 

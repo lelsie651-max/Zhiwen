@@ -63,6 +63,10 @@ class ProcessingJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "attempt_no",
             name="uq_processing_jobs_revision_id_job_type_attempt_no",
         ),
+        UniqueConstraint(
+            "result_extraction_run_id",
+            name="uq_pj_result_run_id",
+        ),
         CheckConstraint("attempt_no > 0", name="processing_jobs_attempt_no_positive"),
         CheckConstraint(
             "job_type IN ('revision_extraction')",

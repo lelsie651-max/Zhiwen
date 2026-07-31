@@ -119,10 +119,12 @@ class Entity(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     subject_facts: Mapped[list["Fact"]] = relationship(
         back_populates="subject_entity",
         foreign_keys="Fact.subject_entity_id",
+        passive_deletes=True,
     )
     referenced_fact_values: Mapped[list["FactValue"]] = relationship(
         back_populates="referenced_entity",
         foreign_keys="FactValue.referenced_entity_id",
+        passive_deletes=True,
     )
     merged_into: Mapped["Entity | None"] = relationship(
         back_populates="merged_from",

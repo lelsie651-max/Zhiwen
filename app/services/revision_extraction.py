@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.document_content import ExtractionRun
 from app.models.document_revision import DocumentRevision, DocumentRevisionStatus, SourceAuthority
 from app.models.ingestion_validation import (
     IngestionValidationReport,
@@ -32,6 +34,11 @@ SUPPORTED_EXTRACTION_FORMATS = {
     DetectedFileFormat.TXT,
     DetectedFileFormat.MD,
 }
+
+RevisionExtractionFinalizer = Callable[
+    [AsyncSession, DocumentRevision, ExtractionRun],
+    Awaitable[None],
+]
 
 
 class RevisionExtractionError(Exception):
@@ -60,6 +67,7 @@ async def run_revision_extraction(
     project_id: uuid.UUID,
     revision_id: uuid.UUID,
     storage: FileStorage,
+    finalizer: RevisionExtractionFinalizer | None = None,
 ) -> RevisionExtractionResult:
     file_format, detected_encoding, storage_key = await _enter_parsing_phase(
         session,
@@ -96,6 +104,7 @@ async def run_revision_extraction(
         extracted_document=extracted_document,
         started_at=started_at,
         completed_at=completed_at,
+        finalizer=finalizer,
     )
 
 
@@ -159,6 +168,7 @@ async def _finalize_extraction_phase(
     extracted_document: ExtractedDocument,
     started_at: datetime,
     completed_at: datetime,
+    finalizer: RevisionExtractionFinalizer | None = None,
 ) -> RevisionExtractionResult:
     revision = await _lock_revision_for_project(
         session,
@@ -184,9 +194,11 @@ async def _finalize_extraction_phase(
             commit=False,
         )
         revision.status = _map_extraction_outcome_to_revision_status(extracted_document.outcome)
+        if finalizer is not None:
+            await finalizer(session, revision, extraction_run)
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         revision.status = previous_status
         await session.rollback()
         raise

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
@@ -11,6 +13,22 @@ from app.models.document_revision import DocumentRevision
 from app.models.processing_job import ACTIVE_PROCESSING_JOB_STATUSES, ProcessingJob
 from app.models.project_member import ProjectMember
 from app.models.user import User
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessingExtractionResultContext:
+    job_id: uuid.UUID
+    project_id: uuid.UUID
+    job_status: str
+    job_type: str
+    job_revision_id: uuid.UUID
+    result_run_id: uuid.UUID | None
+    run_revision_id: uuid.UUID | None
+    run_status: str | None
+    run_outcome: str | None
+    revision_status: str
+    lease_token: uuid.UUID | None
+    lease_expires_at: datetime | None
 
 
 async def get_revision_for_processing_job_update(
@@ -209,6 +227,19 @@ async def get_extraction_run_by_id(
     return result.scalar_one_or_none()
 
 
+async def get_extraction_run_by_id_for_update(
+    session: AsyncSession,
+    *,
+    extraction_run_id: uuid.UUID,
+) -> ExtractionRun | None:
+    result = await session.execute(
+        select(ExtractionRun)
+        .where(ExtractionRun.id == extraction_run_id)
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_revision_by_id(
     session: AsyncSession,
     *,
@@ -218,3 +249,68 @@ async def get_revision_by_id(
         select(DocumentRevision).where(DocumentRevision.id == revision_id)
     )
     return result.scalar_one_or_none()
+
+
+async def get_processing_extraction_result_context(
+    session: AsyncSession,
+    *,
+    job_id: uuid.UUID,
+    for_update: bool = False,
+) -> ProcessingExtractionResultContext | None:
+    statement = (
+        select(
+            ProcessingJob.id,
+            ProcessingJob.project_id,
+            ProcessingJob.status,
+            ProcessingJob.job_type,
+            ProcessingJob.revision_id,
+            ProcessingJob.result_extraction_run_id,
+            ExtractionRun.revision_id,
+            ExtractionRun.status,
+            ExtractionRun.outcome,
+            DocumentRevision.status,
+            ProcessingJob.lease_token,
+            ProcessingJob.lease_expires_at,
+        )
+        .join(DocumentRevision, DocumentRevision.id == ProcessingJob.revision_id)
+        .outerjoin(ExtractionRun, ExtractionRun.id == ProcessingJob.result_extraction_run_id)
+        .where(ProcessingJob.id == job_id)
+    )
+    if for_update:
+        statement = statement.with_for_update()
+
+    result = await session.execute(statement)
+    row = result.one_or_none()
+    if row is None:
+        return None
+
+    return ProcessingExtractionResultContext(
+        job_id=row[0],
+        project_id=row[1],
+        job_status=row[2],
+        job_type=row[3],
+        job_revision_id=row[4],
+        result_run_id=row[5],
+        run_revision_id=row[6],
+        run_status=row[7],
+        run_outcome=row[8],
+        revision_status=row[9],
+        lease_token=row[10],
+        lease_expires_at=row[11],
+    )
+
+
+async def revision_has_terminal_extraction_run(
+    session: AsyncSession,
+    *,
+    revision_id: uuid.UUID,
+) -> bool:
+    result = await session.execute(
+        select(
+            exists().where(
+                ExtractionRun.revision_id == revision_id,
+                ExtractionRun.status.in_(("completed", "failed")),
+            )
+        )
+    )
+    return bool(result.scalar_one())

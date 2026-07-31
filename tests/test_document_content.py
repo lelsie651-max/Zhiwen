@@ -301,7 +301,7 @@ def test_persist_extraction_result_rejects_invalid_anchor_hash_without_writing(m
     assert called["get_revision"] is False
     assert called["create_run"] is False
     assert session.commit_called is False
-    assert session.rollback_called is False
+    assert session.rollback_called is True
 
 
 def test_persist_extraction_result_accepts_correct_anchor_hash_and_preserves_raw_text(monkeypatch) -> None:

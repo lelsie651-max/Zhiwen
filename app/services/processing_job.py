@@ -5,7 +5,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.document_content import ExtractionRunOutcome
+from app.models.document_content import ExtractionRun, ExtractionRunOutcome
 from app.models.document_revision import DocumentRevision, DocumentRevisionStatus
 from app.models.processing_job import (
     ProcessingJob,
@@ -15,6 +15,14 @@ from app.models.processing_job import (
 )
 from app.models.project_member import ProjectMemberRole
 from app.repositories import processing_job as processing_job_repository
+
+LEASE_EXPIRED_FAILURE_CODE = "lease_expired"
+LEASE_EXPIRED_FAILURE_MESSAGE = "Worker lease expired before extraction completed."
+ORPHANED_EXTRACTION_RESULT_FAILURE_CODE = "orphaned_extraction_result"
+ORPHANED_EXTRACTION_RESULT_FAILURE_MESSAGE = (
+    "A persisted extraction result could not be linked deterministically to the stale processing job."
+)
+PROCESSING_RESULT_STATE_MISMATCH_CODE = "processing_result_state_mismatch"
 
 
 class ProcessingJobError(Exception):
@@ -77,7 +85,7 @@ async def enqueue_revision_extraction_job(
     )
     try:
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
     return job
@@ -141,7 +149,7 @@ async def retry_failed_revision_extraction(
     try:
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
     return job
@@ -165,27 +173,76 @@ async def recover_stale_revision_extraction(
         project_id=project_id,
         revision_id=revision_id,
     )
-    _reject_recovery_for_terminal_revision_status(revision)
-
     now = datetime.now(timezone.utc)
     active_job = await processing_job_repository.get_active_processing_job_for_update(
         session,
         revision_id=revision.id,
         job_type=ProcessingJobType.REVISION_EXTRACTION.value,
     )
-    if active_job is not None:
-        if active_job.status != ProcessingJobStatus.RUNNING.value:
-            raise ProcessingJobStateError("Queued extraction jobs cannot be recovered as stale.")
-        if active_job.lease_expires_at is None or active_job.lease_expires_at > now:
-            raise ProcessingJobStateError("Running job lease has not expired.")
-        active_job.status = ProcessingJobStatus.FAILED.value
-        active_job.completed_at = now
-        active_job.lease_token = None
-        active_job.lease_expires_at = None
-        active_job.result_extraction_run_id = None
-        active_job.failure_code = "lease_expired"
-        active_job.failure_message = "Worker lease expired before extraction completed."
-    else:
+    try:
+        if active_job is not None:
+            if active_job.status != ProcessingJobStatus.RUNNING.value:
+                raise ProcessingJobStateError("Queued extraction jobs cannot be recovered as stale.")
+            if active_job.lease_expires_at is None or active_job.lease_expires_at > now:
+                raise ProcessingJobStateError("Running job lease has not expired.")
+
+            result_context = await processing_job_repository.get_processing_extraction_result_context(
+                session,
+                job_id=active_job.id,
+            )
+            if result_context is None:
+                raise ProcessingJobNotFoundError("Processing job was not found during recovery.")
+
+            if result_context.result_run_id is not None:
+                _validate_result_context_consistency(result_context)
+                active_job.status = ProcessingJobStatus.COMPLETED.value
+                active_job.completed_at = now
+                active_job.lease_token = None
+                active_job.lease_expires_at = None
+                active_job.failure_code = None
+                active_job.failure_message = None
+                await session.flush()
+                await session.commit()
+                return active_job
+
+            has_terminal_run = await processing_job_repository.revision_has_terminal_extraction_run(
+                session,
+                revision_id=revision.id,
+            )
+            if _revision_has_orphaned_result(revision_status=revision.status, has_terminal_run=has_terminal_run):
+                _mark_job_failed(
+                    active_job,
+                    now=now,
+                    failure_code=ORPHANED_EXTRACTION_RESULT_FAILURE_CODE,
+                    failure_message=ORPHANED_EXTRACTION_RESULT_FAILURE_MESSAGE,
+                )
+                await session.flush()
+                await session.commit()
+                raise ProcessingJobStateError(ORPHANED_EXTRACTION_RESULT_FAILURE_CODE)
+
+            _mark_job_failed(
+                active_job,
+                now=now,
+                failure_code=LEASE_EXPIRED_FAILURE_CODE,
+                failure_message=LEASE_EXPIRED_FAILURE_MESSAGE,
+            )
+            if revision.status in {
+                DocumentRevisionStatus.PARSING.value,
+                DocumentRevisionStatus.EXTRACTING.value,
+            }:
+                revision.status = DocumentRevisionStatus.ACCEPTED.value
+
+            job = await _create_queued_job(
+                session,
+                project_id=project_id,
+                revision_id=revision.id,
+                trigger_kind=ProcessingTriggerKind.RECOVERY,
+                requested_by_id=actor.id,
+            )
+            await session.flush()
+            await session.commit()
+            return job
+
         if revision.status not in {
             DocumentRevisionStatus.ACCEPTED.value,
             DocumentRevisionStatus.PARSING.value,
@@ -195,26 +252,32 @@ async def recover_stale_revision_extraction(
         if revision.updated_at > stale_before:
             raise ProcessingJobStateError("Revision is not stale enough to recover.")
 
-    if revision.status in {
-        DocumentRevisionStatus.PARSING.value,
-        DocumentRevisionStatus.EXTRACTING.value,
-    }:
-        revision.status = DocumentRevisionStatus.ACCEPTED.value
+        has_terminal_run = await processing_job_repository.revision_has_terminal_extraction_run(
+            session,
+            revision_id=revision.id,
+        )
+        if _revision_has_orphaned_result(revision_status=revision.status, has_terminal_run=has_terminal_run):
+            raise ProcessingJobStateError(ORPHANED_EXTRACTION_RESULT_FAILURE_CODE)
 
-    job = await _create_queued_job(
-        session,
-        project_id=project_id,
-        revision_id=revision.id,
-        trigger_kind=ProcessingTriggerKind.RECOVERY,
-        requested_by_id=actor.id,
-    )
-    try:
+        if revision.status in {
+            DocumentRevisionStatus.PARSING.value,
+            DocumentRevisionStatus.EXTRACTING.value,
+        }:
+            revision.status = DocumentRevisionStatus.ACCEPTED.value
+
+        job = await _create_queued_job(
+            session,
+            project_id=project_id,
+            revision_id=revision.id,
+            trigger_kind=ProcessingTriggerKind.RECOVERY,
+            requested_by_id=actor.id,
+        )
         await session.flush()
         await session.commit()
-    except Exception:
+        return job
+    except BaseException:
         await session.rollback()
         raise
-    return job
 
 
 async def claim_processing_job(
@@ -243,7 +306,7 @@ async def claim_processing_job(
     try:
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
     return job
@@ -257,34 +320,17 @@ async def complete_processing_job(
     lease_token: uuid.UUID,
     extraction_run_id: uuid.UUID,
 ) -> ProcessingJob:
-    job = await _lock_processing_job_for_project(
-        session,
-        project_id=project_id,
-        job_id=job_id,
-    )
-    now = datetime.now(timezone.utc)
-    _validate_running_job_lease(job, lease_token=lease_token, now=now)
-
-    extraction_run = await processing_job_repository.get_extraction_run_by_id(
-        session,
-        extraction_run_id=extraction_run_id,
-    )
-    if extraction_run is None:
-        raise ProcessingJobStateError("Extraction run not found.")
-    if extraction_run.revision_id != job.revision_id:
-        raise ProcessingJobStateError("Extraction run must belong to the same revision as the job.")
-
-    job.status = ProcessingJobStatus.COMPLETED.value
-    job.completed_at = now
-    job.result_extraction_run_id = extraction_run.id
-    job.lease_token = None
-    job.lease_expires_at = None
-    job.failure_code = None
-    job.failure_message = None
     try:
+        job = await complete_processing_job_in_transaction(
+            session,
+            project_id=project_id,
+            job_id=job_id,
+            lease_token=lease_token,
+            extraction_run_id=extraction_run_id,
+        )
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
     return job
@@ -299,25 +345,18 @@ async def fail_processing_job(
     failure_code: str,
     failure_message: str,
 ) -> ProcessingJob:
-    job = await _lock_processing_job_for_project(
-        session,
-        project_id=project_id,
-        job_id=job_id,
-    )
-    now = datetime.now(timezone.utc)
-    _validate_running_job_lease(job, lease_token=lease_token, now=now)
-
-    job.status = ProcessingJobStatus.FAILED.value
-    job.completed_at = now
-    job.result_extraction_run_id = None
-    job.lease_token = None
-    job.lease_expires_at = None
-    job.failure_code = failure_code
-    job.failure_message = failure_message
     try:
+        job = await fail_processing_job_in_transaction(
+            session,
+            project_id=project_id,
+            job_id=job_id,
+            lease_token=lease_token,
+            failure_code=failure_code,
+            failure_message=failure_message,
+        )
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
     return job
@@ -340,9 +379,77 @@ async def renew_processing_job_lease(
     try:
         await session.flush()
         await session.commit()
-    except Exception:
+    except BaseException:
         await session.rollback()
         raise
+    return job
+
+
+async def complete_processing_job_in_transaction(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    job_id: uuid.UUID,
+    lease_token: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+) -> ProcessingJob:
+    job = await _lock_processing_job_for_project(
+        session,
+        project_id=project_id,
+        job_id=job_id,
+    )
+    now = datetime.now(timezone.utc)
+    extraction_run = await processing_job_repository.get_extraction_run_by_id_for_update(
+        session,
+        extraction_run_id=extraction_run_id,
+    )
+    if extraction_run is None:
+        raise ProcessingJobStateError("Extraction run not found.")
+    if job.job_type != ProcessingJobType.REVISION_EXTRACTION.value:
+        raise ProcessingJobStateError("Only revision extraction jobs can store extraction run results.")
+    if extraction_run.revision_id != job.revision_id:
+        raise ProcessingJobStateError("Extraction run must belong to the same revision as the job.")
+    if job.result_extraction_run_id is not None and job.result_extraction_run_id != extraction_run.id:
+        raise ProcessingJobStateError("Processing job is already bound to another extraction run.")
+
+    if job.status == ProcessingJobStatus.COMPLETED.value:
+        if job.result_extraction_run_id == extraction_run.id:
+            return job
+        raise ProcessingJobStateError("Completed processing jobs cannot be rebound to another extraction run.")
+
+    _validate_running_job_lease(job, lease_token=lease_token, now=now)
+    job.status = ProcessingJobStatus.COMPLETED.value
+    job.completed_at = now
+    job.result_extraction_run_id = extraction_run.id
+    job.lease_token = None
+    job.lease_expires_at = None
+    job.failure_code = None
+    job.failure_message = None
+    return job
+
+
+async def fail_processing_job_in_transaction(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    job_id: uuid.UUID,
+    lease_token: uuid.UUID,
+    failure_code: str,
+    failure_message: str,
+) -> ProcessingJob:
+    job = await _lock_processing_job_for_project(
+        session,
+        project_id=project_id,
+        job_id=job_id,
+    )
+    now = datetime.now(timezone.utc)
+    _validate_running_job_lease(job, lease_token=lease_token, now=now)
+    _mark_job_failed(
+        job,
+        now=now,
+        failure_code=failure_code,
+        failure_message=failure_message,
+    )
     return job
 
 
@@ -495,3 +602,60 @@ def _validate_running_job_lease(
         raise ProcessingJobLeaseError("Lease token does not match the running job.")
     if job.lease_expires_at <= now:
         raise ProcessingJobLeaseError("Lease has already expired.")
+
+
+def _mark_job_failed(
+    job: ProcessingJob,
+    *,
+    now: datetime,
+    failure_code: str,
+    failure_message: str,
+) -> None:
+    job.status = ProcessingJobStatus.FAILED.value
+    job.completed_at = now
+    job.result_extraction_run_id = None
+    job.lease_token = None
+    job.lease_expires_at = None
+    job.failure_code = failure_code
+    job.failure_message = failure_message
+
+
+def _validate_result_context_consistency(
+    context: processing_job_repository.ProcessingExtractionResultContext,
+) -> None:
+    if context.job_type != ProcessingJobType.REVISION_EXTRACTION.value:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+    if context.result_run_id is None or context.run_revision_id is None:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+    if context.run_revision_id != context.job_revision_id:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+    if context.run_status not in {"completed", "failed"}:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+
+    expected_revision_status = _map_extraction_outcome_to_revision_status(context.run_outcome)
+    if context.revision_status != expected_revision_status:
+        raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+
+
+def _map_extraction_outcome_to_revision_status(run_outcome: str | None) -> str:
+    if run_outcome in {
+        ExtractionRunOutcome.SUCCESS.value,
+        ExtractionRunOutcome.PARTIAL.value,
+    }:
+        return DocumentRevisionStatus.AWAITING_REVIEW.value
+    if run_outcome in {
+        ExtractionRunOutcome.NEEDS_OCR.value,
+        ExtractionRunOutcome.FAILED.value,
+    }:
+        return DocumentRevisionStatus.FAILED.value
+    raise ProcessingJobStateError(PROCESSING_RESULT_STATE_MISMATCH_CODE)
+
+
+def _revision_has_orphaned_result(*, revision_status: str, has_terminal_run: bool) -> bool:
+    if has_terminal_run:
+        return True
+    return revision_status in {
+        DocumentRevisionStatus.AWAITING_REVIEW.value,
+        DocumentRevisionStatus.COMPLETED.value,
+        DocumentRevisionStatus.FAILED.value,
+    }

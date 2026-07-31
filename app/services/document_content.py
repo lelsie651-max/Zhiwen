@@ -52,6 +52,39 @@ async def persist_extraction_result(
     completed_at: datetime | None = None,
     commit: bool = True,
 ) -> ExtractionRun:
+    try:
+        extraction_run = await persist_extraction_result_in_transaction(
+            session,
+            revision_id=revision_id,
+            extracted_document=extracted_document,
+            extractor_name=extractor_name,
+            extractor_version=extractor_version,
+            failure_code=failure_code,
+            failure_message=failure_message,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+        if commit:
+            await session.commit()
+        return extraction_run
+    except BaseException:
+        if commit:
+            await session.rollback()
+        raise
+
+
+async def persist_extraction_result_in_transaction(
+    session: AsyncSession,
+    *,
+    revision_id: uuid.UUID,
+    extracted_document: ExtractedDocument,
+    extractor_name: str,
+    extractor_version: str,
+    failure_code: str | None = None,
+    failure_message: str | None = None,
+    started_at: datetime | None = None,
+    completed_at: datetime | None = None,
+) -> ExtractionRun:
     _validate_extracted_document(extracted_document)
 
     revision = await document_content_repository.get_revision_for_extraction_update(session, revision_id)
@@ -106,17 +139,10 @@ async def persist_extraction_result(
         for block in extracted_document.blocks
     ]
 
-    try:
-        await document_content_repository.create_extraction_run(session, extraction_run)
-        if blocks:
-            await document_content_repository.create_document_blocks(session, blocks)
-        extraction_run.blocks.extend(blocks)
-        if commit:
-            await session.commit()
-    except Exception:
-        if commit:
-            await session.rollback()
-        raise
+    await document_content_repository.create_extraction_run(session, extraction_run)
+    if blocks:
+        await document_content_repository.create_document_blocks(session, blocks)
+    extraction_run.blocks.extend(blocks)
 
     return extraction_run
 
