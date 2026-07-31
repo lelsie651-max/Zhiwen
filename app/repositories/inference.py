@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from app.models.document import Document
 from app.models.document_content import DocumentBlock, ExtractionRun
 from app.models.document_revision import DocumentRevision
-from app.models.inference import InferenceInputBatch, InferenceRun
+from app.models.inference import InferenceInputBatch, InferenceInputBlock, InferenceRun
 from app.models.project import Project
 
 
@@ -24,6 +24,7 @@ class CompletedFactExtractionRunContext:
     status: str
     batch_id: uuid.UUID
     extraction_run_id_snapshots: frozenset[uuid.UUID]
+    source_block_id_snapshots: frozenset[uuid.UUID]
 
 
 async def get_project(session: AsyncSession, project_id: uuid.UUID) -> Project | None:
@@ -146,6 +147,7 @@ async def get_completed_fact_extraction_run_context(
             InferenceRun.status.label("status"),
             InferenceRun.input_batch_id.label("batch_id"),
             InferenceInputBlock.extraction_run_id_snapshot.label("extraction_run_id_snapshot"),
+            InferenceInputBlock.source_block_id_snapshot.label("source_block_id_snapshot"),
         )
         .join(InferenceInputBatch, InferenceRun.input_batch_id == InferenceInputBatch.id)
         .outerjoin(InferenceInputBlock, InferenceInputBlock.batch_id == InferenceInputBatch.id)
@@ -161,6 +163,11 @@ async def get_completed_fact_extraction_run_context(
         for row in rows
         if row.extraction_run_id_snapshot is not None
     )
+    source_block_id_snapshots = frozenset(
+        row.source_block_id_snapshot
+        for row in rows
+        if row.source_block_id_snapshot is not None
+    )
     return CompletedFactExtractionRunContext(
         run_id=first.run_id,
         project_id=first.project_id,
@@ -168,4 +175,5 @@ async def get_completed_fact_extraction_run_context(
         status=first.status,
         batch_id=first.batch_id,
         extraction_run_id_snapshots=extraction_run_id_snapshots,
+        source_block_id_snapshots=source_block_id_snapshots,
     )

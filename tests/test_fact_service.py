@@ -44,13 +44,17 @@ class FakeSession:
     def __init__(self) -> None:
         self.commit_called = False
         self.rollback_called = False
+        self.commit_count = 0
+        self.rollback_count = 0
         self.savepoints: list[FakeSavepoint] = []
 
     async def commit(self) -> None:
         self.commit_called = True
+        self.commit_count += 1
 
     async def rollback(self) -> None:
         self.rollback_called = True
+        self.rollback_count += 1
 
     async def begin_nested(self) -> FakeSavepoint:
         savepoint = FakeSavepoint()
@@ -201,6 +205,7 @@ def build_inference_run_context(
     *,
     project_id: uuid.UUID,
     extraction_run_ids: list[uuid.UUID],
+    source_block_ids: list[uuid.UUID] | None = None,
     run_id: uuid.UUID | None = None,
     status: str = "completed",
     task_type: str = "fact_extraction",
@@ -212,6 +217,7 @@ def build_inference_run_context(
         status=status,
         batch_id=uuid.uuid4(),
         extraction_run_id_snapshots=frozenset(extraction_run_ids),
+        source_block_id_snapshots=frozenset(source_block_ids or []),
     )
 
 
@@ -558,11 +564,12 @@ def test_propose_ai_fact_value_is_always_proposed(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
     )
-    evidence = build_evidence(extraction_run=run)
     payload = build_ai_payload([evidence.id])
     captured: dict[str, object] = {}
 
@@ -625,6 +632,8 @@ def test_propose_ai_fact_value_is_always_proposed(monkeypatch) -> None:
     assert result.decided_by_id is None
     assert result.decided_at is None
     assert session.commit_called is True
+    assert session.commit_count == 1
+    assert session.rollback_called is False
     assert captured["links"][0].source_order == 0
 
 
@@ -632,11 +641,12 @@ def test_current_value_id_is_not_changed_by_ai_proposal(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
     )
-    evidence = build_evidence(extraction_run=run)
     human_current_value = FactValue(
         id=uuid.uuid4(),
         fact_id=uuid.uuid4(),
@@ -714,11 +724,12 @@ def test_existing_human_current_value_is_not_overwritten(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
     )
-    evidence = build_evidence(extraction_run=run)
     current_value_id = uuid.uuid4()
     fact = build_fact(
         project_id=project.id,
@@ -929,6 +940,8 @@ def test_non_completed_inference_runs_are_rejected(monkeypatch, status: str) -> 
                 payload=payload,
             )
         )
+    assert session.rollback_called is True
+    assert session.commit_called is False
 
 
 @pytest.mark.parametrize("task_type", ["schema_inference", "consistency_check"])
@@ -1003,17 +1016,21 @@ def test_cross_project_inference_run_is_rejected(monkeypatch) -> None:
                 payload=payload,
             )
         )
+    assert session.rollback_called is True
+    assert session.commit_called is False
 
 
 def test_inference_run_without_target_extraction_snapshot_is_rejected(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[uuid.uuid4()],
+        source_block_ids=[evidence.block.id],
     )
-    payload = build_ai_payload([build_evidence(extraction_run=run).id])
+    payload = build_ai_payload([evidence.id])
 
     async def fake_get_extraction_run_with_project(_session, _extraction_run_id):
         return run
@@ -1039,18 +1056,184 @@ def test_inference_run_without_target_extraction_snapshot_is_rejected(monkeypatc
                 payload=payload,
             )
         )
+    assert session.rollback_called is True
+    assert session.commit_called is False
+
+
+def test_evidence_block_not_in_inference_batch_is_rejected(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[uuid.uuid4()],
+    )
+    payload = build_ai_payload([evidence.id])
+
+    async def fake_get_extraction_run_with_project(_session, _extraction_run_id):
+        return run
+
+    async def fake_get_completed_fact_extraction_run_context(_session, *, inference_run_id):
+        assert inference_run_id == inference_context.run_id
+        return inference_context
+
+    async def fake_list_source_evidences_with_context(_session, _evidence_ids):
+        return [evidence]
+
+    monkeypatch.setattr(fact_service.fact_repository, "get_extraction_run_with_project", fake_get_extraction_run_with_project)
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        fake_get_completed_fact_extraction_run_context,
+    )
+    monkeypatch.setattr(fact_service.fact_repository, "list_source_evidences_with_context", fake_list_source_evidences_with_context)
+
+    with pytest.raises(fact_service.FactInferenceEvidenceMismatchError) as exc_info:
+        run_async(
+            fact_service.propose_ai_fact_value(
+                session,
+                project_id=project.id,
+                extraction_run_id=run.id,
+                inference_run_id=inference_context.run_id,
+                payload=payload,
+            )
+        )
+
+    assert "alpha beta gamma" not in str(exc_info.value)
+    assert "alpha" not in str(exc_info.value)
+    assert session.rollback_called is True
+    assert session.commit_called is False
+
+
+def test_any_mismatched_evidence_block_rejects_entire_batch(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence_one = build_evidence(extraction_run=run)
+    evidence_two = build_evidence(extraction_run=run)
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence_one.block.id],
+    )
+    payload = build_ai_payload([evidence_one.id, evidence_two.id])
+
+    async def fake_get_extraction_run_with_project(_session, _extraction_run_id):
+        return run
+
+    async def fake_get_completed_fact_extraction_run_context(_session, *, inference_run_id):
+        assert inference_run_id == inference_context.run_id
+        return inference_context
+
+    async def fake_list_source_evidences_with_context(_session, _evidence_ids):
+        return [evidence_one, evidence_two]
+
+    monkeypatch.setattr(fact_service.fact_repository, "get_extraction_run_with_project", fake_get_extraction_run_with_project)
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        fake_get_completed_fact_extraction_run_context,
+    )
+    monkeypatch.setattr(fact_service.fact_repository, "list_source_evidences_with_context", fake_list_source_evidences_with_context)
+
+    with pytest.raises(fact_service.FactInferenceEvidenceMismatchError):
+        run_async(
+            fact_service.propose_ai_fact_value(
+                session,
+                project_id=project.id,
+                extraction_run_id=run.id,
+                inference_run_id=inference_context.run_id,
+                payload=payload,
+            )
+        )
+
+    assert session.rollback_called is True
+    assert session.commit_called is False
+
+
+def test_all_evidence_blocks_in_batch_succeeds(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence_one = build_evidence(extraction_run=run)
+    evidence_two = build_evidence(extraction_run=run)
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence_one.block.id, evidence_two.block.id],
+    )
+    payload = build_ai_payload([evidence_one.id, evidence_two.id])
+    captured: dict[str, object] = {}
+
+    async def fake_get_extraction_run_with_project(_session, _extraction_run_id):
+        return run
+
+    async def fake_get_completed_fact_extraction_run_context(_session, *, inference_run_id):
+        assert inference_run_id == inference_context.run_id
+        return inference_context
+
+    async def fake_list_source_evidences_with_context(_session, _evidence_ids):
+        return [evidence_one, evidence_two]
+
+    async def fake_get_fact_by_identity_for_update(_session, **_kwargs):
+        return None
+
+    async def fake_create_fact(_session, fact):
+        captured["fact"] = fact
+        return fact
+
+    async def fake_get_next_fact_version_no(_session, _fact_id):
+        return 1
+
+    async def fake_create_fact_value(_session, fact_value):
+        captured["fact_value"] = fact_value
+        return fact_value
+
+    async def fake_create_fact_evidence_links(_session, links):
+        captured["links"] = links
+        return links
+
+    monkeypatch.setattr(fact_service.fact_repository, "get_extraction_run_with_project", fake_get_extraction_run_with_project)
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        fake_get_completed_fact_extraction_run_context,
+    )
+    monkeypatch.setattr(fact_service.fact_repository, "list_source_evidences_with_context", fake_list_source_evidences_with_context)
+    monkeypatch.setattr(fact_service.fact_repository, "get_fact_by_identity_for_update", fake_get_fact_by_identity_for_update)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact", fake_create_fact)
+    monkeypatch.setattr(fact_service.fact_repository, "get_next_fact_version_no", fake_get_next_fact_version_no)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact_value", fake_create_fact_value)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact_evidence_links", fake_create_fact_evidence_links)
+
+    result = run_async(
+        fact_service.propose_ai_fact_value(
+            session,
+            project_id=project.id,
+            extraction_run_id=run.id,
+            inference_run_id=inference_context.run_id,
+            payload=payload,
+        )
+    )
+
+    assert result.status == "proposed"
+    assert session.commit_count == 1
+    assert session.rollback_count == 0
 
 
 def test_source_order_follows_input_list_order(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence_one = build_evidence(extraction_run=run)
+    evidence_two = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[run.id],
+        source_block_ids=[evidence_one.block.id, evidence_two.block.id],
     )
-    evidence_one = build_evidence(extraction_run=run)
-    evidence_two = build_evidence(extraction_run=run)
     payload = AIProposalInput(
         identity=build_identity(),
         value=build_value_input(),
@@ -1118,11 +1301,12 @@ def test_concurrent_fact_creation_returns_existing_fact(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
     )
-    evidence = build_evidence(extraction_run=run)
     payload = build_ai_payload([evidence.id])
     existing_fact = build_fact(
         project_id=project.id,
@@ -1190,11 +1374,12 @@ def test_version_number_is_computed_after_fact_lock(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
     )
-    evidence = build_evidence(extraction_run=run)
     payload = build_ai_payload([evidence.id])
     fact = build_fact(
         project_id=project.id,
@@ -1256,11 +1441,12 @@ def test_failure_rolls_back_entire_transaction(monkeypatch) -> None:
     session = FakeSession()
     project = build_project()
     run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
     inference_context = build_inference_run_context(
         project_id=project.id,
         extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
     )
-    evidence = build_evidence(extraction_run=run)
     payload = build_ai_payload([evidence.id])
 
     async def fake_get_extraction_run_with_project(_session, _extraction_run_id):
@@ -1314,6 +1500,63 @@ def test_failure_rolls_back_entire_transaction(monkeypatch) -> None:
 
     assert session.rollback_called is True
     assert session.commit_called is False
+
+
+def test_cancelled_error_rolls_back_and_propagates(monkeypatch) -> None:
+    session = FakeSession()
+    project = build_project()
+    run = build_run(project=project)
+    evidence = build_evidence(extraction_run=run)
+    inference_context = build_inference_run_context(
+        project_id=project.id,
+        extraction_run_ids=[run.id],
+        source_block_ids=[evidence.block.id],
+    )
+    payload = build_ai_payload([evidence.id])
+
+    async def fake_get_extraction_run_with_project(_session, _extraction_run_id):
+        return run
+
+    async def fake_get_completed_fact_extraction_run_context(_session, *, inference_run_id):
+        assert inference_run_id == inference_context.run_id
+        return inference_context
+
+    async def fake_list_source_evidences_with_context(_session, _evidence_ids):
+        return [evidence]
+
+    async def fake_get_fact_by_identity_for_update(_session, **_kwargs):
+        return None
+
+    async def fake_create_fact(_session, fact):
+        return fact
+
+    async def fake_get_next_fact_version_no(_session, _fact_id):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(fact_service.fact_repository, "get_extraction_run_with_project", fake_get_extraction_run_with_project)
+    monkeypatch.setattr(
+        fact_service.inference_repository,
+        "get_completed_fact_extraction_run_context",
+        fake_get_completed_fact_extraction_run_context,
+    )
+    monkeypatch.setattr(fact_service.fact_repository, "list_source_evidences_with_context", fake_list_source_evidences_with_context)
+    monkeypatch.setattr(fact_service.fact_repository, "get_fact_by_identity_for_update", fake_get_fact_by_identity_for_update)
+    monkeypatch.setattr(fact_service.fact_repository, "create_fact", fake_create_fact)
+    monkeypatch.setattr(fact_service.fact_repository, "get_next_fact_version_no", fake_get_next_fact_version_no)
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(
+            fact_service.propose_ai_fact_value(
+                session,
+                project_id=project.id,
+                extraction_run_id=run.id,
+                inference_run_id=inference_context.run_id,
+                payload=payload,
+            )
+        )
+
+    assert session.rollback_count == 1
+    assert session.commit_count == 0
 
 
 @pytest.mark.parametrize("role", ["owner", "editor"])

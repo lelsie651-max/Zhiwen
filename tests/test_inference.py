@@ -98,6 +98,22 @@ class FakeSession:
         self.flushed += 1
 
 
+class FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class ContextSession:
+    def __init__(self, rows):
+        self._rows = rows
+
+    async def execute(self, _statement):
+        return FakeResult(self._rows)
+
+
 # --------------------------------------------------------------------------- #
 # Model / schema structure
 # --------------------------------------------------------------------------- #
@@ -218,7 +234,57 @@ def test_repository_uses_explicit_joins_no_lazy_load():
     assert "get_completed_fact_extraction_run_context" in source
     assert "content_text" not in source
     assert "extraction_run_id_snapshot" in source
+    assert "source_block_id_snapshot" in source
     assert ".outerjoin(" in source
+
+
+def test_completed_fact_extraction_run_context_returns_source_block_snapshots():
+    run_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    batch_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    source_block_id = uuid.uuid4()
+    other_block_id = uuid.uuid4()
+    rows = [
+        SimpleNamespace(
+            run_id=run_id,
+            project_id=project_id,
+            task_type="fact_extraction",
+            status="completed",
+            batch_id=batch_id,
+            extraction_run_id_snapshot=extraction_run_id,
+            source_block_id_snapshot=source_block_id,
+        ),
+        SimpleNamespace(
+            run_id=run_id,
+            project_id=project_id,
+            task_type="fact_extraction",
+            status="completed",
+            batch_id=batch_id,
+            extraction_run_id_snapshot=extraction_run_id,
+            source_block_id_snapshot=source_block_id,
+        ),
+        SimpleNamespace(
+            run_id=run_id,
+            project_id=project_id,
+            task_type="fact_extraction",
+            status="completed",
+            batch_id=batch_id,
+            extraction_run_id_snapshot=None,
+            source_block_id_snapshot=other_block_id,
+        ),
+    ]
+
+    context = run_async(
+        inference_repository.get_completed_fact_extraction_run_context(
+            ContextSession(rows),
+            inference_run_id=run_id,
+        )
+    )
+
+    assert context is not None
+    assert context.extraction_run_id_snapshots == frozenset({extraction_run_id})
+    assert context.source_block_id_snapshots == frozenset({source_block_id, other_block_id})
 
 
 # --------------------------------------------------------------------------- #
