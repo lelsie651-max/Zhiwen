@@ -69,8 +69,9 @@ async def get_extraction_run_with_project_for_update(
     row = result.one_or_none()
     if row is None:
         return None
+    extraction_run = row[0]
     return ExtractionRunProjectContext(
-        extraction_run=row.DocumentExtractionRun,
+        extraction_run=extraction_run,
         project_id=row.project_id,
         revision_status=row.revision_status,
     )

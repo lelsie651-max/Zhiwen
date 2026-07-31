@@ -15,7 +15,7 @@ from app.agents.fact_extraction_planner import plan_fact_extraction_batches
 from app.agents.prompt_registry import get_prompt
 from app.models import Base
 from app.models.base import utc_now
-from app.models.document_content import DocumentBlock
+from app.models.document_content import DocumentBlock, ExtractionRun as DocumentExtractionRun
 from app.models.fact_extraction_orchestration import (
     FactExtractionOrchestration,
     FactExtractionOrchestrationBatch,
@@ -125,6 +125,16 @@ class StatementCaptureSession:
         if isinstance(self.result, list):
             return self.result.pop(0)
         return self.result
+
+
+class FakeExtractionRunRow:
+    def __init__(self, extraction_run, project_id, revision_status) -> None:
+        self._values = (extraction_run, project_id, revision_status)
+        self.project_id = project_id
+        self.revision_status = revision_status
+
+    def __getitem__(self, index):
+        return self._values[index]
 
 
 def _source_block(*, source_order: int, raw_text: str, extraction_run_id: uuid.UUID) -> DocumentBlock:
@@ -279,6 +289,85 @@ def test_repository_explicitly_separates_document_and_inference_runs() -> None:
     assert "from app.models.document_content import ExtractionRun as DocumentExtractionRun" in source
     assert "from app.models.inference import InferenceRun" in source
     assert "get_batch_attempt_reconciliation_context_for_update" not in source
+    assert "row.DocumentExtractionRun" not in source
+
+
+def test_document_extraction_run_alias_keeps_original_class_name() -> None:
+    assert DocumentExtractionRun.__name__ == "ExtractionRun"
+
+
+def test_get_extraction_run_with_project_for_update_reads_entity_without_alias_attribute() -> None:
+    extraction_run = DocumentExtractionRun(
+        revision_id=uuid.uuid4(),
+        attempt_no=1,
+        status="completed",
+        outcome="success",
+        extractor_name="doc_extractor",
+        extractor_version="1.0.0",
+        detected_format="markdown",
+        detected_encoding="utf-8",
+        page_count=1,
+        character_count=10,
+        block_count=1,
+        warnings=[],
+        content_metadata={},
+        failure_code=None,
+        failure_message=None,
+        started_at=utc_now(),
+        completed_at=utc_now(),
+    )
+    project_id = uuid.uuid4()
+    row = FakeExtractionRunRow(
+        extraction_run=extraction_run,
+        project_id=project_id,
+        revision_status="awaiting_review",
+    )
+    session = StatementCaptureSession(ExecuteResult(row=row))
+
+    context = run_async(
+        orchestration_repository.get_extraction_run_with_project_for_update(
+            session,
+            extraction_run_id=uuid.uuid4(),
+        )
+    )
+
+    assert context is not None
+    assert context.extraction_run is extraction_run
+    assert context.project_id == project_id
+    assert context.revision_status == "awaiting_review"
+
+
+def test_get_extraction_run_with_project_for_update_returns_none_when_missing() -> None:
+    session = StatementCaptureSession(ExecuteResult(row=None))
+
+    context = run_async(
+        orchestration_repository.get_extraction_run_with_project_for_update(
+            session,
+            extraction_run_id=uuid.uuid4(),
+        )
+    )
+
+    assert context is None
+
+
+def test_get_extraction_run_with_project_for_update_compiles_postgresql_sql() -> None:
+    session = StatementCaptureSession(ExecuteResult(row=None))
+
+    run_async(
+        orchestration_repository.get_extraction_run_with_project_for_update(
+            session,
+            extraction_run_id=uuid.uuid4(),
+        )
+    )
+
+    sql = str(session.statements[0].compile(dialect=postgresql.dialect()))
+    assert "FROM extraction_runs" in sql
+    assert "JOIN document_revisions" in sql
+    assert "JOIN documents" in sql
+    assert "FOR UPDATE OF extraction_runs" in sql
+    assert "FROM inference_runs" not in sql
+    assert "extraction_runs.task_type" not in sql
+    assert "extraction_runs.input_batch_id" not in sql
 
 
 def test_inference_run_lock_query_compiles_with_inference_table_fields() -> None:
