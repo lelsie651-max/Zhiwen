@@ -479,6 +479,549 @@ def test_recover_stale_inference_run_marks_old_running_failed(monkeypatch) -> No
     assert run.completed_at is not None
 
 
+@pytest.mark.parametrize(
+    ("run_status", "expected_error"),
+    [
+        (InferenceRunStatus.COMPLETED.value, "completed_inference_requires_reconciliation"),
+        (InferenceRunStatus.PENDING.value, "active_inference_requires_recovery"),
+        (InferenceRunStatus.RUNNING.value, "active_inference_requires_recovery"),
+    ],
+)
+def test_transition_after_failed_attempt_rejects_non_failed_runs(
+    monkeypatch,
+    run_status: str,
+    expected_error: str,
+) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=run_status,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code="llm_transport_error",
+    )
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        return run
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match=expected_error):
+        run_async(
+            orchestration_service.transition_batch_after_failed_inference_attempt(
+                session,
+                orchestration_id=orchestration.id,
+                batch_index=0,
+                worker_token=batch.lease_token,
+                inference_run_id=batch.current_inference_run_id,
+                failure_code="llm_transport_error",
+                max_batch_attempts=2,
+            )
+        )
+
+
+def test_transition_after_failed_attempt_accepts_failed_run_and_preserves_input_batch(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    run = SimpleNamespace(
+        id=batch.current_inference_run_id,
+        status=InferenceRunStatus.FAILED.value,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        input_batch_id=batch.current_input_batch_id,
+        failure_code="llm_transport_error",
+    )
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_get_run(*_args, **_kwargs):
+        return run
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(orchestration_service.inference_repository, "get_run_for_update", fake_get_run)
+
+    transition = run_async(
+        orchestration_service.transition_batch_after_failed_inference_attempt(
+            session,
+            orchestration_id=orchestration.id,
+            batch_index=0,
+            worker_token=batch.lease_token,
+            inference_run_id=batch.current_inference_run_id,
+            failure_code="llm_transport_error",
+            max_batch_attempts=2,
+        )
+    )
+
+    assert transition.status == "pending"
+    assert transition.current_input_batch_id == batch.current_input_batch_id
+    assert transition.current_inference_run_id is None
+
+
+def test_reconcile_completed_application_finalizes_batch_even_if_attempts_exhausted(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    context = orchestration_service.orchestration_repository.BatchAttemptReconciliationContext(
+        orchestration_id=orchestration.id,
+        orchestration_status="running",
+        orchestration_project_id=orchestration.project_id,
+        orchestration_extraction_run_id=orchestration.extraction_run_id,
+        batch_id=batch.id,
+        batch_index=0,
+        batch_status="running",
+        attempt_count=1,
+        lease_token=batch.lease_token,
+        input_batch_id=batch.current_input_batch_id,
+        inference_run_id=batch.current_inference_run_id,
+        inference_run_status=InferenceRunStatus.COMPLETED.value,
+        inference_run_project_id=orchestration.project_id,
+        inference_run_task_type="fact_extraction",
+        inference_run_input_batch_id=batch.current_input_batch_id,
+        inference_run_failure_code=None,
+        application_id=uuid.uuid4(),
+        application_status="completed",
+        batch_application_id=None,
+        batch_application_status=None,
+        run_application_id=uuid.uuid4(),
+        run_application_status="completed",
+    )
+    finalized_calls: list[tuple[uuid.UUID | None, uuid.UUID, uuid.UUID]] = []
+
+    async def fake_context(*_args, **_kwargs):
+        return context
+
+    async def fake_finalize(*_args, worker_token, inference_run_id, application_id, **_kwargs):
+        finalized_calls.append((worker_token, inference_run_id, application_id))
+        return orchestration_service.FactExtractionOrchestrationBatchResult(
+            batch_index=0,
+            batch_plan_hash=batch.batch_plan_hash,
+            status=FactExtractionOrchestrationBatchStatus.COMPLETED,
+            attempt_count=1,
+            input_batch_id=batch.current_input_batch_id,
+            inference_run_id=batch.current_inference_run_id,
+            application_id=application_id,
+            proposal_count=1,
+            created_count=1,
+            reused_count=0,
+            withheld_count=0,
+            failure_code=None,
+        )
+
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_batch_attempt_reconciliation_context_for_update",
+        fake_context,
+    )
+    monkeypatch.setattr(orchestration_service, "finalize_batch_from_completed_application", fake_finalize)
+
+    result = run_async(
+        orchestration_service.reconcile_fact_extraction_batch_after_interruption(
+            session,
+            orchestration_id=orchestration.id,
+            batch_index=0,
+            worker_token=batch.lease_token,
+            failure_code="persistence_context_invalid",
+            max_batch_attempts=1,
+        )
+    )
+
+    assert result.batch_status == "completed"
+    assert result.application_id == finalized_calls[0][2]
+    assert finalized_calls == [(batch.lease_token, batch.current_inference_run_id, finalized_calls[0][2])]
+
+
+def test_reconcile_completed_run_without_application_keeps_run_anchor_and_expires_lease(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    batch.lease_expires_at = utc_now()
+    context = orchestration_service.orchestration_repository.BatchAttemptReconciliationContext(
+        orchestration_id=orchestration.id,
+        orchestration_status="running",
+        orchestration_project_id=orchestration.project_id,
+        orchestration_extraction_run_id=orchestration.extraction_run_id,
+        batch_id=batch.id,
+        batch_index=0,
+        batch_status="running",
+        attempt_count=1,
+        lease_token=batch.lease_token,
+        input_batch_id=batch.current_input_batch_id,
+        inference_run_id=batch.current_inference_run_id,
+        inference_run_status=InferenceRunStatus.COMPLETED.value,
+        inference_run_project_id=orchestration.project_id,
+        inference_run_task_type="fact_extraction",
+        inference_run_input_batch_id=batch.current_input_batch_id,
+        inference_run_failure_code=None,
+        application_id=None,
+        application_status=None,
+        batch_application_id=None,
+        batch_application_status=None,
+        run_application_id=None,
+        run_application_status=None,
+    )
+
+    async def fake_context(*_args, **_kwargs):
+        return context
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_batch_attempt_reconciliation_context_for_update",
+        fake_context,
+    )
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+
+    result = run_async(
+        orchestration_service.reconcile_fact_extraction_batch_after_interruption(
+            session,
+            orchestration_id=orchestration.id,
+            batch_index=0,
+            worker_token=batch.lease_token,
+            failure_code="fact_extraction_execution_cancelled",
+            max_batch_attempts=2,
+        )
+    )
+
+    assert result.batch_status == "running"
+    assert batch.current_inference_run_id == context.inference_run_id
+    assert batch.current_input_batch_id == context.input_batch_id
+    assert batch.lease_expires_at is not None and batch.lease_expires_at < utc_now()
+
+
+def test_reconcile_completed_run_with_persistence_context_invalid_fails_batch_but_preserves_run(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    context = orchestration_service.orchestration_repository.BatchAttemptReconciliationContext(
+        orchestration_id=orchestration.id,
+        orchestration_status="running",
+        orchestration_project_id=orchestration.project_id,
+        orchestration_extraction_run_id=orchestration.extraction_run_id,
+        batch_id=batch.id,
+        batch_index=0,
+        batch_status="running",
+        attempt_count=1,
+        lease_token=batch.lease_token,
+        input_batch_id=batch.current_input_batch_id,
+        inference_run_id=batch.current_inference_run_id,
+        inference_run_status=InferenceRunStatus.COMPLETED.value,
+        inference_run_project_id=orchestration.project_id,
+        inference_run_task_type="fact_extraction",
+        inference_run_input_batch_id=batch.current_input_batch_id,
+        inference_run_failure_code=None,
+        application_id=None,
+        application_status=None,
+        batch_application_id=None,
+        batch_application_status=None,
+        run_application_id=None,
+        run_application_status=None,
+    )
+
+    async def fake_context(*_args, **_kwargs):
+        return context
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_batch_attempt_reconciliation_context_for_update",
+        fake_context,
+    )
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+
+    result = run_async(
+        orchestration_service.reconcile_fact_extraction_batch_after_interruption(
+            session,
+            orchestration_id=orchestration.id,
+            batch_index=0,
+            worker_token=batch.lease_token,
+            failure_code="persistence_context_invalid",
+            max_batch_attempts=2,
+        )
+    )
+
+    assert result.batch_status == "failed"
+    assert batch.current_inference_run_id == context.inference_run_id
+    assert batch.failure_code == "persistence_context_invalid"
+
+
+def test_reconcile_does_not_modify_batch_after_lease_is_taken_over(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.current_input_batch_id = uuid.uuid4()
+    batch.current_inference_run_id = uuid.uuid4()
+    batch.lease_token = uuid.uuid4()
+    other_worker = uuid.uuid4()
+    context = orchestration_service.orchestration_repository.BatchAttemptReconciliationContext(
+        orchestration_id=orchestration.id,
+        orchestration_status="running",
+        orchestration_project_id=orchestration.project_id,
+        orchestration_extraction_run_id=orchestration.extraction_run_id,
+        batch_id=batch.id,
+        batch_index=0,
+        batch_status="running",
+        attempt_count=1,
+        lease_token=other_worker,
+        input_batch_id=batch.current_input_batch_id,
+        inference_run_id=batch.current_inference_run_id,
+        inference_run_status=InferenceRunStatus.RUNNING.value,
+        inference_run_project_id=orchestration.project_id,
+        inference_run_task_type="fact_extraction",
+        inference_run_input_batch_id=batch.current_input_batch_id,
+        inference_run_failure_code=None,
+        application_id=None,
+        application_status=None,
+        batch_application_id=None,
+        batch_application_status=None,
+        run_application_id=None,
+        run_application_status=None,
+    )
+
+    async def fake_context(*_args, **_kwargs):
+        return context
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_batch_attempt_reconciliation_context_for_update",
+        fake_context,
+    )
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+
+    result = run_async(
+        orchestration_service.reconcile_fact_extraction_batch_after_interruption(
+            session,
+            orchestration_id=orchestration.id,
+            batch_index=0,
+            worker_token=batch.lease_token,
+            failure_code="fact_extraction_batch_lease_lost",
+            max_batch_attempts=2,
+        )
+    )
+
+    assert result.batch_status == "running"
+    assert batch.lease_token != context.lease_token
+    assert batch.current_inference_run_id == context.inference_run_id
+
+
+def test_record_prepared_run_notice_rejects_failed_run_registration(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="running")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.lease_token = uuid.uuid4()
+    notice = orchestration_service.PreparedFactExtractionRunNotice(
+        project_id=orchestration.project_id,
+        extraction_run_id=orchestration.extraction_run_id,
+        plan_hash=orchestration.plan_hash,
+        batch_index=0,
+        batch_plan_hash=batch.batch_plan_hash,
+        input_batch_id=uuid.uuid4(),
+        inference_run_id=uuid.uuid4(),
+        inference_request_hash="a" * 64,
+    )
+    registration_context = orchestration_service.inference_repository.PreparedInferenceRunRegistrationContext(
+        inference_run_id=notice.inference_run_id,
+        input_batch_id=notice.input_batch_id,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        status=InferenceRunStatus.FAILED.value,
+        inference_request_hash=notice.inference_request_hash,
+        agent_name=orchestration.agent_name,
+        agent_version=orchestration.agent_version,
+        prompt_name=orchestration.prompt_name,
+        prompt_version=orchestration.prompt_version,
+        prompt_contract_hash=orchestration.prompt_contract_hash,
+        provider=orchestration.provider,
+        requested_model=orchestration.requested_model,
+        batch_project_id=orchestration.project_id,
+        batch_task_type="fact_extraction",
+        request_metadata={
+            "extraction_run_id": str(orchestration.extraction_run_id),
+            "plan_hash": orchestration.plan_hash,
+            "batch_index": 0,
+            "batch_plan_hash": batch.batch_plan_hash,
+            "executor_name": orchestration.executor_name,
+            "executor_version": orchestration.executor_version,
+            "planner_name": orchestration.planner_name,
+            "planner_version": orchestration.planner_version,
+            "prompt_contract_hash": orchestration.prompt_contract_hash,
+        },
+    )
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_registration(*_args, **_kwargs):
+        return registration_context
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(
+        orchestration_service.inference_repository,
+        "get_prepared_inference_run_registration_context",
+        fake_registration,
+    )
+
+    with pytest.raises(orchestration_service.PreparedInferenceRunRegistrationError, match="status"):
+        run_async(
+            orchestration_service._record_prepared_run_notice(
+                session,
+                orchestration_id=orchestration.id,
+                worker_token=batch.lease_token,
+                notice=notice,
+            )
+        )
+
+
+def test_record_prepared_run_notice_rejects_non_running_orchestration(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="failed")
+    batch = _make_batch(orchestration.id, batch_index=0, status="running", attempt_count=1)
+    batch.lease_token = uuid.uuid4()
+    notice = orchestration_service.PreparedFactExtractionRunNotice(
+        project_id=orchestration.project_id,
+        extraction_run_id=orchestration.extraction_run_id,
+        plan_hash=orchestration.plan_hash,
+        batch_index=0,
+        batch_plan_hash=batch.batch_plan_hash,
+        input_batch_id=uuid.uuid4(),
+        inference_run_id=uuid.uuid4(),
+        inference_request_hash="a" * 64,
+    )
+    registration_context = orchestration_service.inference_repository.PreparedInferenceRunRegistrationContext(
+        inference_run_id=notice.inference_run_id,
+        input_batch_id=notice.input_batch_id,
+        project_id=orchestration.project_id,
+        task_type="fact_extraction",
+        status=InferenceRunStatus.PENDING.value,
+        inference_request_hash=notice.inference_request_hash,
+        agent_name=orchestration.agent_name,
+        agent_version=orchestration.agent_version,
+        prompt_name=orchestration.prompt_name,
+        prompt_version=orchestration.prompt_version,
+        prompt_contract_hash=orchestration.prompt_contract_hash,
+        provider=orchestration.provider,
+        requested_model=orchestration.requested_model,
+        batch_project_id=orchestration.project_id,
+        batch_task_type="fact_extraction",
+        request_metadata={
+            "extraction_run_id": str(orchestration.extraction_run_id),
+            "plan_hash": orchestration.plan_hash,
+            "batch_index": 0,
+            "batch_plan_hash": batch.batch_plan_hash,
+            "executor_name": orchestration.executor_name,
+            "executor_version": orchestration.executor_version,
+            "planner_name": orchestration.planner_name,
+            "planner_version": orchestration.planner_version,
+            "prompt_contract_hash": orchestration.prompt_contract_hash,
+        },
+    )
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_get_batch(*_args, **_kwargs):
+        return batch
+
+    async def fake_registration(*_args, **_kwargs):
+        return registration_context
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_batch_for_update", fake_get_batch)
+    monkeypatch.setattr(
+        orchestration_service.inference_repository,
+        "get_prepared_inference_run_registration_context",
+        fake_registration,
+    )
+
+    with pytest.raises(orchestration_service.PreparedInferenceRunRegistrationError, match="orchestration"):
+        run_async(
+            orchestration_service._record_prepared_run_notice(
+                session,
+                orchestration_id=orchestration.id,
+                worker_token=batch.lease_token,
+                notice=notice,
+            )
+        )
+
+
+def test_classify_lease_lost_uses_dedicated_failure_code() -> None:
+    error = orchestration_service.FactExtractionBatchLeaseLostError("lost")
+    assert orchestration_service._classify_batch_failure(error) == "fact_extraction_batch_lease_lost"
+
+
+def test_terminal_validation_is_shared_by_read_and_finalize(monkeypatch) -> None:
+    session = FakeSession()
+    orchestration = _make_orchestration(status="completed")
+    orchestration.completed_batch_count = orchestration.batch_count
+    batch = _make_batch(orchestration.id, batch_index=0, status="completed")
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_list_batches(*_args, **_kwargs):
+        return [batch, _make_batch(orchestration.id, batch_index=1, status="completed"), _make_batch(orchestration.id, batch_index=2, status="completed")]
+
+    async def fake_list_applications(*_args, **_kwargs):
+        return []
+
+    def sentinel(**_kwargs):
+        raise orchestration_service.FactExtractionOrchestrationStateError("shared-terminal-validator")
+
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "get_orchestration_for_update", fake_get_orchestration)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "list_batches_for_orchestration_for_update", fake_list_batches)
+    monkeypatch.setattr(orchestration_service.orchestration_repository, "list_applications", fake_list_applications)
+    monkeypatch.setattr(orchestration_service, "_load_authenticated_completed_applications", lambda **_kwargs: {})
+    monkeypatch.setattr(orchestration_service, "validate_terminal_orchestration_state", sentinel)
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match="shared-terminal-validator"):
+        run_async(orchestration_service._read_completed_orchestration_result(session, orchestration_id=orchestration.id))
+
+    with pytest.raises(orchestration_service.FactExtractionOrchestrationStateError, match="shared-terminal-validator"):
+        run_async(orchestration_service._finalize_orchestration(session, orchestration_id=orchestration.id))
+
+
 def test_finalize_orchestration_aggregates_completed_application_counts(monkeypatch) -> None:
     session = FakeSession()
     orchestration = _make_orchestration(status="running")
@@ -878,6 +1421,16 @@ def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:
     assert "fact_extraction_orchestrations" in migration
     assert "fact_extraction_orch_batches" in migration
     assert "feo_terminal_batch_counts_within_batch_count" in migration
+    historical_migration = Path("alembic/versions/202607312200_fact_extraction_orchestration.py").read_text(encoding="utf-8")
+    assert "feo_terminal_batch_counts_within_batch_count" not in historical_migration
+    assert "completed_batch_count + failed_batch_count = batch_count" not in historical_migration
+    assert historical_migration.count("feo_partial_shape") == 1
+    assert historical_migration.count("feo_failed_shape") == 1
+    assert historical_migration.count("feob_pending_shape") == 1
+    assert '"feo_terminal_batch_counts_within_batch_count",' in migration
+    assert 'op.drop_constraint("feo_partial_shape"' in migration
+    assert 'op.drop_constraint("feo_failed_shape"' in migration
+    assert 'op.drop_constraint("feob_pending_shape"' in migration
 
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
