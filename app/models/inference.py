@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -325,6 +326,13 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
             # Kept <= 63 chars for PostgreSQL's identifier limit (the descriptive
             # name would be truncated non-deterministically otherwise).
             name="uq_inference_runs_batch_agent_prompt_attempt",
+        ),
+        Index(
+            "uq_ir_active_request",
+            "input_batch_id",
+            "request_hash",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'running')"),
         ),
         CheckConstraint(
             f"status IN {_RUN_STATUS_SQL}",

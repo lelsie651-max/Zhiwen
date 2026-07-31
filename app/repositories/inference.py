@@ -13,6 +13,7 @@ from app.models.document import Document
 from app.models.document_content import DocumentBlock, ExtractionRun
 from app.models.document_revision import DocumentRevision
 from app.models.inference import InferenceInputBatch, InferenceInputBlock, InferenceRun
+from app.models.inference import InferenceRunStatus
 from app.models.project import Project
 
 
@@ -132,6 +133,56 @@ async def get_run_for_update(
         select(InferenceRun).where(InferenceRun.id == run_id).with_for_update()
     )
     return result.scalar_one_or_none()
+
+
+async def get_runs_by_request_for_update(
+    session: AsyncSession,
+    *,
+    input_batch_id: uuid.UUID,
+    request_hash: str,
+    agent_name: str,
+    prompt_version: str,
+) -> list[InferenceRun]:
+    result = await session.execute(
+        select(InferenceRun)
+        .where(
+            InferenceRun.input_batch_id == input_batch_id,
+            InferenceRun.request_hash == request_hash,
+            InferenceRun.agent_name == agent_name,
+            InferenceRun.prompt_version == prompt_version,
+        )
+        .order_by(InferenceRun.attempt_no.desc(), InferenceRun.created_at.desc())
+        .with_for_update()
+    )
+    return list(result.scalars().all())
+
+
+async def get_active_run_by_request_for_update(
+    session: AsyncSession,
+    *,
+    input_batch_id: uuid.UUID,
+    request_hash: str,
+    agent_name: str,
+    prompt_version: str,
+) -> InferenceRun | None:
+    result = await session.execute(
+        select(InferenceRun)
+        .where(
+            InferenceRun.input_batch_id == input_batch_id,
+            InferenceRun.request_hash == request_hash,
+            InferenceRun.agent_name == agent_name,
+            InferenceRun.prompt_version == prompt_version,
+            InferenceRun.status.in_(
+                (
+                    InferenceRunStatus.PENDING.value,
+                    InferenceRunStatus.RUNNING.value,
+                )
+            ),
+        )
+        .order_by(InferenceRun.attempt_no.desc(), InferenceRun.created_at.desc())
+        .with_for_update()
+    )
+    return result.scalars().first()
 
 
 async def get_completed_fact_extraction_run_context(

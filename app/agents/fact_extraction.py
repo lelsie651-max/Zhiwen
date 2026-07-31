@@ -171,10 +171,15 @@ def parse_fact_extraction_completion(
         raise AgentResponseError(
             "fact extraction response was not a single strict JSON object"
         )
+    return parse_fact_extraction_response_object(payload)
 
+
+def parse_fact_extraction_response_object(
+    response_json: dict[str, Any],
+) -> FactExtractionResponse:
     summary: str | None = None
     try:
-        return FactExtractionResponse.model_validate(payload)
+        return FactExtractionResponse.model_validate(response_json)
     except ValidationError as error:
         # Only field locations + error types — never the raw model content, the
         # offending input value, or validation context. Also bounded in count and

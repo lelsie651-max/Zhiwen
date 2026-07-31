@@ -14,6 +14,7 @@ import json
 import math
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -42,6 +43,7 @@ _ADMISSIBLE_EXTRACTION_OUTCOMES = {
 _BATCH_IDENTITY_CONSTRAINT = (
     "uq_inference_input_batches_project_id_task_type_snapshot_hash"
 )
+_ACTIVE_REQUEST_CONSTRAINT = "uq_ir_active_request"
 
 # Length bounds for the run identity fields, matching the ORM column sizes.
 _RUN_IDENTITY_LIMITS = {
@@ -119,6 +121,20 @@ class InferenceFailureConflictError(InferenceError):
     """Raised when a failed run is re-failed with a different result."""
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedInferenceRun:
+    run: InferenceRun
+    created: bool
+    reused_completed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceRunClaim:
+    run_id: uuid.UUID
+    status: str
+    claimed: bool
+
+
 # --------------------------------------------------------------------------- #
 # Hashing helpers
 # --------------------------------------------------------------------------- #
@@ -153,8 +169,65 @@ def _is_batch_identity_conflict(error: IntegrityError) -> bool:
     return constraint == _BATCH_IDENTITY_CONSTRAINT
 
 
+def _is_active_request_conflict(error: IntegrityError) -> bool:
+    constraint = getattr(
+        getattr(getattr(error, "orig", None), "diag", None),
+        "constraint_name",
+        None,
+    )
+    return constraint == _ACTIVE_REQUEST_CONSTRAINT
+
+
 def _block_ref(index: int) -> str:
     return f"B{index + 1:04d}"
+
+
+def build_inference_request_hash(
+    *,
+    snapshot_hash: str,
+    task_type: str,
+    agent_name: str,
+    agent_version: str,
+    prompt_name: str,
+    prompt_version: str,
+    prompt_contract_hash: str | None,
+    provider: str,
+    requested_model: str,
+    temperature: float,
+    max_output_tokens: int,
+    request_metadata: dict[str, Any],
+) -> str:
+    snapshot_hash_value = _required_hash(snapshot_hash, "snapshot_hash")
+    task_type_value = _require_task_type(task_type)
+    temperature_value = _require_temperature(temperature)
+    max_tokens_value = _require_max_output_tokens(max_output_tokens)
+    metadata = _strict_json_metadata(request_metadata, field_name="request_metadata")
+    contract_hash = _optional_hash(prompt_contract_hash, "prompt_contract_hash")
+    agent_name_value = _require_identity_text(agent_name, "agent_name")
+    agent_version_value = _require_identity_text(agent_version, "agent_version")
+    prompt_name_value = _require_identity_text(prompt_name, "prompt_name")
+    prompt_version_value = _require_identity_text(prompt_version, "prompt_version")
+    provider_value = _require_identity_text(provider, "provider")
+    requested_model_value = _require_identity_text(requested_model, "requested_model")
+
+    return _sha256(
+        _canonical_json(
+            {
+                "snapshot_hash": snapshot_hash_value,
+                "task_type": task_type_value,
+                "agent_name": agent_name_value,
+                "agent_version": agent_version_value,
+                "prompt_name": prompt_name_value,
+                "prompt_version": prompt_version_value,
+                "prompt_contract_hash": contract_hash,
+                "provider": provider_value,
+                "requested_model": requested_model_value,
+                "temperature": temperature_value,
+                "max_output_tokens": max_tokens_value,
+                "request_metadata": metadata,
+            }
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -343,23 +416,19 @@ async def create_inference_run(
             session, input_batch_id, agent_name_value, prompt_version_value
         )
 
-        request_hash = _sha256(
-            _canonical_json(
-                {
-                    "snapshot_hash": batch.snapshot_hash,
-                    "task_type": task_type_value,
-                    "agent_name": agent_name_value,
-                    "agent_version": agent_version_value,
-                    "prompt_name": prompt_name_value,
-                    "prompt_version": prompt_version_value,
-                    "prompt_contract_hash": contract_hash,
-                    "provider": provider_value,
-                    "requested_model": requested_model_value,
-                    "temperature": temperature_value,
-                    "max_output_tokens": max_tokens_value,
-                    "request_metadata": metadata,
-                }
-            )
+        request_hash = build_inference_request_hash(
+            snapshot_hash=batch.snapshot_hash,
+            task_type=task_type_value,
+            agent_name=agent_name_value,
+            agent_version=agent_version_value,
+            prompt_name=prompt_name_value,
+            prompt_version=prompt_version_value,
+            prompt_contract_hash=contract_hash,
+            provider=provider_value,
+            requested_model=requested_model_value,
+            temperature=temperature_value,
+            max_output_tokens=max_tokens_value,
+            request_metadata=metadata,
         )
 
         run = InferenceRun(
@@ -390,6 +459,197 @@ async def create_inference_run(
         raise
 
 
+async def prepare_inference_run(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    input_batch_id: uuid.UUID,
+    task_type: str,
+    agent_name: str,
+    agent_version: str,
+    prompt_name: str,
+    prompt_version: str,
+    prompt_contract_hash: str | None,
+    provider: str,
+    requested_model: str,
+    temperature: float,
+    max_output_tokens: int,
+    request_metadata: dict[str, Any] | None = None,
+) -> PreparedInferenceRun:
+    task_type_value = _require_task_type(task_type)
+    temperature_value = _require_temperature(temperature)
+    max_tokens_value = _require_max_output_tokens(max_output_tokens)
+    metadata = _strict_json_metadata(request_metadata, field_name="request_metadata")
+    contract_hash = _optional_hash(prompt_contract_hash, "prompt_contract_hash")
+    agent_name_value = _require_identity_text(agent_name, "agent_name")
+    agent_version_value = _require_identity_text(agent_version, "agent_version")
+    prompt_name_value = _require_identity_text(prompt_name, "prompt_name")
+    prompt_version_value = _require_identity_text(prompt_version, "prompt_version")
+    provider_value = _require_identity_text(provider, "provider")
+    requested_model_value = _require_identity_text(requested_model, "requested_model")
+
+    try:
+        batch = await inference_repository.get_batch_for_update(session, input_batch_id)
+        if batch is None:
+            raise InferenceBatchNotFoundError("Target input batch not found.")
+        if batch.project_id != project_id:
+            raise InferenceBatchMismatchError(
+                "Batch does not belong to the given project."
+            )
+        if batch.task_type != task_type_value:
+            raise InferenceBatchMismatchError(
+                "Batch task_type does not match the run task_type."
+            )
+
+        request_hash = build_inference_request_hash(
+            snapshot_hash=batch.snapshot_hash,
+            task_type=task_type_value,
+            agent_name=agent_name_value,
+            agent_version=agent_version_value,
+            prompt_name=prompt_name_value,
+            prompt_version=prompt_version_value,
+            prompt_contract_hash=contract_hash,
+            provider=provider_value,
+            requested_model=requested_model_value,
+            temperature=temperature_value,
+            max_output_tokens=max_tokens_value,
+            request_metadata=metadata,
+        )
+        existing_runs = await inference_repository.get_runs_by_request_for_update(
+            session,
+            input_batch_id=input_batch_id,
+            request_hash=request_hash,
+            agent_name=agent_name_value,
+            prompt_version=prompt_version_value,
+        )
+        latest_run = existing_runs[0] if existing_runs else None
+        if latest_run is not None:
+            if latest_run.status == InferenceRunStatus.COMPLETED.value:
+                _validate_reusable_completed_run(
+                    latest_run,
+                    provider=provider_value,
+                    requested_model=requested_model_value,
+                    prompt_contract_hash=contract_hash,
+                    request_hash=request_hash,
+                )
+                await session.commit()
+                return PreparedInferenceRun(
+                    run=latest_run,
+                    created=False,
+                    reused_completed=True,
+                )
+            if latest_run.status in {
+                InferenceRunStatus.PENDING.value,
+                InferenceRunStatus.RUNNING.value,
+            }:
+                await session.commit()
+                return PreparedInferenceRun(
+                    run=latest_run,
+                    created=False,
+                    reused_completed=False,
+                )
+
+        attempt_no = await inference_repository.get_next_run_attempt_no(
+            session,
+            input_batch_id,
+            agent_name_value,
+            prompt_version_value,
+        )
+        run = InferenceRun(
+            project_id=project_id,
+            input_batch_id=input_batch_id,
+            task_type=task_type_value,
+            attempt_no=attempt_no,
+            status=InferenceRunStatus.PENDING.value,
+            agent_name=agent_name_value,
+            agent_version=agent_version_value,
+            prompt_name=prompt_name_value,
+            prompt_version=prompt_version_value,
+            prompt_contract_hash=contract_hash,
+            request_hash=request_hash,
+            request_metadata=metadata,
+            provider=provider_value,
+            requested_model=requested_model_value,
+            temperature=temperature_value,
+            max_output_tokens=max_tokens_value,
+            attempt_count=0,
+        )
+
+        savepoint = await session.begin_nested()
+        try:
+            await inference_repository.create_inference_run(session, run)
+            await savepoint.commit()
+        except IntegrityError as error:
+            await savepoint.rollback()
+            if not _is_active_request_conflict(error):
+                raise
+            active_run = await inference_repository.get_active_run_by_request_for_update(
+                session,
+                input_batch_id=input_batch_id,
+                request_hash=request_hash,
+                agent_name=agent_name_value,
+                prompt_version=prompt_version_value,
+            )
+            if active_run is None:
+                raise error
+            await session.commit()
+            return PreparedInferenceRun(
+                run=active_run,
+                created=False,
+                reused_completed=False,
+            )
+
+        await session.commit()
+        return PreparedInferenceRun(
+            run=run,
+            created=True,
+            reused_completed=False,
+        )
+    except BaseException:
+        await session.rollback()
+        raise
+
+
+async def claim_inference_run_for_execution(
+    session: AsyncSession,
+    *,
+    run_id: uuid.UUID,
+) -> InferenceRunClaim:
+    try:
+        run = await inference_repository.get_run_for_update(session, run_id)
+        if run is None:
+            raise InferenceRunNotFoundError("Target run not found.")
+
+        if run.status == InferenceRunStatus.PENDING.value:
+            run.status = InferenceRunStatus.RUNNING.value
+            run.started_at = utc_now()
+            await session.flush()
+            await session.commit()
+            return InferenceRunClaim(
+                run_id=run.id,
+                status=run.status,
+                claimed=True,
+            )
+        if run.status == InferenceRunStatus.RUNNING.value:
+            await session.commit()
+            return InferenceRunClaim(
+                run_id=run.id,
+                status=run.status,
+                claimed=False,
+            )
+        if run.status == InferenceRunStatus.COMPLETED.value:
+            await session.commit()
+            return InferenceRunClaim(
+                run_id=run.id,
+                status=run.status,
+                claimed=False,
+            )
+        raise InferenceRunStateError("Failed runs cannot be claimed for execution.")
+    except BaseException:
+        await session.rollback()
+        raise
+
+
 async def start_inference_run(
     session: AsyncSession,
     *,
@@ -415,6 +675,32 @@ async def start_inference_run(
     except BaseException:
         await session.rollback()
         raise
+
+
+def _validate_reusable_completed_run(
+    run: InferenceRun,
+    *,
+    provider: str,
+    requested_model: str,
+    prompt_contract_hash: str | None,
+    request_hash: str,
+) -> None:
+    if run.provider != provider:
+        raise InferenceRunStateError("Completed run provider does not match the request.")
+    if run.requested_model != requested_model:
+        raise InferenceRunStateError("Completed run requested_model does not match the request.")
+    if run.prompt_contract_hash != prompt_contract_hash:
+        raise InferenceRunStateError("Completed run prompt contract does not match the request.")
+    if run.request_hash != request_hash:
+        raise InferenceRunStateError("Completed run request_hash does not match the request.")
+    if run.response_json is None or run.response_hash is None:
+        raise InferenceRunStateError("Completed run is missing structured response data.")
+    if run.finish_reason != "stop":
+        raise InferenceRunStateError("Completed run has an invalid finish_reason.")
+    if run.response_model is None or run.completed_at is None or run.started_at is None:
+        raise InferenceRunStateError("Completed run is missing terminal completion metadata.")
+    if run.attempt_count < 1:
+        raise InferenceRunStateError("Completed run has an invalid attempt_count.")
 
 
 async def complete_inference_run(
@@ -648,6 +934,10 @@ def _require_max_output_tokens(max_output_tokens: int) -> int:
 def _optional_hash(value: str | None, field_name: str) -> str | None:
     if value is None:
         return None
+    return _required_hash(value, field_name)
+
+
+def _required_hash(value: str, field_name: str) -> str:
     if not isinstance(value, str):
         raise InvalidInferenceInputError(f"{field_name} must be a string.")
     normalized = value.lower()

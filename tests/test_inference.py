@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import CheckConstraint, Enum as SAEnum, String, UniqueConstraint
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateIndex
 
 from app.models import Base
 from app.models.document_content import DocumentBlock
@@ -87,6 +89,8 @@ class FakeSession:
         self.committed = 0
         self.rolled_back = 0
         self.flushed = 0
+        self.savepoint_committed = 0
+        self.savepoint_rolled_back = 0
 
     async def commit(self):
         self.committed += 1
@@ -96,6 +100,18 @@ class FakeSession:
 
     async def flush(self):
         self.flushed += 1
+
+    async def begin_nested(self):
+        session = self
+
+        class _Savepoint:
+            async def commit(self_nonlocal):
+                session.savepoint_committed += 1
+
+            async def rollback(self_nonlocal):
+                session.savepoint_rolled_back += 1
+
+        return _Savepoint()
 
 
 class FakeResult:
@@ -135,7 +151,7 @@ def test_single_migration_head_is_inference():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202607311600"]
+    assert list(script.get_heads()) == ["202607311700"]
 
 
 def test_status_uses_string_and_check_not_native_enum():
@@ -157,6 +173,14 @@ def test_run_composite_unique_constraint_exists():
         == ("input_batch_id", "agent_name", "prompt_version", "attempt_no")
         for c in runs.constraints
     )
+
+
+def test_active_request_partial_unique_index_exists_and_compiles_for_postgresql():
+    runs = Base.metadata.tables["inference_runs"]
+    index = next(index for index in runs.indexes if index.name == "uq_ir_active_request")
+    sql = str(CreateIndex(index).compile(dialect=postgresql.dialect()))
+    assert index.unique is True
+    assert "WHERE status IN ('pending', 'running')" in sql
 
 
 def test_batch_and_block_unique_constraints_exist():
@@ -692,6 +716,187 @@ def test_create_run_rejects_project_or_task_mismatch(monkeypatch):
         )
 
 
+def test_prepare_inference_run_reuses_completed_run(monkeypatch):
+    project_id = uuid.uuid4()
+    batch = _fake_batch(project_id)
+    kwargs = _create_run_kwargs(project_id, batch.id)
+    request_hash = inference_service.build_inference_request_hash(
+        snapshot_hash=batch.snapshot_hash,
+        task_type=kwargs["task_type"],
+        agent_name=kwargs["agent_name"],
+        agent_version=kwargs["agent_version"],
+        prompt_name=kwargs["prompt_name"],
+        prompt_version=kwargs["prompt_version"],
+        prompt_contract_hash=kwargs["prompt_contract_hash"],
+        provider=kwargs["provider"],
+        requested_model=kwargs["requested_model"],
+        temperature=kwargs["temperature"],
+        max_output_tokens=kwargs["max_output_tokens"],
+        request_metadata=kwargs["request_metadata"],
+    )
+    completed = _completed_run(
+        project_id,
+        request_hash=request_hash,
+        prompt_contract_hash=kwargs["prompt_contract_hash"],
+    )
+    completed.provider = kwargs["provider"]
+    completed.requested_model = kwargs["requested_model"]
+    monkeypatch.setattr(inference_repository, "get_batch_for_update", _acoro(lambda *a, **k: batch))
+    monkeypatch.setattr(
+        inference_repository,
+        "get_runs_by_request_for_update",
+        _acoro(lambda *a, **k: [completed]),
+    )
+    session = FakeSession()
+
+    prepared = run_async(inference_service.prepare_inference_run(session, **kwargs))
+
+    assert prepared.run is completed
+    assert prepared.created is False
+    assert prepared.reused_completed is True
+    assert session.committed == 1
+
+
+def test_prepare_inference_run_creates_new_attempt_after_failed(monkeypatch):
+    project_id = uuid.uuid4()
+    batch = _fake_batch(project_id)
+    kwargs = _create_run_kwargs(project_id, batch.id)
+    request_hash = inference_service.build_inference_request_hash(
+        snapshot_hash=batch.snapshot_hash,
+        task_type=kwargs["task_type"],
+        agent_name=kwargs["agent_name"],
+        agent_version=kwargs["agent_version"],
+        prompt_name=kwargs["prompt_name"],
+        prompt_version=kwargs["prompt_version"],
+        prompt_contract_hash=kwargs["prompt_contract_hash"],
+        provider=kwargs["provider"],
+        requested_model=kwargs["requested_model"],
+        temperature=kwargs["temperature"],
+        max_output_tokens=kwargs["max_output_tokens"],
+        request_metadata=kwargs["request_metadata"],
+    )
+    failed = _failed_run(
+        project_id,
+        request_hash=request_hash,
+        prompt_contract_hash=kwargs["prompt_contract_hash"],
+    )
+    monkeypatch.setattr(inference_repository, "get_batch_for_update", _acoro(lambda *a, **k: batch))
+    monkeypatch.setattr(
+        inference_repository,
+        "get_runs_by_request_for_update",
+        _acoro(lambda *a, **k: [failed]),
+    )
+    monkeypatch.setattr(
+        inference_repository,
+        "get_next_run_attempt_no",
+        _acoro(lambda *a, **k: 2),
+    )
+    monkeypatch.setattr(inference_repository, "create_inference_run", _acoro(lambda _s, run: run))
+    session = FakeSession()
+
+    prepared = run_async(inference_service.prepare_inference_run(session, **kwargs))
+
+    assert prepared.created is True
+    assert prepared.reused_completed is False
+    assert prepared.run.attempt_no == 2
+    assert prepared.run.status == InferenceRunStatus.PENDING.value
+
+
+def test_prepare_inference_run_recovers_only_target_active_request_conflict(monkeypatch):
+    project_id = uuid.uuid4()
+    batch = _fake_batch(project_id)
+    kwargs = _create_run_kwargs(project_id, batch.id)
+    request_hash = inference_service.build_inference_request_hash(
+        snapshot_hash=batch.snapshot_hash,
+        task_type=kwargs["task_type"],
+        agent_name=kwargs["agent_name"],
+        agent_version=kwargs["agent_version"],
+        prompt_name=kwargs["prompt_name"],
+        prompt_version=kwargs["prompt_version"],
+        prompt_contract_hash=kwargs["prompt_contract_hash"],
+        provider=kwargs["provider"],
+        requested_model=kwargs["requested_model"],
+        temperature=kwargs["temperature"],
+        max_output_tokens=kwargs["max_output_tokens"],
+        request_metadata=kwargs["request_metadata"],
+    )
+    existing = _pending_run(project_id)
+    existing.request_hash = request_hash
+    existing.agent_name = kwargs["agent_name"]
+    existing.prompt_version = kwargs["prompt_version"]
+
+    monkeypatch.setattr(inference_repository, "get_batch_for_update", _acoro(lambda *a, **k: batch))
+    monkeypatch.setattr(
+        inference_repository,
+        "get_runs_by_request_for_update",
+        _acoro(lambda *a, **k: []),
+    )
+    monkeypatch.setattr(
+        inference_repository,
+        "get_next_run_attempt_no",
+        _acoro(lambda *a, **k: 1),
+    )
+
+    async def raise_target(_session, _run):
+        raise make_integrity_error("uq_ir_active_request")
+
+    monkeypatch.setattr(inference_repository, "create_inference_run", raise_target)
+    monkeypatch.setattr(
+        inference_repository,
+        "get_active_run_by_request_for_update",
+        _acoro(lambda *a, **k: existing),
+    )
+    session = FakeSession()
+
+    prepared = run_async(inference_service.prepare_inference_run(session, **kwargs))
+
+    assert prepared.run is existing
+    assert prepared.created is False
+    assert session.savepoint_rolled_back == 1
+
+    async def raise_other(_session, _run):
+        raise make_integrity_error("other_constraint")
+
+    monkeypatch.setattr(inference_repository, "create_inference_run", raise_other)
+    session_other = FakeSession()
+    with pytest.raises(Exception):
+        run_async(inference_service.prepare_inference_run(session_other, **kwargs))
+    assert session_other.savepoint_rolled_back == 1
+
+
+def test_claim_inference_run_for_execution_behaviour(monkeypatch):
+    pending = _pending_run(uuid.uuid4())
+    monkeypatch.setattr(inference_repository, "get_run_for_update", _acoro(lambda *a, **k: pending))
+    session = FakeSession()
+    claim = run_async(inference_service.claim_inference_run_for_execution(session, run_id=pending.id))
+    assert claim.claimed is True
+    assert claim.status == InferenceRunStatus.RUNNING.value
+    assert pending.started_at is not None
+
+    running = _running_run(uuid.uuid4())
+    monkeypatch.setattr(inference_repository, "get_run_for_update", _acoro(lambda *a, **k: running))
+    session_running = FakeSession()
+    claim_running = run_async(
+        inference_service.claim_inference_run_for_execution(session_running, run_id=running.id)
+    )
+    assert claim_running.claimed is False
+    assert claim_running.status == InferenceRunStatus.RUNNING.value
+
+    completed = _completed_run(uuid.uuid4(), request_hash=sha256("req"))
+    monkeypatch.setattr(inference_repository, "get_run_for_update", _acoro(lambda *a, **k: completed))
+    session_completed = FakeSession()
+    claim_completed = run_async(
+        inference_service.claim_inference_run_for_execution(session_completed, run_id=completed.id)
+    )
+    assert claim_completed.claimed is False
+    assert claim_completed.status == InferenceRunStatus.COMPLETED.value
+
+    failed = _failed_run(uuid.uuid4(), request_hash=sha256("req"))
+    monkeypatch.setattr(inference_repository, "get_run_for_update", _acoro(lambda *a, **k: failed))
+    with pytest.raises(inference_service.InferenceRunStateError):
+        run_async(inference_service.claim_inference_run_for_execution(FakeSession(), run_id=failed.id))
+
+
 def _pending_run(project_id):
     return InferenceRun(
         id=uuid.uuid4(),
@@ -743,6 +948,30 @@ def _running_run(project_id, provider="deepseek"):
     run.provider = provider
     run.status = InferenceRunStatus.RUNNING.value
     run.started_at = inference_service.utc_now()
+    return run
+
+
+def _completed_run(project_id, *, request_hash: str, prompt_contract_hash: str | None = None):
+    run = _running_run(project_id)
+    run.status = InferenceRunStatus.COMPLETED.value
+    run.request_hash = request_hash
+    run.prompt_contract_hash = prompt_contract_hash
+    run.completed_at = inference_service.utc_now()
+    run.response_model = "deepseek-v4-flash"
+    run.finish_reason = "stop"
+    run.attempt_count = 1
+    run.response_json = {"facts": []}
+    run.response_hash = sha256('{"facts":[]}')
+    return run
+
+
+def _failed_run(project_id, *, request_hash: str, prompt_contract_hash: str | None = None):
+    run = _running_run(project_id)
+    run.status = InferenceRunStatus.FAILED.value
+    run.request_hash = request_hash
+    run.prompt_contract_hash = prompt_contract_hash
+    run.completed_at = inference_service.utc_now()
+    run.failure_code = "network_error"
     return run
 
 

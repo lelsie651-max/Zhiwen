@@ -242,6 +242,16 @@ def test_parse_valid_completion():
     assert len(response.facts) == 1
 
 
+def test_parse_response_object_reuses_same_contract_validation():
+    payload = {"facts": [_fact()], "batch_summary": "ok", "uncertainties": []}
+    response = fx.parse_fact_extraction_response_object(payload)
+    assert isinstance(response, FactExtractionResponse)
+    assert len(response.facts) == 1
+
+    with pytest.raises(fx.AgentResponseError):
+        fx.parse_fact_extraction_response_object({"facts": [{"subject_kind": "x"}]})
+
+
 @pytest.mark.parametrize(
     "content",
     [

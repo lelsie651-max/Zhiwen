@@ -37,6 +37,11 @@ from app.schemas.fact import (
     FactValueInput,
     FactValueRead,
 )
+from app.schemas.fact_extraction_execution import (
+    FactExtractionBatchExecutionResult,
+    InferenceInputBlockSnapshot,
+    MaterializedFactExtractionBatch,
+)
 from app.schemas.fact_commands import (
     AIProposalInput,
     FactEvidenceInput,
@@ -119,6 +124,9 @@ __all__ = [
     "AIProposalInput",
     "HumanFactValueInput",
     "FactValueDecisionInput",
+    "InferenceInputBlockSnapshot",
+    "MaterializedFactExtractionBatch",
+    "FactExtractionBatchExecutionResult",
     "ExtractionOutcome",
     "ExtractedBlockType",
     "ExtractedBlock",
