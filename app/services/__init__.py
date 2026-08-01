@@ -66,6 +66,12 @@ from app.services.document_content import (
     create_source_evidence,
     persist_extraction_result,
 )
+from app.services.document_revision_diff import (
+    DocumentRevisionBlockDiffError,
+    DocumentRevisionBlockDiffInvariantError,
+    DocumentRevisionBlockDiffStateError,
+    get_document_revision_block_diff,
+)
 from app.services.document_extraction import extract_document
 from app.services.document_upload import (
     ProjectDocumentSummary,
@@ -147,6 +153,9 @@ __all__ = [
     "InvalidExtractionResultError",
     "DocumentBlockNotFoundError",
     "EvidenceOffsetError",
+    "DocumentRevisionBlockDiffError",
+    "DocumentRevisionBlockDiffStateError",
+    "DocumentRevisionBlockDiffInvariantError",
     "DynamicSchemaServiceError",
     "DynamicSchemaProjectionError",
     "DynamicSchemaProjectionNotFoundError",
@@ -200,6 +209,7 @@ __all__ = [
     "reject_fact_value",
     "persist_extraction_result",
     "create_source_evidence",
+    "get_document_revision_block_diff",
     "extract_document",
     "UploadAccessError",
     "UploadFormError",

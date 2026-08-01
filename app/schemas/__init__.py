@@ -93,6 +93,11 @@ from app.schemas.document_extraction import (
     ExtractedDocument,
     ExtractionOutcome,
 )
+from app.schemas.document_revision_diff import (
+    DocumentRevisionBlockDiff,
+    DocumentRevisionBlockDiffItem,
+    DocumentRevisionDiffBlockSnapshot,
+)
 from app.schemas.document_upload import DocumentUploadSubmit
 from app.schemas.document_revision import (
     DocumentRevisionCreate,
@@ -203,6 +208,9 @@ __all__ = [
     "ExtractedBlockType",
     "ExtractedBlock",
     "ExtractedDocument",
+    "DocumentRevisionDiffBlockSnapshot",
+    "DocumentRevisionBlockDiffItem",
+    "DocumentRevisionBlockDiff",
     "DocumentUploadSubmit",
     "DocumentRevisionCreate",
     "DocumentRevisionRead",
