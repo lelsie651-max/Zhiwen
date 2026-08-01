@@ -25,6 +25,7 @@ from app.services import document_content as document_content_service
 from app.services import document_extraction, revision_extraction as revision_extraction_service
 from app.services.document_extraction import extract_document
 from app.storage import LocalFileStorage
+from app.utils import build_document_block_anchor_hash
 
 
 def run_async(awaitable):
@@ -141,9 +142,11 @@ def build_extracted_document(
             raw_text=raw_text,
             normalized_text=raw_text,
             location_key=location_key,
-            anchor_hash=hashlib.sha256(
-                f"{detected_format.value}|{location_key}|{raw_text}".encode("utf-8")
-            ).hexdigest(),
+            anchor_hash=build_document_block_anchor_hash(
+                detected_format=detected_format.value,
+                location_key=location_key,
+                raw_text=raw_text,
+            ),
             page_no=1,
             block_index=0,
             heading_path=[],

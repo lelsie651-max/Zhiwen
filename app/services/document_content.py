@@ -17,6 +17,7 @@ from app.models.document_content import (
 from app.repositories import document_content as document_content_repository
 from app.schemas.document_content import SourceEvidenceCreate
 from app.schemas.document_extraction import ExtractedDocument, ExtractionOutcome
+from app.utils import build_document_block_anchor_hash
 
 
 class ExtractionPersistenceError(Exception):
@@ -260,11 +261,16 @@ def _validate_extracted_document(extracted_document: ExtractedDocument) -> None:
 
     detected_format = extracted_document.detected_format.value
     for block in blocks:
-        expected_anchor_hash = _build_anchor_hash(
-            detected_format=detected_format,
-            location_key=block.location_key,
-            raw_text=block.raw_text,
-        )
+        try:
+            expected_anchor_hash = build_document_block_anchor_hash(
+                detected_format=detected_format,
+                location_key=block.location_key,
+                raw_text=block.raw_text,
+            )
+        except ValueError as exc:
+            raise InvalidExtractionResultError(
+                "Block anchor_hash cannot be verified."
+            ) from exc
         if block.anchor_hash != expected_anchor_hash:
             raise InvalidExtractionResultError("Block anchor_hash does not match the expected deterministic hash.")
 
@@ -314,9 +320,3 @@ def _validate_source_evidence_replay(
         raise SourceEvidenceReplayConflictError(
             "Stored source evidence does not match the requested offsets."
         )
-
-
-def _build_anchor_hash(*, detected_format: str, location_key: str, raw_text: str) -> str:
-    return hashlib.sha256(
-        f"{detected_format}|{location_key}|{raw_text}".encode("utf-8")
-    ).hexdigest()

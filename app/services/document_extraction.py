@@ -26,6 +26,7 @@ from app.schemas.document_extraction import (
 )
 from app.schemas.file_ingestion import DetectedFileFormat
 from app.storage import FileStorage
+from app.utils import build_document_block_anchor_hash
 
 logger = logging.getLogger(__name__)
 
@@ -590,7 +591,11 @@ def _materialize_blocks(
                         collapse_spaces=raw_block.collapse_spaces,
                     ),
                     location_key=location_key,
-                    anchor_hash=_build_anchor_hash(detected_format, location_key, segment_text),
+                    anchor_hash=build_document_block_anchor_hash(
+                        detected_format=detected_format.value,
+                        location_key=location_key,
+                        raw_text=segment_text,
+                    ),
                     page_no=raw_block.page_no,
                     block_index=raw_block.block_index,
                     heading_level=raw_block.heading_level,
@@ -605,18 +610,6 @@ def _materialize_blocks(
             source_order += 1
 
     return blocks
-
-
-def _build_anchor_hash(
-    detected_format: DetectedFileFormat,
-    location_key: str,
-    raw_text: str,
-) -> str:
-    return hashlib.sha256(
-        f"{detected_format.value}|{location_key}|{raw_text}".encode("utf-8")
-    ).hexdigest()
-
-
 def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 

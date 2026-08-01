@@ -25,6 +25,7 @@ from app.schemas.document_extraction import (
 )
 from app.schemas.file_ingestion import DetectedFileFormat
 from app.services import document_content as document_content_service
+from app.utils import build_document_block_anchor_hash
 
 
 def run_async(awaitable):
@@ -37,9 +38,11 @@ def make_integrity_error(constraint_name: str | None) -> IntegrityError:
 
 
 def build_anchor_hash(*, detected_format: str, location_key: str, raw_text: str) -> str:
-    return hashlib.sha256(
-        f"{detected_format}|{location_key}|{raw_text}".encode("utf-8")
-    ).hexdigest()
+    return build_document_block_anchor_hash(
+        detected_format=detected_format,
+        location_key=location_key,
+        raw_text=raw_text,
+    )
 
 
 def build_extracted_block(
@@ -132,6 +135,92 @@ def test_document_block_preserves_raw_text_and_normalized_text_whitespace() -> N
     assert block.normalized_text == normalized_text
     assert block.location_key == "loc-0"
     assert block.anchor_hash == "a" * 64
+
+
+def test_anchor_hash_golden_vector_is_unchanged() -> None:
+    assert build_document_block_anchor_hash(
+        detected_format="md",
+        location_key="md:p7",
+        raw_text="Alpha\nBeta",
+    ) == hashlib.sha256("md|md:p7|Alpha\nBeta".encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "kwargs", "sentinel_in_raw_text"),
+    [
+        (
+            "raw_text",
+            {
+                "detected_format": "md",
+                "location_key": "loc-1",
+                "raw_text": 123,
+            },
+            False,
+        ),
+        (
+            "location_key",
+            {
+                "detected_format": "md",
+                "location_key": object(),
+                "raw_text": "SENSITIVE_ANCHOR_SENTINEL",
+            },
+            True,
+        ),
+        (
+            "detected_format",
+            {
+                "detected_format": None,
+                "location_key": "loc-1",
+                "raw_text": "SENSITIVE_ANCHOR_SENTINEL",
+            },
+            True,
+        ),
+    ],
+)
+def test_anchor_hash_rejects_non_string_inputs_without_leaking_content(
+    field_name: str,
+    kwargs: dict[str, object],
+    sentinel_in_raw_text: bool,
+) -> None:
+    sentinel = "SENSITIVE_ANCHOR_SENTINEL"
+
+    with pytest.raises(ValueError, match="document_block_anchor_hash_invalid_input") as exc_info:
+        build_document_block_anchor_hash(**kwargs)
+
+    if sentinel_in_raw_text:
+        assert sentinel not in str(exc_info.value)
+
+
+def test_anchor_hash_changes_when_any_input_changes() -> None:
+    baseline = build_document_block_anchor_hash(
+        detected_format="md",
+        location_key="loc-1",
+        raw_text="alpha",
+    )
+    assert (
+        build_document_block_anchor_hash(
+            detected_format="pdf",
+            location_key="loc-1",
+            raw_text="alpha",
+        )
+        != baseline
+    )
+    assert (
+        build_document_block_anchor_hash(
+            detected_format="md",
+            location_key="loc-2",
+            raw_text="alpha",
+        )
+        != baseline
+    )
+    assert (
+        build_document_block_anchor_hash(
+            detected_format="md",
+            location_key="loc-1",
+            raw_text="beta",
+        )
+        != baseline
+    )
 
 
 def test_source_evidence_preserves_excerpt_whitespace() -> None:

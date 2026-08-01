@@ -1,5 +1,6 @@
 import asyncio
 import io
+import inspect
 import tempfile
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from app.schemas.file_ingestion import DetectedFileFormat
 from app.services import document_extraction
 from app.services.document_extraction import extract_document
 from app.storage import LocalFileStorage
+from app.utils import build_document_block_anchor_hash
 
 
 def run_async(awaitable):
@@ -340,6 +342,12 @@ def test_same_input_produces_same_anchor_hashes(tmp_path: Path) -> None:
     second = run_async(extract_document(storage, storage_key, DetectedFileFormat.MD))
 
     assert [block.anchor_hash for block in first.blocks] == [block.anchor_hash for block in second.blocks]
+
+
+def test_document_extraction_uses_public_anchor_hash_function() -> None:
+    source = inspect.getsource(document_extraction)
+    assert document_extraction.build_document_block_anchor_hash is build_document_block_anchor_hash
+    assert "def _build_anchor_hash" not in source
 
 
 def test_long_block_is_safely_split(tmp_path: Path) -> None:

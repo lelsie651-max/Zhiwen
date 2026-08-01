@@ -18,8 +18,11 @@ from app.schemas.document_revision_diff import (
     DocumentRevisionDiffBlockSnapshot,
 )
 from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
+from app.utils import build_document_block_anchor_hash
 
 _COMPARABLE_OUTCOMES = frozenset({"success", "partial"})
+DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_NAME = "document_revision_block_diff"
+DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_VERSION = "1.0.0"
 
 
 class DocumentRevisionBlockDiffError(Exception):
@@ -44,12 +47,6 @@ def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _build_anchor_hash(*, detected_format: str, location_key: str, raw_text: str) -> str:
-    return hashlib.sha256(
-        f"{detected_format}|{location_key}|{raw_text}".encode("utf-8")
-    ).hexdigest()
 
 
 def _block_fingerprint(block: DocumentRevisionDiffBlockRecord) -> tuple[str, str]:
@@ -164,11 +161,16 @@ def _validate_blocks_for_run(
         )
 
     for block in blocks:
-        expected_anchor_hash = _build_anchor_hash(
-            detected_format=run.detected_format,
-            location_key=block.location_key,
-            raw_text=block.raw_text,
-        )
+        try:
+            expected_anchor_hash = build_document_block_anchor_hash(
+                detected_format=run.detected_format,
+                location_key=block.location_key,
+                raw_text=block.raw_text,
+            )
+        except ValueError as exc:
+            raise DocumentRevisionBlockDiffInvariantError(
+                "document_revision_diff_block_anchor_input_invalid"
+            ) from exc
         if block.anchor_hash != expected_anchor_hash:
             raise DocumentRevisionBlockDiffInvariantError(
                 "document_revision_diff_block_anchor_drift"
@@ -225,6 +227,8 @@ def _build_manifest_hash(
     target_revision_no: int,
     base_run: DocumentRevisionDiffRunRecord,
     target_run: DocumentRevisionDiffRunRecord,
+    algorithm_name: str,
+    algorithm_version: str,
     comparison_quality: str,
     unchanged_count: int,
     modified_count: int,
@@ -237,6 +241,10 @@ def _build_manifest_hash(
         {
             "project_id": str(project_id),
             "document_id": str(document_id),
+            "algorithm": {
+                "name": algorithm_name,
+                "version": algorithm_version,
+            },
             "base_revision": {
                 "revision_id": str(base_revision_id),
                 "revision_no": base_revision_no,
@@ -495,6 +503,8 @@ async def get_document_revision_block_diff(
         target_revision_no=target_revision.revision_no,
         base_run=base_run,
         target_run=target_run,
+        algorithm_name=DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_NAME,
+        algorithm_version=DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_VERSION,
         comparison_quality=comparison_quality,
         unchanged_count=unchanged_count,
         modified_count=modified_count,
@@ -512,6 +522,11 @@ async def get_document_revision_block_diff(
         target_extraction_run_id=target_run.id,
         base_revision_no=base_revision.revision_no,
         target_revision_no=target_revision.revision_no,
+        algorithm_name=DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_NAME,
+        algorithm_version=DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_VERSION,
+        extractor_name=base_run.extractor_name,
+        extractor_version=base_run.extractor_version,
+        detected_format=base_run.detected_format,
         comparison_quality=comparison_quality,
         unchanged_count=unchanged_count,
         modified_count=modified_count,

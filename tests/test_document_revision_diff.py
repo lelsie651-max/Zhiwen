@@ -14,7 +14,9 @@ from app.repositories.document_revision_diff import (
     DocumentRevisionDiffRevisionRecord,
     DocumentRevisionDiffRunRecord,
 )
+from app.services import document_content as document_content_service
 from app.services import document_revision_diff as diff_service
+from app.utils import build_document_block_anchor_hash
 
 
 def run_async(awaitable):
@@ -57,9 +59,11 @@ def _uuid(seed: str) -> uuid.UUID:
 
 
 def _anchor_hash(*, detected_format: str, location_key: str, raw_text: str) -> str:
-    return hashlib.sha256(
-        f"{detected_format}|{location_key}|{raw_text}".encode("utf-8")
-    ).hexdigest()
+    return build_document_block_anchor_hash(
+        detected_format=detected_format,
+        location_key=location_key,
+        raw_text=raw_text,
+    )
 
 
 def _document(*, project_id: uuid.UUID, document_id: uuid.UUID) -> DocumentRevisionDiffDocumentRecord:
@@ -381,6 +385,11 @@ def test_get_document_revision_block_diff_classifies_all_change_kinds_and_is_det
     )
 
     assert first == second
+    assert first.algorithm_name == diff_service.DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_NAME
+    assert first.algorithm_version == diff_service.DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_VERSION
+    assert first.extractor_name == fixture["base_run"].extractor_name
+    assert first.extractor_version == fixture["base_run"].extractor_version
+    assert first.detected_format == fixture["base_run"].detected_format
     assert first.comparison_quality == "complete"
     assert (
         first.unchanged_count,
@@ -979,7 +988,77 @@ def test_get_document_revision_block_diff_does_not_write_and_does_not_leak_sensi
     assert all(session.rollback_count == 1 for session in session_factory.sessions)
 
 
+def test_document_content_and_diff_use_same_public_anchor_function() -> None:
+    assert (
+        document_content_service.build_document_block_anchor_hash
+        is build_document_block_anchor_hash
+    )
+    assert diff_service.build_document_block_anchor_hash is build_document_block_anchor_hash
+
+
 def test_service_source_does_not_call_llm_or_latest_helpers() -> None:
     source = inspect.getsource(diff_service)
     assert "llm" not in source
     assert "latest" not in source
+    assert "def _build_anchor_hash" not in source
+
+
+def test_manifest_changes_when_only_algorithm_version_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_fixture()
+    _install_repository(
+        monkeypatch,
+        document=fixture["document"],
+        base_revision=fixture["base_revision"],
+        target_revision=fixture["target_revision"],
+        base_run=fixture["base_run"],
+        target_run=fixture["target_run"],
+        base_blocks=fixture["base_blocks"],
+        target_blocks=fixture["target_blocks"],
+    )
+    baseline = run_async(
+        diff_service.get_document_revision_block_diff(
+            SessionFactory(),
+            project_id=fixture["project_id"],
+            document_id=fixture["document_id"],
+            base_revision_id=fixture["base_revision_id"],
+            target_revision_id=fixture["target_revision_id"],
+            base_extraction_run_id=fixture["base_run_id"],
+            target_extraction_run_id=fixture["target_run_id"],
+        )
+    )
+
+    monkeypatch.setattr(
+        diff_service,
+        "DOCUMENT_REVISION_BLOCK_DIFF_ALGORITHM_VERSION",
+        "1.0.1",
+    )
+    _install_repository(
+        monkeypatch,
+        document=fixture["document"],
+        base_revision=fixture["base_revision"],
+        target_revision=fixture["target_revision"],
+        base_run=fixture["base_run"],
+        target_run=fixture["target_run"],
+        base_blocks=fixture["base_blocks"],
+        target_blocks=fixture["target_blocks"],
+    )
+    mutated = run_async(
+        diff_service.get_document_revision_block_diff(
+            SessionFactory(),
+            project_id=fixture["project_id"],
+            document_id=fixture["document_id"],
+            base_revision_id=fixture["base_revision_id"],
+            target_revision_id=fixture["target_revision_id"],
+            base_extraction_run_id=fixture["base_run_id"],
+            target_extraction_run_id=fixture["target_run_id"],
+        )
+    )
+
+    assert baseline.diff_manifest_hash != mutated.diff_manifest_hash
+    assert [item.change_kind for item in baseline.items] == [
+        item.change_kind for item in mutated.items
+    ]
+    assert baseline.algorithm_version == "1.0.0"
+    assert mutated.algorithm_version == "1.0.1"

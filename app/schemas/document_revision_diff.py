@@ -55,6 +55,11 @@ class DocumentRevisionBlockDiff:
     target_extraction_run_id: uuid.UUID
     base_revision_no: int
     target_revision_no: int
+    algorithm_name: str
+    algorithm_version: str
+    extractor_name: str
+    extractor_version: str
+    detected_format: str
     comparison_quality: DocumentRevisionDiffQuality
     unchanged_count: int
     modified_count: int
