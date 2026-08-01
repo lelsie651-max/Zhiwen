@@ -407,6 +407,7 @@ async def get_consistency_review_projection(
             items.append(
                 ConsistencyReviewProjectionItem(
                     assessment_id=assessment.id,
+                    fact_id=candidate.fact_id,
                     candidate_id=candidate.candidate_id,
                     batch_index=assessment.batch_index,
                     verdict=assessment.verdict,

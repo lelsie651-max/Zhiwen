@@ -60,6 +60,7 @@ class ConsistencyReviewProjectionMember:
 @dataclass(frozen=True, slots=True)
 class ConsistencyReviewProjectionItem:
     assessment_id: uuid.UUID
+    fact_id: uuid.UUID
     candidate_id: uuid.UUID
     batch_index: int
     verdict: str

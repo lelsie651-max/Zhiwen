@@ -909,6 +909,7 @@ def test_get_consistency_review_projection_builds_complete_projection(
     ]
     first = result.items[0]
     assert first.assessment_id == fixture_ids["assessment_a_id"]
+    assert first.fact_id == _uuid("fact-a")
     assert first.review_status == "pending_review"
     assert first.current_decision is None
     assert first.decision_history == ()
