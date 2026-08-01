@@ -730,6 +730,88 @@ def _validate_reusable_completed_run(
         raise InferenceRunStateError("Completed run response_json_hash does not match stored response_json.")
 
 
+def validate_completed_inference_run_identity(
+    run: InferenceRun,
+    *,
+    project_id: uuid.UUID,
+    input_batch_id: uuid.UUID,
+    snapshot_hash: str,
+    task_type: str,
+    agent_name: str,
+    agent_version: str,
+    prompt_name: str,
+    prompt_version: str,
+    prompt_contract_hash: str | None,
+    provider: str,
+    requested_model: str,
+    temperature: float,
+    max_output_tokens: int,
+    request_metadata: dict[str, Any],
+) -> str:
+    project_id_value = project_id if isinstance(project_id, uuid.UUID) else None
+    if project_id_value is None:
+        raise InferenceRunStateError("Completed run project_id must be a UUID.")
+    input_batch_id_value = input_batch_id if isinstance(input_batch_id, uuid.UUID) else None
+    if input_batch_id_value is None:
+        raise InferenceRunStateError("Completed run input_batch_id must be a UUID.")
+    task_type_value = _require_task_type(task_type)
+    temperature_value = _require_temperature(temperature)
+    max_tokens_value = _require_max_output_tokens(max_output_tokens)
+    metadata = _strict_json_metadata(request_metadata, field_name="request_metadata")
+    contract_hash = _optional_hash(prompt_contract_hash, "prompt_contract_hash")
+    snapshot_hash_value = _required_hash(snapshot_hash, "snapshot_hash")
+    agent_name_value = _require_identity_text(agent_name, "agent_name")
+    agent_version_value = _require_identity_text(agent_version, "agent_version")
+    prompt_name_value = _require_identity_text(prompt_name, "prompt_name")
+    prompt_version_value = _require_identity_text(prompt_version, "prompt_version")
+    provider_value = _require_identity_text(provider, "provider")
+    requested_model_value = _require_identity_text(requested_model, "requested_model")
+
+    if run.project_id != project_id_value:
+        raise InferenceRunStateError("Completed run project_id does not match the request.")
+    if run.input_batch_id != input_batch_id_value:
+        raise InferenceRunStateError("Completed run input_batch_id does not match the request.")
+    if run.task_type != task_type_value:
+        raise InferenceRunStateError("Completed run task_type does not match the request.")
+    if run.agent_name != agent_name_value:
+        raise InferenceRunStateError("Completed run agent_name does not match the request.")
+    if run.agent_version != agent_version_value:
+        raise InferenceRunStateError("Completed run agent_version does not match the request.")
+    if run.prompt_name != prompt_name_value:
+        raise InferenceRunStateError("Completed run prompt_name does not match the request.")
+    if run.prompt_version != prompt_version_value:
+        raise InferenceRunStateError("Completed run prompt_version does not match the request.")
+    if run.temperature != temperature_value:
+        raise InferenceRunStateError("Completed run temperature does not match the request.")
+    if run.max_output_tokens != max_tokens_value:
+        raise InferenceRunStateError("Completed run max_output_tokens does not match the request.")
+    if run.request_metadata != metadata:
+        raise InferenceRunStateError("Completed run request_metadata does not match the request.")
+
+    expected_request_hash = build_inference_request_hash(
+        snapshot_hash=snapshot_hash_value,
+        task_type=task_type_value,
+        agent_name=agent_name_value,
+        agent_version=agent_version_value,
+        prompt_name=prompt_name_value,
+        prompt_version=prompt_version_value,
+        prompt_contract_hash=contract_hash,
+        provider=provider_value,
+        requested_model=requested_model_value,
+        temperature=temperature_value,
+        max_output_tokens=max_tokens_value,
+        request_metadata=metadata,
+    )
+    _validate_reusable_completed_run(
+        run,
+        provider=provider_value,
+        requested_model=requested_model_value,
+        prompt_contract_hash=contract_hash,
+        request_hash=expected_request_hash,
+    )
+    return expected_request_hash
+
+
 async def complete_inference_run(
     session: AsyncSession,
     *,

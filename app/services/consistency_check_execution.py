@@ -49,6 +49,7 @@ from app.services.inference import (
     fail_inference_run,
     prepare_inference_run,
     build_inference_input_batch_snapshot_hash,
+    validate_completed_inference_run_identity,
 )
 from app.services.llm import (
     LLMClient,
@@ -364,6 +365,15 @@ def _capture_run_snapshot(run: InferenceRun) -> _InferenceRunSnapshot:
         completion_tokens=run.completion_tokens,
         total_tokens=run.total_tokens,
     )
+
+
+def _validate_plan_execution_result_matches_expected(
+    *,
+    expected: ConsistencyCheckPlanExecutionResult,
+    actual: ConsistencyCheckPlanExecutionResult,
+) -> None:
+    if actual != expected:
+        _raise_plan_result_validation_error()
 
 
 def _validate_and_order_batch_result(
@@ -891,6 +901,111 @@ async def execute_consistency_check_batch(
                 failure_code=classify_consistency_check_batch_failure(error),
             )
         raise
+
+
+async def authenticate_completed_consistency_check_batch_run(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    authoritative_plan: ConsistencyCheckPlan,
+    batch: ConsistencyCheckBatchPlan,
+    prompt: PromptDefinition,
+    provider: str,
+    requested_model: str,
+    inference_run_id: uuid.UUID | None,
+) -> ConsistencyCheckBatchExecutionResult:
+    validate_consistency_check_prompt(prompt)
+    validate_consistency_check_batch_plan(plan=authoritative_plan, batch=batch)
+
+    if batch.candidate_count == 0:
+        if inference_run_id is not None:
+            raise ConsistencyCheckExecutionError(
+                "consistency_check_persistence_empty_batch_run_invalid"
+            )
+        return _build_execution_result(
+            authoritative_plan=authoritative_plan,
+            batch=batch,
+            input_batch_id=None,
+            run_snapshot=None,
+            message_content_hash=None,
+            skipped_empty=True,
+            reused_completed_run=False,
+            response=ConsistencyCheckResponse(assessments=[]),
+        )
+
+    if not isinstance(inference_run_id, uuid.UUID):
+        raise ConsistencyCheckExecutionError(
+            "consistency_check_persistence_inference_run_id_invalid"
+        )
+
+    expected_block_ids = _collect_batch_document_block_ids(batch)
+    messages = render_consistency_check_messages(
+        prompt=prompt,
+        plan=authoritative_plan,
+        batch=batch,
+    )
+    message_content_hash = _build_message_content_hash(messages)
+
+    async with session_factory() as session:
+        try:
+            run = await inference_repository.get_run_by_id(session, inference_run_id)
+            if run is None:
+                raise ConsistencyCheckExecutionError(
+                    "consistency_check_persistence_inference_run_not_found"
+                )
+            loaded_batch = await inference_repository.get_batch_by_id(session, run.input_batch_id)
+            if loaded_batch is None:
+                raise ConsistencyCheckExecutionError(
+                    "consistency_check_persistence_input_batch_not_found"
+                )
+            materialized_batch = _materialize_batch_snapshot(
+                batch=loaded_batch,
+                project_id=authoritative_plan.project_id,
+                expected_block_ids=expected_block_ids,
+            )
+            request_metadata = _build_request_metadata(
+                plan=authoritative_plan,
+                batch=batch,
+                prompt=prompt,
+                message_content_hash=message_content_hash,
+            )
+            validate_completed_inference_run_identity(
+                run,
+                project_id=authoritative_plan.project_id,
+                input_batch_id=materialized_batch.id,
+                snapshot_hash=materialized_batch.snapshot_hash,
+                task_type=_CONSISTENCY_CHECK_TASK_TYPE,
+                agent_name=prompt.agent_name,
+                agent_version=prompt.agent_version,
+                prompt_name=prompt.prompt_name,
+                prompt_version=prompt.prompt_version,
+                prompt_contract_hash=prompt.contract_hash,
+                provider=provider,
+                requested_model=requested_model,
+                temperature=prompt.temperature,
+                max_output_tokens=prompt.max_output_tokens,
+                request_metadata=request_metadata,
+            )
+            run_snapshot = _capture_run_snapshot(run)
+            response = parse_consistency_check_response_object(
+                run_snapshot.response_json or {},
+                batch=batch,
+            )
+        except BaseException:
+            await session.rollback()
+            raise
+        else:
+            await session.rollback()
+
+    return _build_execution_result(
+        authoritative_plan=authoritative_plan,
+        batch=batch,
+        input_batch_id=materialized_batch.id,
+        run_snapshot=run_snapshot,
+        message_content_hash=message_content_hash,
+        skipped_empty=False,
+        reused_completed_run=True,
+        response=response,
+    )
 
 
 async def execute_consistency_check_plan(

@@ -99,6 +99,18 @@ async def get_batch_by_identity(
     return result.scalar_one_or_none()
 
 
+async def get_batch_by_id(
+    session: AsyncSession,
+    batch_id: uuid.UUID,
+) -> InferenceInputBatch | None:
+    result = await session.execute(
+        select(InferenceInputBatch)
+        .where(InferenceInputBatch.id == batch_id)
+        .options(selectinload(InferenceInputBatch.blocks))
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_inference_batch_with_blocks(
     session: AsyncSession,
     batch: InferenceInputBatch,
@@ -153,6 +165,16 @@ async def get_run_for_update(
 ) -> InferenceRun | None:
     result = await session.execute(
         select(InferenceRun).where(InferenceRun.id == run_id).with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_run_by_id(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+) -> InferenceRun | None:
+    result = await session.execute(
+        select(InferenceRun).where(InferenceRun.id == run_id)
     )
     return result.scalar_one_or_none()
 

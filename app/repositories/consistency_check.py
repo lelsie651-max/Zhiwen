@@ -6,12 +6,24 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.consistency_check import (
+    ConsistencyAssessmentCitation,
+    ConsistencyAssessmentLedger,
+    ConsistencyCheckApplication,
+    ConsistencyCheckBatchLedger,
+)
 from app.models.document_content import DocumentBlock, SourceEvidence
 from app.models.fact import FactEvidenceLink, FactValue
 from app.models.fact_extraction_orchestration import FactExtractionOrchestrationBatch
 from app.models.fact_value_duplicate_grouping import (
     FactValueConsistencyCandidate,
     FactValueConsistencyCandidateMember,
+)
+from app.schemas.consistency_check_persistence import (
+    ConsistencyAssessmentCitationLedgerRecord,
+    ConsistencyAssessmentLedgerRecord,
+    ConsistencyCheckApplicationLedgerRecord,
+    ConsistencyCheckBatchLedgerRecord,
 )
 
 
@@ -155,6 +167,208 @@ async def list_consistency_check_candidate_rows(
             page_no=row.page_no,
             start_line=row.start_line,
             end_line=row.end_line,
+        )
+        for row in rows
+    )
+
+
+async def get_consistency_check_application_for_update(
+    session: AsyncSession,
+    *,
+    execution_identity_hash: str,
+) -> ConsistencyCheckApplication | None:
+    result = await session.execute(
+        select(ConsistencyCheckApplication)
+        .where(ConsistencyCheckApplication.execution_identity_hash == execution_identity_hash)
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_consistency_check_application_ledger_by_execution_identity(
+    session: AsyncSession,
+    *,
+    execution_identity_hash: str,
+) -> ConsistencyCheckApplicationLedgerRecord | None:
+    result = await session.execute(
+        select(ConsistencyCheckApplication).where(
+            ConsistencyCheckApplication.execution_identity_hash == execution_identity_hash
+        )
+    )
+    application = result.scalar_one_or_none()
+    if application is None:
+        return None
+    return ConsistencyCheckApplicationLedgerRecord(
+        id=application.id,
+        project_id=application.project_id,
+        consistency_application_id=application.consistency_application_id,
+        orchestration_id=application.orchestration_id,
+        source_result_manifest_hash=application.source_result_manifest_hash,
+        plan_manifest_hash=application.plan_manifest_hash,
+        execution_identity_hash=application.execution_identity_hash,
+        result_manifest_hash=application.result_manifest_hash,
+        prompt_contract_hash=application.prompt_contract_hash,
+        provider=application.provider,
+        requested_model=application.requested_model,
+        executor_name=application.executor_name,
+        executor_version=application.executor_version,
+        batch_count=application.batch_count,
+        executed_batch_count=application.executed_batch_count,
+        skipped_empty_batch_count=application.skipped_empty_batch_count,
+        inference_run_count=application.inference_run_count,
+        assessment_count=application.assessment_count,
+        created_at=application.created_at,
+    )
+
+
+async def create_consistency_check_application(
+    session: AsyncSession,
+    application: ConsistencyCheckApplication,
+) -> ConsistencyCheckApplication:
+    session.add(application)
+    await session.flush()
+    return application
+
+
+async def create_consistency_check_batches(
+    session: AsyncSession,
+    batches: list[ConsistencyCheckBatchLedger],
+) -> list[ConsistencyCheckBatchLedger]:
+    session.add_all(batches)
+    await session.flush()
+    return batches
+
+
+async def create_consistency_assessments(
+    session: AsyncSession,
+    assessments: list[ConsistencyAssessmentLedger],
+) -> list[ConsistencyAssessmentLedger]:
+    session.add_all(assessments)
+    await session.flush()
+    return assessments
+
+
+async def create_consistency_assessment_citations(
+    session: AsyncSession,
+    citations: list[ConsistencyAssessmentCitation],
+) -> list[ConsistencyAssessmentCitation]:
+    session.add_all(citations)
+    await session.flush()
+    return citations
+
+
+async def list_consistency_check_batch_ledgers(
+    session: AsyncSession,
+    *,
+    consistency_check_application_id: uuid.UUID,
+) -> tuple[ConsistencyCheckBatchLedgerRecord, ...]:
+    result = await session.execute(
+        select(ConsistencyCheckBatchLedger)
+        .where(
+            ConsistencyCheckBatchLedger.consistency_check_application_id
+            == consistency_check_application_id
+        )
+        .order_by(
+            ConsistencyCheckBatchLedger.batch_index.asc(),
+            ConsistencyCheckBatchLedger.id.asc(),
+        )
+    )
+    batches = list(result.scalars().all())
+    return tuple(
+        ConsistencyCheckBatchLedgerRecord(
+            id=batch.id,
+            consistency_check_application_id=batch.consistency_check_application_id,
+            batch_index=batch.batch_index,
+            batch_manifest_hash=batch.batch_manifest_hash,
+            skipped_empty=batch.skipped_empty,
+            input_batch_id=batch.input_batch_id,
+            inference_run_id=batch.inference_run_id,
+            request_hash=batch.request_hash,
+            message_content_hash=batch.message_content_hash,
+            created_at=batch.created_at,
+        )
+        for batch in batches
+    )
+
+
+async def list_consistency_assessment_ledgers(
+    session: AsyncSession,
+    *,
+    consistency_check_application_id: uuid.UUID,
+) -> tuple[ConsistencyAssessmentLedgerRecord, ...]:
+    result = await session.execute(
+        select(ConsistencyAssessmentLedger)
+        .where(
+            ConsistencyAssessmentLedger.consistency_check_application_id
+            == consistency_check_application_id
+        )
+        .order_by(
+            ConsistencyAssessmentLedger.batch_index.asc(),
+            ConsistencyAssessmentLedger.source_consistency_candidate_id.asc(),
+            ConsistencyAssessmentLedger.id.asc(),
+        )
+    )
+    assessments = list(result.scalars().all())
+    return tuple(
+        ConsistencyAssessmentLedgerRecord(
+            id=assessment.id,
+            consistency_check_application_id=assessment.consistency_check_application_id,
+            source_consistency_application_id=assessment.source_consistency_application_id,
+            source_consistency_candidate_id=assessment.source_consistency_candidate_id,
+            batch_index=assessment.batch_index,
+            verdict=assessment.verdict,
+            severity=assessment.severity,
+            confidence=assessment.confidence,
+            explanation=assessment.explanation,
+            impact_json=tuple(assessment.impact_json),
+            recommended_actions_json=tuple(assessment.recommended_actions_json),
+            assessment_manifest_hash=assessment.assessment_manifest_hash,
+            created_at=assessment.created_at,
+        )
+        for assessment in assessments
+    )
+
+
+async def list_consistency_assessment_citation_ledgers(
+    session: AsyncSession,
+    *,
+    consistency_check_application_id: uuid.UUID,
+) -> tuple[ConsistencyAssessmentCitationLedgerRecord, ...]:
+    result = await session.execute(
+        select(
+            ConsistencyAssessmentCitation,
+            ConsistencyAssessmentLedger.batch_index.label("batch_index"),
+            ConsistencyAssessmentLedger.source_consistency_candidate_id.label(
+                "source_consistency_candidate_id"
+            ),
+        )
+        .select_from(ConsistencyAssessmentCitation)
+        .join(
+            ConsistencyAssessmentLedger,
+            ConsistencyAssessmentCitation.assessment_id == ConsistencyAssessmentLedger.id,
+        )
+        .where(
+            ConsistencyAssessmentLedger.consistency_check_application_id
+            == consistency_check_application_id
+        )
+        .order_by(
+            ConsistencyAssessmentLedger.batch_index.asc(),
+            ConsistencyAssessmentLedger.source_consistency_candidate_id.asc(),
+            ConsistencyAssessmentCitation.citation_order.asc(),
+            ConsistencyAssessmentCitation.id.asc(),
+        )
+    )
+    rows = list(result.all())
+    return tuple(
+        ConsistencyAssessmentCitationLedgerRecord(
+            id=row[0].id,
+            assessment_id=row[0].assessment_id,
+            source_consistency_application_id=row[0].source_consistency_application_id,
+            source_consistency_candidate_id=row[0].source_consistency_candidate_id,
+            source_fact_value_id=row[0].source_fact_value_id,
+            evidence_link_id=row[0].evidence_link_id,
+            citation_order=row[0].citation_order,
+            created_at=row[0].created_at,
         )
         for row in rows
     )
