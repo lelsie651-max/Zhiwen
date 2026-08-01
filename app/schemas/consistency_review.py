@@ -45,6 +45,12 @@ class ConsistencyReviewDecisionSelectionLedgerRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthenticatedConsistencyReviewDecisionChainEntry:
+    decision: ConsistencyReviewDecisionLedgerRecord
+    selected_fact_value_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AppendConsistencyReviewDecisionResult:
     decision_id: uuid.UUID
     decision_no: int

@@ -16,6 +16,7 @@ from app.models.project_member import ProjectMemberRole
 from app.repositories import consistency_review as consistency_review_repository
 from app.schemas.consistency_review import (
     AppendConsistencyReviewDecisionResult,
+    AuthenticatedConsistencyReviewDecisionChainEntry,
     ConsistencyReviewCandidateMemberRecord,
     ConsistencyReviewDecisionLedgerRecord,
     ConsistencyReviewDecisionSelectionLedgerRecord,
@@ -62,12 +63,6 @@ class _NormalizedRequest:
     decision_kind: str
     selected_fact_value_ids: tuple[uuid.UUID, ...]
     comment: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _ValidatedDecisionChainEntry:
-    decision: ConsistencyReviewDecisionLedgerRecord
-    selected_fact_value_ids: tuple[uuid.UUID, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,31 +509,40 @@ def _assert_candidate_member_snapshot_matches(
         _immutable_mismatch()
 
 
-def _validate_existing_chain(
+def authenticate_consistency_review_decision_chain(
     *,
     decisions: Sequence[ConsistencyReviewDecisionLedgerRecord],
     selections: Sequence[ConsistencyReviewDecisionSelectionLedgerRecord],
-    request: _NormalizedRequest,
+    project_id: uuid.UUID,
+    consistency_check_application_id: uuid.UUID,
+    assessment_id: uuid.UUID,
     source_consistency_application_id: uuid.UUID,
     source_consistency_candidate_id: uuid.UUID,
     candidate_members: Sequence[ConsistencyReviewCandidateMemberRecord],
-) -> tuple[_ValidatedDecisionChainEntry, ...]:
+) -> tuple[AuthenticatedConsistencyReviewDecisionChainEntry, ...]:
     member_fact_value_ids = {member.fact_value_id for member in candidate_members}
+    seen_decision_ids: set[uuid.UUID] = set()
     selections_by_decision_id: dict[uuid.UUID, list[ConsistencyReviewDecisionSelectionLedgerRecord]] = {}
-    decision_ids = {decision.id for decision in decisions}
+    decision_ids: set[uuid.UUID] = set()
+    seen_selection_ids: set[uuid.UUID] = set()
     for selection in selections:
-        if selection.decision_id not in decision_ids:
+        if selection.id in seen_selection_ids:
             _immutable_mismatch()
+        seen_selection_ids.add(selection.id)
         selections_by_decision_id.setdefault(selection.decision_id, []).append(selection)
 
-    validated: list[_ValidatedDecisionChainEntry] = []
+    validated: list[AuthenticatedConsistencyReviewDecisionChainEntry] = []
     previous_decision_id: uuid.UUID | None = None
     for index, decision in enumerate(decisions, start=1):
-        if decision.project_id != request.project_id:
+        if decision.id in seen_decision_ids:
             _immutable_mismatch()
-        if decision.consistency_check_application_id != request.consistency_check_application_id:
+        seen_decision_ids.add(decision.id)
+        decision_ids.add(decision.id)
+        if decision.project_id != project_id:
             _immutable_mismatch()
-        if decision.assessment_id != request.assessment_id:
+        if decision.consistency_check_application_id != consistency_check_application_id:
+            _immutable_mismatch()
+        if decision.assessment_id != assessment_id:
             _immutable_mismatch()
         if (
             decision.source_consistency_application_id
@@ -573,6 +577,8 @@ def _validate_existing_chain(
         ordered_fact_value_ids: list[uuid.UUID] = []
         seen_fact_value_ids: set[uuid.UUID] = set()
         for selection_order, selection in enumerate(decision_selections):
+            if selection.decision_id not in decision_ids:
+                _immutable_mismatch()
             if selection.assessment_id != decision.assessment_id:
                 _immutable_mismatch()
             if (
@@ -617,22 +623,25 @@ def _validate_existing_chain(
             _immutable_mismatch()
 
         validated.append(
-            _ValidatedDecisionChainEntry(
+            AuthenticatedConsistencyReviewDecisionChainEntry(
                 decision=decision,
                 selected_fact_value_ids=tuple(ordered_fact_value_ids),
             )
         )
         previous_decision_id = decision.id
+    for decision_id in selections_by_decision_id:
+        if decision_id not in decision_ids:
+            _immutable_mismatch()
     return tuple(validated)
 
 
 def _find_existing_matching_decision(
     *,
-    chain: Sequence[_ValidatedDecisionChainEntry],
+    chain: Sequence[AuthenticatedConsistencyReviewDecisionChainEntry],
     request: _NormalizedRequest,
     source_consistency_application_id: uuid.UUID,
     source_consistency_candidate_id: uuid.UUID,
-) -> _ValidatedDecisionChainEntry | None:
+) -> AuthenticatedConsistencyReviewDecisionChainEntry | None:
     decision_no_by_id = {entry.decision.id: entry.decision.decision_no for entry in chain}
     if request.expected_current_decision_id is None:
         expected_decision_no = 1
@@ -679,7 +688,7 @@ def _build_write_plan(
     request: _NormalizedRequest,
     source_consistency_application_id: uuid.UUID,
     source_consistency_candidate_id: uuid.UUID,
-    chain: Sequence[_ValidatedDecisionChainEntry],
+    chain: Sequence[AuthenticatedConsistencyReviewDecisionChainEntry],
 ) -> _DecisionWritePlan:
     current_leaf = chain[-1].decision if chain else None
     expected_leaf_id = None if current_leaf is None else current_leaf.id
@@ -723,7 +732,7 @@ async def _load_validated_chain_in_session(
     authenticated_context,
     authoritative_assessment,
     authoritative_members: Sequence[ConsistencyReviewCandidateMemberRecord],
-) -> tuple[_ValidatedDecisionChainEntry, ...]:
+) -> tuple[AuthenticatedConsistencyReviewDecisionChainEntry, ...]:
     current_application = await consistency_review_repository.get_consistency_check_application_by_id(
         session,
         consistency_check_application_id=request.consistency_check_application_id,
@@ -765,10 +774,12 @@ async def _load_validated_chain_in_session(
         session,
         assessment_id=request.assessment_id,
     )
-    return _validate_existing_chain(
+    return authenticate_consistency_review_decision_chain(
         decisions=decisions,
         selections=selections,
-        request=request,
+        project_id=request.project_id,
+        consistency_check_application_id=request.consistency_check_application_id,
+        assessment_id=request.assessment_id,
         source_consistency_application_id=authoritative_assessment.source_consistency_application_id,
         source_consistency_candidate_id=authoritative_assessment.source_consistency_candidate_id,
         candidate_members=current_members,

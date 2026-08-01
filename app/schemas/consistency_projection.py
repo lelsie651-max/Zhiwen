@@ -2,10 +2,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 
-ConsistencyReviewStatus = Literal["pending_review", "not_required"]
+ConsistencyReviewStatus = Literal[
+    "pending_review",
+    "not_required",
+    "reviewed",
+    "deferred",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ConsistencyReviewProjectionDecision:
+    decision_id: uuid.UUID
+    decision_no: int
+    supersedes_decision_id: uuid.UUID | None
+    actor_id: uuid.UUID
+    decision_kind: str
+    selected_fact_value_ids: tuple[uuid.UUID, ...]
+    comment: str | None
+    decision_manifest_hash: str
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,11 +52,14 @@ class ConsistencyReviewProjectionMember:
     value_json: Any | None
     normalized_value_text: str | None
     referenced_entity_id: uuid.UUID | None
+    selected_by_current_decision: bool
+    current_selection_order: int | None
     evidences: tuple[ConsistencyReviewProjectionEvidence, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class ConsistencyReviewProjectionItem:
+    assessment_id: uuid.UUID
     candidate_id: uuid.UUID
     batch_index: int
     verdict: str
@@ -47,6 +69,9 @@ class ConsistencyReviewProjectionItem:
     impact: tuple[str, ...]
     recommended_actions: tuple[str, ...]
     review_status: ConsistencyReviewStatus
+    current_decision: ConsistencyReviewProjectionDecision | None
+    decision_history: tuple[ConsistencyReviewProjectionDecision, ...]
+    selected_fact_value_ids: tuple[uuid.UUID, ...]
     members: tuple[ConsistencyReviewProjectionMember, ...]
 
 
@@ -63,4 +88,9 @@ class ConsistencyReviewProjection:
     insufficient_evidence_count: int
     red_count: int
     yellow_count: int
+    pending_review_count: int
+    reviewed_count: int
+    deferred_count: int
+    not_required_count: int
+    decision_count: int
     items: tuple[ConsistencyReviewProjectionItem, ...]

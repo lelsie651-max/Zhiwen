@@ -7,11 +7,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.consistency_projection import (
     ConsistencyReviewProjection,
+    ConsistencyReviewProjectionDecision,
     ConsistencyReviewProjectionEvidence,
     ConsistencyReviewProjectionItem,
     ConsistencyReviewProjectionMember,
 )
+from app.schemas.consistency_review import (
+    AuthenticatedConsistencyReviewDecisionChainEntry,
+    ConsistencyReviewCandidateMemberRecord,
+)
+from app.repositories import consistency_review as consistency_review_repository
 from app.services import consistency_check_persistence as persistence_service
+from app.services import consistency_review as review_service
 
 
 class ConsistencyProjectionError(Exception):
@@ -59,6 +66,18 @@ def _review_status_for_verdict(verdict: str) -> str:
     return "pending_review"
 
 
+def _review_status_for_item(
+    *,
+    verdict: str,
+    current_decision: ConsistencyReviewProjectionDecision | None,
+) -> str:
+    if current_decision is not None:
+        if current_decision.decision_kind == "defer":
+            return "deferred"
+        return "reviewed"
+    return _review_status_for_verdict(verdict)
+
+
 def _build_unique_map(
     records,
     *,
@@ -104,6 +123,165 @@ def _require_uuid_field(value: object) -> uuid.UUID:
     return value
 
 
+def _build_decision_projection(
+    entry: AuthenticatedConsistencyReviewDecisionChainEntry,
+) -> ConsistencyReviewProjectionDecision:
+    decision = entry.decision
+    return ConsistencyReviewProjectionDecision(
+        decision_id=decision.id,
+        decision_no=decision.decision_no,
+        supersedes_decision_id=decision.supersedes_decision_id,
+        actor_id=decision.actor_id,
+        decision_kind=decision.decision_kind,
+        selected_fact_value_ids=entry.selected_fact_value_ids,
+        comment=decision.comment,
+        decision_manifest_hash=decision.decision_manifest_hash,
+        created_at=decision.created_at,
+    )
+
+
+def _raise_projection_immutable_mismatch() -> None:
+    raise ConsistencyProjectionInvariantError(
+        "consistency_review_projection_immutable_ledger_mismatch"
+    )
+
+
+async def _load_authenticated_decision_chains(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    authenticated,
+) -> dict[uuid.UUID, tuple[AuthenticatedConsistencyReviewDecisionChainEntry, ...]]:
+    candidate_members_by_candidate_id: dict[
+        uuid.UUID, tuple[ConsistencyReviewCandidateMemberRecord, ...]
+    ] = {
+        candidate.candidate_id: tuple(
+            ConsistencyReviewCandidateMemberRecord(
+                consistency_application_id=authenticated.application.consistency_application_id,
+                candidate_id=candidate.candidate_id,
+                fact_value_id=member.fact_value_id,
+                source_batch_id=member.source_batch_id,
+                semantic_key_hash=member.semantic_key_hash,
+            )
+            for member in candidate.members
+        )
+        for candidate in authenticated.candidate_bundles
+    }
+    assessments_by_id = _build_unique_map(
+        authenticated.assessments,
+        key_builder=lambda assessment: assessment.id,
+    )
+    assessment_by_candidate_id = _build_unique_map(
+        authenticated.assessments,
+        key_builder=lambda assessment: assessment.source_consistency_candidate_id,
+    )
+    async with session_factory() as read_session:
+        try:
+            decisions = await consistency_review_repository.list_decision_ledgers_by_application(
+                read_session,
+                consistency_check_application_id=authenticated.application.id,
+            )
+            selections = await consistency_review_repository.list_selection_ledgers_by_application(
+                read_session,
+                consistency_check_application_id=authenticated.application.id,
+            )
+        except BaseException:
+            await read_session.rollback()
+            raise
+        else:
+            await read_session.rollback()
+
+    decisions_by_assessment: dict[uuid.UUID, list[object]] = {}
+    for decision in decisions:
+        assessment = assessments_by_id.get(decision.assessment_id)
+        if assessment is None:
+            raise ConsistencyProjectionInvariantError(
+                "consistency_review_projection_immutable_ledger_mismatch"
+            )
+        if decision.consistency_check_application_id != authenticated.application.id:
+            raise ConsistencyProjectionInvariantError(
+                "consistency_review_projection_immutable_ledger_mismatch"
+            )
+        if decision.source_consistency_application_id != authenticated.application.consistency_application_id:
+            raise ConsistencyProjectionInvariantError(
+                "consistency_review_projection_immutable_ledger_mismatch"
+            )
+        if (
+            decision.source_consistency_candidate_id
+            != assessment.source_consistency_candidate_id
+        ):
+            raise ConsistencyProjectionInvariantError(
+                "consistency_review_projection_immutable_ledger_mismatch"
+            )
+        decisions_by_assessment.setdefault(decision.assessment_id, []).append(decision)
+
+    selections_by_assessment: dict[uuid.UUID, list[object]] = {}
+    for selection in selections:
+        assessment = assessments_by_id.get(selection.assessment_id)
+        if assessment is None:
+            raise ConsistencyProjectionInvariantError(
+                "consistency_review_projection_immutable_ledger_mismatch"
+            )
+        if (
+            selection.source_consistency_application_id
+            != authenticated.application.consistency_application_id
+        ):
+            raise ConsistencyProjectionInvariantError(
+                "consistency_review_projection_immutable_ledger_mismatch"
+            )
+        if (
+            selection.source_consistency_candidate_id
+            != assessment.source_consistency_candidate_id
+        ):
+            raise ConsistencyProjectionInvariantError(
+                "consistency_review_projection_immutable_ledger_mismatch"
+            )
+        selections_by_assessment.setdefault(selection.assessment_id, []).append(selection)
+
+    authenticated_chains: dict[
+        uuid.UUID, tuple[AuthenticatedConsistencyReviewDecisionChainEntry, ...]
+    ] = {}
+    for assessment in authenticated.assessments:
+        candidate_members = candidate_members_by_candidate_id.get(
+            assessment.source_consistency_candidate_id
+        )
+        authoritative_assessment = assessment_by_candidate_id.get(
+            assessment.source_consistency_candidate_id
+        )
+        if candidate_members is None or authoritative_assessment is None:
+            _raise_projection_immutable_mismatch()
+        try:
+            authenticated_chains[assessment.id] = (
+                review_service.authenticate_consistency_review_decision_chain(
+                    decisions=tuple(decisions_by_assessment.get(assessment.id, ())),
+                    selections=tuple(selections_by_assessment.get(assessment.id, ())),
+                    project_id=authenticated.application.project_id,
+                    consistency_check_application_id=authenticated.application.id,
+                    assessment_id=assessment.id,
+                    source_consistency_application_id=assessment.source_consistency_application_id,
+                    source_consistency_candidate_id=assessment.source_consistency_candidate_id,
+                    candidate_members=candidate_members,
+                )
+            )
+        except (
+            review_service.ConsistencyReviewInvariantError,
+            review_service.ConsistencyReviewStateError,
+        ):
+            _raise_projection_immutable_mismatch()
+    if len(decisions) != sum(len(chain) for chain in authenticated_chains.values()):
+        raise ConsistencyProjectionInvariantError(
+            "consistency_review_projection_immutable_ledger_mismatch"
+        )
+    if len(selections) != sum(
+        len(entry.selected_fact_value_ids)
+        for chain in authenticated_chains.values()
+        for entry in chain
+    ):
+        raise ConsistencyProjectionInvariantError(
+            "consistency_review_projection_immutable_ledger_mismatch"
+        )
+    return authenticated_chains
+
+
 async def get_consistency_review_projection(
     session_factory: Callable[[], AsyncSession],
     *,
@@ -132,6 +310,10 @@ async def get_consistency_review_projection(
         authenticated.assessments,
         key_builder=lambda assessment: assessment.source_consistency_candidate_id,
     )
+    authenticated_decision_chains = await _load_authenticated_decision_chains(
+        session_factory,
+        authenticated=authenticated,
+    )
     source_row_by_fact_value_id = _build_representative_map(
         authenticated.source_rows,
         key_builder=lambda row: row.member_fact_value_id,
@@ -156,6 +338,29 @@ async def get_consistency_review_projection(
             assessment = assessment_by_candidate_id.get(candidate.candidate_id)
             if assessment is None or assessment.batch_index != batch_index:
                 continue
+            decision_chain = authenticated_decision_chains.get(assessment.id, ())
+            decision_history = tuple(
+                _build_decision_projection(entry) for entry in decision_chain
+            )
+            current_decision = (
+                decision_history[-1] if decision_history else None
+            )
+            current_selection_order_by_fact_value_id = (
+                {
+                    fact_value_id: selection_order
+                    for selection_order, fact_value_id in enumerate(
+                        current_decision.selected_fact_value_ids
+                    )
+                }
+                if current_decision is not None
+                else {}
+            )
+            selected_fact_value_ids = (
+                current_decision.selected_fact_value_ids
+                if current_decision is not None
+                and current_decision.decision_kind in {"select_one", "keep_multiple"}
+                else ()
+            )
             cited_evidence_ids = citations_by_assessment_id.get(assessment.id, set())
             members = tuple(
                 ConsistencyReviewProjectionMember(
@@ -167,6 +372,11 @@ async def get_consistency_review_projection(
                         key=member.fact_value_id,
                     ).fact_value_normalized_value_text,
                     referenced_entity_id=member.referenced_entity_id,
+                    selected_by_current_decision=member.fact_value_id
+                    in current_selection_order_by_fact_value_id,
+                    current_selection_order=current_selection_order_by_fact_value_id.get(
+                        member.fact_value_id
+                    ),
                     evidences=tuple(
                         ConsistencyReviewProjectionEvidence(
                             evidence_link_id=evidence.evidence_link_id,
@@ -196,6 +406,7 @@ async def get_consistency_review_projection(
             )
             items.append(
                 ConsistencyReviewProjectionItem(
+                    assessment_id=assessment.id,
                     candidate_id=candidate.candidate_id,
                     batch_index=assessment.batch_index,
                     verdict=assessment.verdict,
@@ -204,7 +415,13 @@ async def get_consistency_review_projection(
                     explanation=assessment.explanation,
                     impact=assessment.impact_json,
                     recommended_actions=assessment.recommended_actions_json,
-                    review_status=_review_status_for_verdict(assessment.verdict),
+                    review_status=_review_status_for_item(
+                        verdict=assessment.verdict,
+                        current_decision=current_decision,
+                    ),
+                    current_decision=current_decision,
+                    decision_history=decision_history,
+                    selected_fact_value_ids=selected_fact_value_ids,
                     members=members,
                 )
             )
@@ -221,6 +438,15 @@ async def get_consistency_review_projection(
     )
     red_count = sum(1 for item in items if item.severity == "red")
     yellow_count = sum(1 for item in items if item.severity == "yellow")
+    pending_review_count = sum(
+        1 for item in items if item.review_status == "pending_review"
+    )
+    reviewed_count = sum(1 for item in items if item.review_status == "reviewed")
+    deferred_count = sum(1 for item in items if item.review_status == "deferred")
+    not_required_count = sum(
+        1 for item in items if item.review_status == "not_required"
+    )
+    decision_count = sum(len(item.decision_history) for item in items)
     return ConsistencyReviewProjection(
         project_id=application.project_id,
         consistency_check_application_id=application.id,
@@ -233,5 +459,10 @@ async def get_consistency_review_projection(
         insufficient_evidence_count=insufficient_evidence_count,
         red_count=red_count,
         yellow_count=yellow_count,
+        pending_review_count=pending_review_count,
+        reviewed_count=reviewed_count,
+        deferred_count=deferred_count,
+        not_required_count=not_required_count,
+        decision_count=decision_count,
         items=tuple(items),
     )

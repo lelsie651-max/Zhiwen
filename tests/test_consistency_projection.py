@@ -32,6 +32,7 @@ from app.repositories.consistency_projection import (
 from app.services import consistency_check as consistency_check_service
 from app.services import consistency_check_execution as execution_service
 from app.services import consistency_projection as projection_service
+from app.services import consistency_review as review_service
 from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
 
 
@@ -104,6 +105,100 @@ def _assessment_hash(
             execution_service._assessment_manifest_payload(assessment)
         ),
     )
+
+
+def _decision_manifest(
+    *,
+    project_id: uuid.UUID,
+    application_id: uuid.UUID,
+    assessment_id: uuid.UUID,
+    source_application_id: uuid.UUID,
+    source_candidate_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    decision_no: int,
+    supersedes_decision_id: uuid.UUID | None,
+    decision_kind: str,
+    comment: str | None,
+    selected_fact_value_ids: tuple[uuid.UUID, ...],
+) -> str:
+    return review_service._build_decision_manifest_hash(
+        project_id=project_id,
+        consistency_check_application_id=application_id,
+        assessment_id=assessment_id,
+        source_consistency_application_id=source_application_id,
+        source_consistency_candidate_id=source_candidate_id,
+        actor_id=actor_id,
+        decision_no=decision_no,
+        supersedes_decision_id=supersedes_decision_id,
+        decision_kind=decision_kind,
+        comment=comment,
+        selected_fact_value_ids=selected_fact_value_ids,
+    )
+
+
+def _decision_record(
+    *,
+    decision_id: uuid.UUID,
+    project_id: uuid.UUID,
+    application_id: uuid.UUID,
+    assessment_id: uuid.UUID,
+    source_application_id: uuid.UUID,
+    source_candidate_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    decision_no: int,
+    supersedes_decision_id: uuid.UUID | None,
+    decision_kind: str,
+    comment: str | None,
+    selected_fact_value_ids: tuple[uuid.UUID, ...],
+    created_at: datetime,
+):
+    from app.schemas.consistency_review import (
+        ConsistencyReviewDecisionLedgerRecord,
+        ConsistencyReviewDecisionSelectionLedgerRecord,
+    )
+
+    decision = ConsistencyReviewDecisionLedgerRecord(
+        id=decision_id,
+        project_id=project_id,
+        consistency_check_application_id=application_id,
+        assessment_id=assessment_id,
+        source_consistency_application_id=source_application_id,
+        source_consistency_candidate_id=source_candidate_id,
+        actor_id=actor_id,
+        decision_no=decision_no,
+        supersedes_decision_id=supersedes_decision_id,
+        decision_kind=decision_kind,
+        selected_value_count=len(selected_fact_value_ids),
+        comment=comment,
+        decision_manifest_hash=_decision_manifest(
+            project_id=project_id,
+            application_id=application_id,
+            assessment_id=assessment_id,
+            source_application_id=source_application_id,
+            source_candidate_id=source_candidate_id,
+            actor_id=actor_id,
+            decision_no=decision_no,
+            supersedes_decision_id=supersedes_decision_id,
+            decision_kind=decision_kind,
+            comment=comment,
+            selected_fact_value_ids=selected_fact_value_ids,
+        ),
+        created_at=created_at,
+    )
+    selections = tuple(
+        ConsistencyReviewDecisionSelectionLedgerRecord(
+            id=_uuid(f"{decision_id}-selection-{selection_order}"),
+            decision_id=decision_id,
+            assessment_id=assessment_id,
+            source_consistency_application_id=source_application_id,
+            source_consistency_candidate_id=source_candidate_id,
+            fact_value_id=fact_value_id,
+            selection_order=selection_order,
+            created_at=created_at,
+        )
+        for selection_order, fact_value_id in enumerate(selected_fact_value_ids)
+    )
+    return decision, selections
 
 
 def _source_row(
@@ -685,7 +780,23 @@ def _build_projection_fixture():
         citations=citations,
         source_rows=source_rows,
     )
-    return snapshot, authenticated_source
+    return snapshot, authenticated_source, {
+        "project_id": project_id,
+        "application_id": app_id,
+        "source_application_id": source_app_id,
+        "assessment_a_id": _uuid("assessment-a"),
+        "assessment_b_id": _uuid("assessment-b"),
+        "assessment_c_id": _uuid("assessment-c"),
+        "candidate_a_id": candidate_a,
+        "candidate_b_id": candidate_b,
+        "candidate_c_id": candidate_c,
+        "fv_a1": fv_a1,
+        "fv_a2": fv_a2,
+        "fv_b1": fv_b1,
+        "fv_c1": fv_c1,
+        "actor_id": _uuid("review-actor"),
+        "created_at": created_at,
+    }
 
 
 def _install_snapshot_monkeypatches(
@@ -693,6 +804,9 @@ def _install_snapshot_monkeypatches(
     *,
     snapshot: ConsistencyProjectionSnapshot | None,
     authenticated_source,
+    decisions=(),
+    selections=(),
+    call_log: list[tuple[str, uuid.UUID]] | None = None,
 ) -> None:
     async def fake_load_snapshot(_session, *, consistency_check_application_id):
         if snapshot is None or consistency_check_application_id != snapshot.application.id:
@@ -704,6 +818,23 @@ def _install_snapshot_monkeypatches(
         assert consistency_application_id == snapshot.application.consistency_application_id
         return authenticated_source
 
+    async def fake_list_decisions_by_application(_session, *, consistency_check_application_id):
+        if call_log is not None:
+            call_log.append(("decisions", consistency_check_application_id))
+        assert snapshot is not None
+        assert consistency_check_application_id == snapshot.application.id
+        return tuple(decisions)
+
+    async def fake_list_selections_by_application(_session, *, consistency_check_application_id):
+        if call_log is not None:
+            call_log.append(("selections", consistency_check_application_id))
+        assert snapshot is not None
+        assert consistency_check_application_id == snapshot.application.id
+        return tuple(selections)
+
+    async def _unexpected_per_assessment(*args, **kwargs):
+        raise AssertionError("per-assessment decision query should not be used")
+
     monkeypatch.setattr(
         projection_service.persistence_service.consistency_projection_repository,
         "load_consistency_projection_snapshot",
@@ -714,12 +845,32 @@ def _install_snapshot_monkeypatches(
         "authenticate_fact_value_consistency_candidate_application",
         fake_authenticate_source,
     )
+    monkeypatch.setattr(
+        projection_service.consistency_review_repository,
+        "list_decision_ledgers_by_application",
+        fake_list_decisions_by_application,
+    )
+    monkeypatch.setattr(
+        projection_service.consistency_review_repository,
+        "list_selection_ledgers_by_application",
+        fake_list_selections_by_application,
+    )
+    monkeypatch.setattr(
+        projection_service.consistency_review_repository,
+        "list_decision_ledgers",
+        _unexpected_per_assessment,
+    )
+    monkeypatch.setattr(
+        projection_service.consistency_review_repository,
+        "list_selection_ledgers",
+        _unexpected_per_assessment,
+    )
 
 
 def test_get_consistency_review_projection_builds_complete_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot, authenticated_source = _build_projection_fixture()
+    snapshot, authenticated_source, fixture_ids = _build_projection_fixture()
     session_factory = SessionFactory()
     _install_snapshot_monkeypatches(
         monkeypatch,
@@ -746,13 +897,22 @@ def test_get_consistency_review_projection_builds_complete_projection(
     assert result.insufficient_evidence_count == 1
     assert result.red_count == 1
     assert result.yellow_count == 0
+    assert result.pending_review_count == 2
+    assert result.reviewed_count == 0
+    assert result.deferred_count == 0
+    assert result.not_required_count == 1
+    assert result.decision_count == 0
     assert [item.candidate_id for item in result.items] == [
         _uuid("candidate-a"),
         _uuid("candidate-b"),
         _uuid("candidate-c"),
     ]
     first = result.items[0]
+    assert first.assessment_id == fixture_ids["assessment_a_id"]
     assert first.review_status == "pending_review"
+    assert first.current_decision is None
+    assert first.decision_history == ()
+    assert first.selected_fact_value_ids == ()
     assert [member.fact_value_id for member in first.members] == [_uuid("fv-a1"), _uuid("fv-a2")]
     assert [e.evidence_link_id for e in first.members[0].evidences] == [
         _uuid("evlink-a1-0"),
@@ -760,12 +920,235 @@ def test_get_consistency_review_projection_builds_complete_projection(
     ]
     assert first.members[0].evidences[0].cited_by_assessment is True
     assert first.members[0].evidences[1].cited_by_assessment is False
+    assert first.members[0].selected_by_current_decision is False
+    assert first.members[0].current_selection_order is None
     assert first.members[1].value_type == "object"
     assert result.items[1].review_status == "not_required"
     assert result.items[1].members[0].referenced_entity_id == _uuid("entity-ref")
     assert result.items[2].review_status == "pending_review"
     assert result.items[2].members[0].evidences[0].document_revision_id == _uuid("revision-c")
     assert all(session.commit_count == 0 for session in session_factory.sessions)
+
+
+@pytest.mark.parametrize(
+    ("decision_kind", "selected_fact_value_ids", "expected_status", "expected_selected_ids"),
+    [
+        ("select_one", ("fv-a2",), "reviewed", (_uuid("fv-a2"),)),
+        ("keep_multiple", ("fv-a2", "fv-a1"), "reviewed", (_uuid("fv-a2"), _uuid("fv-a1"))),
+        ("confirm_compatible", (), "reviewed", ()),
+        ("defer", (), "deferred", ()),
+    ],
+)
+def test_get_consistency_review_projection_maps_leaf_decision_state_and_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    decision_kind: str,
+    selected_fact_value_ids: tuple[str, ...],
+    expected_status: str,
+    expected_selected_ids: tuple[uuid.UUID, ...],
+) -> None:
+    snapshot, authenticated_source, fixture_ids = _build_projection_fixture()
+    decision, selections = _decision_record(
+        decision_id=_uuid(f"{decision_kind}-decision"),
+        project_id=fixture_ids["project_id"],
+        application_id=fixture_ids["application_id"],
+        assessment_id=fixture_ids["assessment_a_id"],
+        source_application_id=fixture_ids["source_application_id"],
+        source_candidate_id=fixture_ids["candidate_a_id"],
+        actor_id=fixture_ids["actor_id"],
+        decision_no=1,
+        supersedes_decision_id=None,
+        decision_kind=decision_kind,
+        comment="manual review" if decision_kind == "select_one" else None,
+        selected_fact_value_ids=tuple(_uuid(seed) for seed in selected_fact_value_ids),
+        created_at=fixture_ids["created_at"],
+    )
+    _install_snapshot_monkeypatches(
+        monkeypatch,
+        snapshot=snapshot,
+        authenticated_source=authenticated_source,
+        decisions=(decision,),
+        selections=selections,
+    )
+
+    result = run_async(
+        projection_service.get_consistency_review_projection(
+            SessionFactory(),
+            project_id=snapshot.application.project_id,
+            consistency_check_application_id=snapshot.application.id,
+        )
+    )
+
+    item = result.items[0]
+    assert item.review_status == expected_status
+    assert item.current_decision is not None
+    assert item.current_decision.decision_kind == decision_kind
+    assert item.selected_fact_value_ids == expected_selected_ids
+    assert [entry.decision_no for entry in item.decision_history] == [1]
+    selection_map = {
+        member.fact_value_id: (
+            member.selected_by_current_decision,
+            member.current_selection_order,
+        )
+        for member in item.members
+    }
+    if decision_kind == "select_one":
+        assert selection_map[fixture_ids["fv_a2"]] == (True, 0)
+        assert selection_map[fixture_ids["fv_a1"]] == (False, None)
+    elif decision_kind == "keep_multiple":
+        assert selection_map[fixture_ids["fv_a2"]] == (True, 0)
+        assert selection_map[fixture_ids["fv_a1"]] == (True, 1)
+    else:
+        assert selection_map[fixture_ids["fv_a2"]] == (False, None)
+        assert selection_map[fixture_ids["fv_a1"]] == (False, None)
+
+
+def test_get_consistency_review_projection_exposes_current_leaf_and_ordered_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, authenticated_source, fixture_ids = _build_projection_fixture()
+    first_decision, first_selections = _decision_record(
+        decision_id=_uuid("decision-first"),
+        project_id=fixture_ids["project_id"],
+        application_id=fixture_ids["application_id"],
+        assessment_id=fixture_ids["assessment_a_id"],
+        source_application_id=fixture_ids["source_application_id"],
+        source_candidate_id=fixture_ids["candidate_a_id"],
+        actor_id=fixture_ids["actor_id"],
+        decision_no=1,
+        supersedes_decision_id=None,
+        decision_kind="select_one",
+        comment="first",
+        selected_fact_value_ids=(fixture_ids["fv_a1"],),
+        created_at=fixture_ids["created_at"],
+    )
+    second_decision, second_selections = _decision_record(
+        decision_id=_uuid("decision-second"),
+        project_id=fixture_ids["project_id"],
+        application_id=fixture_ids["application_id"],
+        assessment_id=fixture_ids["assessment_a_id"],
+        source_application_id=fixture_ids["source_application_id"],
+        source_candidate_id=fixture_ids["candidate_a_id"],
+        actor_id=fixture_ids["actor_id"],
+        decision_no=2,
+        supersedes_decision_id=first_decision.id,
+        decision_kind="keep_multiple",
+        comment="second",
+        selected_fact_value_ids=(fixture_ids["fv_a2"], fixture_ids["fv_a1"]),
+        created_at=fixture_ids["created_at"],
+    )
+    _install_snapshot_monkeypatches(
+        monkeypatch,
+        snapshot=snapshot,
+        authenticated_source=authenticated_source,
+        decisions=(first_decision, second_decision),
+        selections=first_selections + second_selections,
+    )
+
+    result = run_async(
+        projection_service.get_consistency_review_projection(
+            SessionFactory(),
+            project_id=snapshot.application.project_id,
+            consistency_check_application_id=snapshot.application.id,
+        )
+    )
+
+    item = result.items[0]
+    assert item.review_status == "reviewed"
+    assert [entry.decision_no for entry in item.decision_history] == [1, 2]
+    assert item.current_decision is not None
+    assert item.current_decision.decision_id == second_decision.id
+    assert item.selected_fact_value_ids == (fixture_ids["fv_a2"], fixture_ids["fv_a1"])
+    assert result.reviewed_count == 1
+    assert result.decision_count == 2
+
+
+def test_get_consistency_review_projection_uses_batch_read_without_n_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, authenticated_source, fixture_ids = _build_projection_fixture()
+    decision, selections = _decision_record(
+        decision_id=_uuid("decision-batch-read"),
+        project_id=fixture_ids["project_id"],
+        application_id=fixture_ids["application_id"],
+        assessment_id=fixture_ids["assessment_a_id"],
+        source_application_id=fixture_ids["source_application_id"],
+        source_candidate_id=fixture_ids["candidate_a_id"],
+        actor_id=fixture_ids["actor_id"],
+        decision_no=1,
+        supersedes_decision_id=None,
+        decision_kind="select_one",
+        comment=None,
+        selected_fact_value_ids=(fixture_ids["fv_a1"],),
+        created_at=fixture_ids["created_at"],
+    )
+    call_log: list[tuple[str, uuid.UUID]] = []
+    _install_snapshot_monkeypatches(
+        monkeypatch,
+        snapshot=snapshot,
+        authenticated_source=authenticated_source,
+        decisions=(decision,),
+        selections=selections,
+        call_log=call_log,
+    )
+
+    run_async(
+        projection_service.get_consistency_review_projection(
+            SessionFactory(),
+            project_id=snapshot.application.project_id,
+            consistency_check_application_id=snapshot.application.id,
+        )
+    )
+
+    assert call_log == [
+        ("decisions", snapshot.application.id),
+        ("selections", snapshot.application.id),
+    ]
+
+
+def test_get_consistency_review_projection_is_deterministic_across_repeated_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, authenticated_source, fixture_ids = _build_projection_fixture()
+    decision, selections = _decision_record(
+        decision_id=_uuid("repeat-decision"),
+        project_id=fixture_ids["project_id"],
+        application_id=fixture_ids["application_id"],
+        assessment_id=fixture_ids["assessment_a_id"],
+        source_application_id=fixture_ids["source_application_id"],
+        source_candidate_id=fixture_ids["candidate_a_id"],
+        actor_id=fixture_ids["actor_id"],
+        decision_no=1,
+        supersedes_decision_id=None,
+        decision_kind="select_one",
+        comment="repeatable",
+        selected_fact_value_ids=(fixture_ids["fv_a1"],),
+        created_at=fixture_ids["created_at"],
+    )
+    _install_snapshot_monkeypatches(
+        monkeypatch,
+        snapshot=snapshot,
+        authenticated_source=authenticated_source,
+        decisions=(decision,),
+        selections=selections,
+    )
+    session_factory = SessionFactory()
+
+    first = run_async(
+        projection_service.get_consistency_review_projection(
+            session_factory,
+            project_id=snapshot.application.project_id,
+            consistency_check_application_id=snapshot.application.id,
+        )
+    )
+    second = run_async(
+        projection_service.get_consistency_review_projection(
+            session_factory,
+            project_id=snapshot.application.project_id,
+            consistency_check_application_id=snapshot.application.id,
+        )
+    )
+
+    assert first == second
 
 
 def test_get_consistency_review_projection_rejects_unknown_application(
@@ -794,7 +1177,7 @@ def test_get_consistency_review_projection_rejects_unknown_application(
 def test_get_consistency_review_projection_rejects_project_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot, authenticated_source = _build_projection_fixture()
+    snapshot, authenticated_source, _fixture_ids = _build_projection_fixture()
     session_factory = SessionFactory()
     _install_snapshot_monkeypatches(
         monkeypatch,
@@ -818,8 +1201,8 @@ def test_get_consistency_review_projection_rejects_project_mismatch(
 def test_get_consistency_review_projection_reads_exact_application_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot, authenticated_source = _build_projection_fixture()
-    other_snapshot, _ = _build_projection_fixture()
+    snapshot, authenticated_source, _fixture_ids = _build_projection_fixture()
+    other_snapshot, _, _ = _build_projection_fixture()
     requested_ids: list[uuid.UUID] = []
 
     async def fake_load_snapshot(_session, *, consistency_check_application_id):
@@ -832,6 +1215,14 @@ def test_get_consistency_review_projection_reads_exact_application_id(
         assert consistency_application_id == snapshot.application.consistency_application_id
         return authenticated_source
 
+    async def fake_list_decisions_by_application(_session, *, consistency_check_application_id):
+        assert consistency_check_application_id == snapshot.application.id
+        return ()
+
+    async def fake_list_selections_by_application(_session, *, consistency_check_application_id):
+        assert consistency_check_application_id == snapshot.application.id
+        return ()
+
     monkeypatch.setattr(
         projection_service.persistence_service.consistency_projection_repository,
         "load_consistency_projection_snapshot",
@@ -841,6 +1232,16 @@ def test_get_consistency_review_projection_reads_exact_application_id(
         projection_service.persistence_service.duplicate_grouping_service,
         "authenticate_fact_value_consistency_candidate_application",
         fake_authenticate_source,
+    )
+    monkeypatch.setattr(
+        projection_service.consistency_review_repository,
+        "list_decision_ledgers_by_application",
+        fake_list_decisions_by_application,
+    )
+    monkeypatch.setattr(
+        projection_service.consistency_review_repository,
+        "list_selection_ledgers_by_application",
+        fake_list_selections_by_application,
     )
 
     result = run_async(
@@ -969,17 +1370,67 @@ def test_get_consistency_review_projection_zero_assessment_projection(
     assert result.conflict_count == 0
     assert result.compatible_count == 0
     assert result.insufficient_evidence_count == 0
+    assert result.pending_review_count == 0
+    assert result.reviewed_count == 0
+    assert result.deferred_count == 0
+    assert result.not_required_count == 0
+    assert result.decision_count == 0
 
 
 @pytest.mark.parametrize(
     "drift_kind",
-    ["assessment_missing", "assessment_extra", "assessment_hash", "result_hash", "citation_binding"],
+    [
+        "assessment_missing",
+        "assessment_extra",
+        "assessment_hash",
+        "result_hash",
+        "citation_binding",
+        "decision_gap",
+        "decision_wrong_predecessor",
+        "decision_manifest",
+        "selection_order",
+        "selection_orphan",
+        "decision_unknown_assessment",
+        "decision_cross_application",
+    ],
 )
 def test_get_consistency_review_projection_fails_closed_on_ledger_drift(
     monkeypatch: pytest.MonkeyPatch,
     drift_kind: str,
 ) -> None:
-    snapshot, authenticated_source = _build_projection_fixture()
+    snapshot, authenticated_source, fixture_ids = _build_projection_fixture()
+    first_decision, first_selections = _decision_record(
+        decision_id=_uuid("drift-first"),
+        project_id=fixture_ids["project_id"],
+        application_id=fixture_ids["application_id"],
+        assessment_id=fixture_ids["assessment_a_id"],
+        source_application_id=fixture_ids["source_application_id"],
+        source_candidate_id=fixture_ids["candidate_a_id"],
+        actor_id=fixture_ids["actor_id"],
+        decision_no=1,
+        supersedes_decision_id=None,
+        decision_kind="select_one",
+        comment=None,
+        selected_fact_value_ids=(fixture_ids["fv_a1"],),
+        created_at=fixture_ids["created_at"],
+    )
+    second_decision, second_selections = _decision_record(
+        decision_id=_uuid("drift-second"),
+        project_id=fixture_ids["project_id"],
+        application_id=fixture_ids["application_id"],
+        assessment_id=fixture_ids["assessment_a_id"],
+        source_application_id=fixture_ids["source_application_id"],
+        source_candidate_id=fixture_ids["candidate_a_id"],
+        actor_id=fixture_ids["actor_id"],
+        decision_no=2,
+        supersedes_decision_id=first_decision.id,
+        decision_kind="keep_multiple",
+        comment=None,
+        selected_fact_value_ids=(fixture_ids["fv_a2"], fixture_ids["fv_a1"]),
+        created_at=fixture_ids["created_at"],
+    )
+    decisions = [first_decision, second_decision]
+    selections = list(first_selections + second_selections)
     if drift_kind == "assessment_missing":
         snapshot = ConsistencyProjectionSnapshot(
             application=replace(snapshot.application, assessment_count=3),
@@ -1020,7 +1471,7 @@ def test_get_consistency_review_projection_fails_closed_on_ledger_drift(
             citations=snapshot.citations,
             source_rows=snapshot.source_rows,
         )
-    else:
+    elif drift_kind == "citation_binding":
         snapshot = ConsistencyProjectionSnapshot(
             application=snapshot.application,
             batches=snapshot.batches,
@@ -1031,10 +1482,41 @@ def test_get_consistency_review_projection_fails_closed_on_ledger_drift(
             ),
             source_rows=snapshot.source_rows,
         )
+    elif drift_kind == "decision_gap":
+        decisions[1] = replace(decisions[1], decision_no=3)
+    elif drift_kind == "decision_wrong_predecessor":
+        decisions[1] = replace(
+            decisions[1],
+            supersedes_decision_id=_uuid("wrong-predecessor"),
+        )
+    elif drift_kind == "decision_manifest":
+        decisions[0] = replace(decisions[0], decision_manifest_hash="0" * 64)
+    elif drift_kind == "selection_order":
+        selections[-1] = replace(selections[-1], selection_order=2)
+    elif drift_kind == "selection_orphan":
+        selections.append(
+            replace(
+                selections[0],
+                id=_uuid("orphan-selection"),
+                decision_id=_uuid("missing-decision"),
+            )
+        )
+    elif drift_kind == "decision_unknown_assessment":
+        decisions[0] = replace(
+            decisions[0],
+            assessment_id=_uuid("unknown-assessment"),
+        )
+    else:
+        decisions[0] = replace(
+            decisions[0],
+            consistency_check_application_id=_uuid("other-application"),
+        )
     _install_snapshot_monkeypatches(
         monkeypatch,
         snapshot=snapshot,
         authenticated_source=authenticated_source,
+        decisions=tuple(decisions),
+        selections=tuple(selections),
     )
 
     with pytest.raises(
@@ -1053,7 +1535,7 @@ def test_get_consistency_review_projection_fails_closed_on_ledger_drift(
 def test_get_consistency_review_projection_contract_is_shared_across_value_types(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot, authenticated_source = _build_projection_fixture()
+    snapshot, authenticated_source, _fixture_ids = _build_projection_fixture()
     _install_snapshot_monkeypatches(
         monkeypatch,
         snapshot=snapshot,
@@ -1086,7 +1568,7 @@ def test_get_consistency_review_projection_contract_is_shared_across_value_types
 def test_get_consistency_review_projection_does_not_leak_sensitive_sentinel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot, authenticated_source = _build_projection_fixture()
+    snapshot, authenticated_source, _fixture_ids = _build_projection_fixture()
     sentinel = "SENSITIVE_EXPLANATION_SENTINEL"
     snapshot = ConsistencyProjectionSnapshot(
         application=replace(snapshot.application, result_manifest_hash="0" * 64),

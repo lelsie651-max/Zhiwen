@@ -181,6 +181,45 @@ async def list_decision_ledgers(
     )
 
 
+async def list_decision_ledgers_by_application(
+    session: AsyncSession,
+    *,
+    consistency_check_application_id: uuid.UUID,
+) -> tuple[ConsistencyReviewDecisionLedgerRecord, ...]:
+    result = await session.execute(
+        select(ConsistencyReviewDecision)
+        .where(
+            ConsistencyReviewDecision.consistency_check_application_id
+            == consistency_check_application_id
+        )
+        .order_by(
+            ConsistencyReviewDecision.assessment_id.asc(),
+            ConsistencyReviewDecision.decision_no.asc(),
+            ConsistencyReviewDecision.id.asc(),
+        )
+    )
+    decisions = list(result.scalars().all())
+    return tuple(
+        ConsistencyReviewDecisionLedgerRecord(
+            id=decision.id,
+            project_id=decision.project_id,
+            consistency_check_application_id=decision.consistency_check_application_id,
+            assessment_id=decision.assessment_id,
+            source_consistency_application_id=decision.source_consistency_application_id,
+            source_consistency_candidate_id=decision.source_consistency_candidate_id,
+            actor_id=decision.actor_id,
+            decision_no=decision.decision_no,
+            supersedes_decision_id=decision.supersedes_decision_id,
+            decision_kind=decision.decision_kind,
+            selected_value_count=decision.selected_value_count,
+            comment=decision.comment,
+            decision_manifest_hash=decision.decision_manifest_hash,
+            created_at=decision.created_at,
+        )
+        for decision in decisions
+    )
+
+
 async def list_selection_ledgers(
     session: AsyncSession,
     *,
@@ -194,6 +233,44 @@ async def list_selection_ledgers(
         )
         .where(ConsistencyReviewDecisionSelection.assessment_id == assessment_id)
         .order_by(
+            ConsistencyReviewDecision.decision_no.asc(),
+            ConsistencyReviewDecisionSelection.selection_order.asc(),
+            ConsistencyReviewDecisionSelection.id.asc(),
+        )
+    )
+    selections = list(result.scalars().all())
+    return tuple(
+        ConsistencyReviewDecisionSelectionLedgerRecord(
+            id=selection.id,
+            decision_id=selection.decision_id,
+            assessment_id=selection.assessment_id,
+            source_consistency_application_id=selection.source_consistency_application_id,
+            source_consistency_candidate_id=selection.source_consistency_candidate_id,
+            fact_value_id=selection.fact_value_id,
+            selection_order=selection.selection_order,
+            created_at=selection.created_at,
+        )
+        for selection in selections
+    )
+
+
+async def list_selection_ledgers_by_application(
+    session: AsyncSession,
+    *,
+    consistency_check_application_id: uuid.UUID,
+) -> tuple[ConsistencyReviewDecisionSelectionLedgerRecord, ...]:
+    result = await session.execute(
+        select(ConsistencyReviewDecisionSelection)
+        .join(
+            ConsistencyReviewDecision,
+            ConsistencyReviewDecision.id == ConsistencyReviewDecisionSelection.decision_id,
+        )
+        .where(
+            ConsistencyReviewDecision.consistency_check_application_id
+            == consistency_check_application_id
+        )
+        .order_by(
+            ConsistencyReviewDecisionSelection.assessment_id.asc(),
             ConsistencyReviewDecision.decision_no.asc(),
             ConsistencyReviewDecisionSelection.selection_order.asc(),
             ConsistencyReviewDecisionSelection.id.asc(),
