@@ -362,6 +362,88 @@ def _build_authoritative_fixture():
     return plan, batch_results, execution_result, authenticated_source
 
 
+def _build_reverse_order_fixture():
+    project_id = uuid.uuid4()
+    consistency_application_id = uuid.uuid4()
+    orchestration_id = uuid.uuid4()
+    source_result_manifest_hash = "a" * 64
+    lower_candidate = _candidate_bundle(
+        candidate_id=uuid.UUID("00000000-0000-0000-0000-000000000101"),
+        fact_id=uuid.uuid4(),
+        fact_value_id=uuid.uuid4(),
+        evidence_link_ids=(uuid.UUID("00000000-0000-0000-0000-000000000201"),),
+    )
+    higher_candidate = _candidate_bundle(
+        candidate_id=uuid.UUID("00000000-0000-0000-0000-000000000102"),
+        fact_id=uuid.uuid4(),
+        fact_value_id=uuid.uuid4(),
+        evidence_link_ids=(
+            uuid.UUID("00000000-0000-0000-0000-000000000202"),
+            uuid.UUID("00000000-0000-0000-0000-000000000203"),
+        ),
+    )
+    plan = _build_plan(
+        project_id=project_id,
+        consistency_application_id=consistency_application_id,
+        source_result_manifest_hash=source_result_manifest_hash,
+        candidates=(higher_candidate, lower_candidate),
+    )
+    batch = plan.batches[0]
+    batch_result = ConsistencyCheckBatchExecutionResult(
+        project_id=plan.project_id,
+        consistency_application_id=plan.consistency_application_id,
+        source_result_manifest_hash=plan.source_result_manifest_hash,
+        plan_manifest_hash=plan.plan_manifest_hash,
+        batch_index=batch.batch_index,
+        batch_manifest_hash=batch.batch_manifest_hash,
+        input_batch_id=uuid.uuid4(),
+        inference_run_id=uuid.uuid5(uuid.NAMESPACE_URL, "run:reverse-order"),
+        request_hash="1" * 64,
+        message_content_hash="2" * 64,
+        skipped_empty=False,
+        reused_completed_run=True,
+        response=ConsistencyCheckResponse(
+            assessments=[
+                _assessment(
+                    candidate_id=higher_candidate.candidate_id,
+                    evidence_link_ids=(
+                        higher_candidate.members[0].evidences[1].evidence_link_id,
+                        higher_candidate.members[0].evidences[0].evidence_link_id,
+                    ),
+                ),
+                _assessment(
+                    candidate_id=lower_candidate.candidate_id,
+                    evidence_link_ids=(lower_candidate.members[0].evidences[0].evidence_link_id,),
+                ),
+            ]
+        ),
+        response_model="gpt-test",
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+    )
+    execution_result = _plan_execution_result(plan=plan, batch_results=(batch_result,))
+    authenticated_source = SimpleNamespace(
+        project_id=project_id,
+        application=FactValueConsistencyCandidateApplicationLedger(
+            id=consistency_application_id,
+            duplicate_grouping_application_id=uuid.uuid4(),
+            orchestration_id=orchestration_id,
+            extraction_run_id=uuid.uuid4(),
+            algorithm_version="cross_batch_multi_value_v1",
+            input_manifest_hash="c" * 64,
+            result_manifest_hash=source_result_manifest_hash,
+            candidate_count=2,
+            member_count=2,
+            created_at=datetime.now(timezone.utc),
+        ),
+        write_plan=SimpleNamespace(),
+        candidate_ledgers=(),
+        member_ledgers=(),
+    )
+    return plan, (batch_result,), execution_result, authenticated_source
+
+
 def _install_common_monkeypatches(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -369,6 +451,8 @@ def _install_common_monkeypatches(
     plan: ConsistencyCheckPlan,
     batch_results: tuple[ConsistencyCheckBatchExecutionResult, ...],
     authenticated_source,
+    expected_provider: str = "openai",
+    expected_requested_model: str = "gpt-4.1",
 ) -> None:
     async def fake_build_plan(_session_factory, *, consistency_application_id, config):
         assert consistency_application_id == plan.consistency_application_id
@@ -391,6 +475,8 @@ def _install_common_monkeypatches(
     ):
         assert authoritative_plan == plan
         assert prompt == PROMPT
+        assert provider == expected_provider
+        assert requested_model == expected_requested_model
         expected = batch_results[batch.batch_index]
         assert inference_run_id == expected.inference_run_id
         return expected
@@ -492,6 +578,10 @@ def _install_common_monkeypatches(
     async def fake_list_citations(_session, *, consistency_check_application_id):
         assert store.application is not None
         assert consistency_check_application_id == store.application.id
+        assessment_by_id = {
+            assessment.id: assessment
+            for assessment in store.assessments
+        }
         return tuple(
             ConsistencyAssessmentCitationLedgerRecord(
                 id=item.id,
@@ -506,10 +596,10 @@ def _install_common_monkeypatches(
             for item in sorted(
                 store.citations,
                 key=lambda value: (
-                    next(
-                        assessment.batch_index
-                        for assessment in store.assessments
-                        if assessment.id == value.assessment_id
+                    (
+                        -1
+                        if assessment_by_id.get(value.assessment_id) is None
+                        else assessment_by_id[value.assessment_id].batch_index
                     ),
                     str(value.source_consistency_candidate_id),
                     value.citation_order,
@@ -1013,3 +1103,327 @@ def test_persist_consistency_check_plan_result_rejects_execution_result_mismatch
                 requested_model="gpt-4.1",
             )
         )
+
+
+def test_persist_consistency_check_plan_result_is_idempotent_when_plan_order_differs_from_uuid_sort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, batch_results, execution_result, authenticated_source = _build_reverse_order_fixture()
+    store = LedgerStore()
+    session_factory = SessionFactory()
+    _install_common_monkeypatches(
+        monkeypatch,
+        store=store,
+        plan=plan,
+        batch_results=batch_results,
+        authenticated_source=authenticated_source,
+    )
+
+    first = run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider="openai",
+            requested_model="gpt-4.1",
+        )
+    )
+    second = run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider="openai",
+            requested_model="gpt-4.1",
+        )
+    )
+
+    assert first.created_new is True
+    assert second.created_new is False
+    assert second.consistency_check_application_id == first.consistency_check_application_id
+
+
+def test_persist_consistency_check_plan_result_handles_unique_conflict_with_reverse_uuid_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, batch_results, execution_result, authenticated_source = _build_reverse_order_fixture()
+    store = LedgerStore()
+    session_factory = SessionFactory()
+    _install_common_monkeypatches(
+        monkeypatch,
+        store=store,
+        plan=plan,
+        batch_results=batch_results,
+        authenticated_source=authenticated_source,
+    )
+
+    first = run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider="openai",
+            requested_model="gpt-4.1",
+        )
+    )
+
+    async def fake_get_for_update(_session, *, execution_identity_hash):
+        return None
+
+    async def fake_create_application(_session, application):
+        raise _make_integrity_error("uq_ccapp_exec_identity_hash")
+
+    monkeypatch.setattr(
+        persistence_service.consistency_check_repository,
+        "get_consistency_check_application_for_update",
+        fake_get_for_update,
+    )
+    monkeypatch.setattr(
+        persistence_service.consistency_check_repository,
+        "create_consistency_check_application",
+        fake_create_application,
+    )
+
+    second = run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider="openai",
+            requested_model="gpt-4.1",
+        )
+    )
+
+    assert second.created_new is False
+    assert second.consistency_check_application_id == first.consistency_check_application_id
+
+
+@pytest.mark.parametrize("drift_kind", ["missing", "extra", "duplicate"])
+def test_persist_consistency_check_plan_result_fails_closed_on_assessment_business_key_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    drift_kind: str,
+) -> None:
+    plan, batch_results, execution_result, authenticated_source = _build_authoritative_fixture()
+    store = LedgerStore()
+    session_factory = SessionFactory()
+    _install_common_monkeypatches(
+        monkeypatch,
+        store=store,
+        plan=plan,
+        batch_results=batch_results,
+        authenticated_source=authenticated_source,
+    )
+
+    run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider="openai",
+            requested_model="gpt-4.1",
+        )
+    )
+
+    if drift_kind == "missing":
+        store.assessments.pop()
+    elif drift_kind == "extra":
+        baseline = store.assessments[0]
+        store.assessments.append(
+            ConsistencyAssessmentLedger(
+                id=uuid.uuid4(),
+                consistency_check_application_id=baseline.consistency_check_application_id,
+                source_consistency_application_id=baseline.source_consistency_application_id,
+                source_consistency_candidate_id=uuid.uuid4(),
+                batch_index=baseline.batch_index,
+                verdict=baseline.verdict,
+                severity=baseline.severity,
+                confidence=baseline.confidence,
+                explanation=baseline.explanation,
+                impact_json=list(baseline.impact_json),
+                recommended_actions_json=list(baseline.recommended_actions_json),
+                assessment_manifest_hash=baseline.assessment_manifest_hash,
+            )
+        )
+    else:
+        baseline = store.assessments[0]
+        store.assessments.append(
+            ConsistencyAssessmentLedger(
+                id=uuid.uuid4(),
+                consistency_check_application_id=baseline.consistency_check_application_id,
+                source_consistency_application_id=baseline.source_consistency_application_id,
+                source_consistency_candidate_id=baseline.source_consistency_candidate_id,
+                batch_index=baseline.batch_index,
+                verdict=baseline.verdict,
+                severity=baseline.severity,
+                confidence=baseline.confidence,
+                explanation=baseline.explanation,
+                impact_json=list(baseline.impact_json),
+                recommended_actions_json=list(baseline.recommended_actions_json),
+                assessment_manifest_hash=baseline.assessment_manifest_hash,
+            )
+        )
+
+    with pytest.raises(
+        persistence_service.ConsistencyCheckPersistenceInvariantError,
+        match="consistency_check_persistence_immutable_ledger_mismatch",
+    ):
+        run_async(
+            persistence_service.persist_consistency_check_plan_result(
+                session_factory,
+                plan=plan,
+                execution_result=execution_result,
+                prompt=PROMPT,
+                provider="openai",
+                requested_model="gpt-4.1",
+            )
+        )
+
+
+@pytest.mark.parametrize("drift_kind", ["missing", "extra", "wrong_order", "wrong_binding"])
+def test_persist_consistency_check_plan_result_fails_closed_on_citation_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    drift_kind: str,
+) -> None:
+    plan, batch_results, execution_result, authenticated_source = _build_authoritative_fixture()
+    store = LedgerStore()
+    session_factory = SessionFactory()
+    _install_common_monkeypatches(
+        monkeypatch,
+        store=store,
+        plan=plan,
+        batch_results=batch_results,
+        authenticated_source=authenticated_source,
+    )
+
+    run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider="openai",
+            requested_model="gpt-4.1",
+        )
+    )
+
+    if drift_kind == "missing":
+        store.citations.pop()
+    elif drift_kind == "extra":
+        baseline = store.citations[0]
+        store.citations.append(
+            ConsistencyAssessmentCitation(
+                id=uuid.uuid4(),
+                assessment_id=baseline.assessment_id,
+                source_consistency_application_id=baseline.source_consistency_application_id,
+                source_consistency_candidate_id=baseline.source_consistency_candidate_id,
+                source_fact_value_id=baseline.source_fact_value_id,
+                evidence_link_id=uuid.uuid4(),
+                citation_order=99,
+            )
+        )
+    elif drift_kind == "wrong_order":
+        store.citations[0].citation_order = 99
+    else:
+        store.citations[0].source_fact_value_id = uuid.uuid4()
+
+    with pytest.raises(
+        persistence_service.ConsistencyCheckPersistenceInvariantError,
+        match="consistency_check_persistence_immutable_ledger_mismatch",
+    ):
+        run_async(
+            persistence_service.persist_consistency_check_plan_result(
+                session_factory,
+                plan=plan,
+                execution_result=execution_result,
+                prompt=PROMPT,
+                provider="openai",
+                requested_model="gpt-4.1",
+            )
+        )
+
+
+def test_persist_consistency_check_plan_result_normalizes_execution_identity_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, batch_results, execution_result, authenticated_source = _build_authoritative_fixture()
+    store = LedgerStore()
+    session_factory = SessionFactory()
+    _install_common_monkeypatches(
+        monkeypatch,
+        store=store,
+        plan=plan,
+        batch_results=batch_results,
+        authenticated_source=authenticated_source,
+        expected_provider="openai",
+        expected_requested_model="gpt-4.1",
+    )
+
+    first = run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider=" openai ",
+            requested_model=" gpt-4.1 ",
+        )
+    )
+    second = run_async(
+        persistence_service.persist_consistency_check_plan_result(
+            session_factory,
+            plan=plan,
+            execution_result=execution_result,
+            prompt=PROMPT,
+            provider="openai",
+            requested_model="gpt-4.1",
+        )
+    )
+
+    assert store.application is not None
+    assert store.application.provider == "openai"
+    assert store.application.requested_model == "gpt-4.1"
+    assert second.consistency_check_application_id == first.consistency_check_application_id
+    assert second.created_new is False
+
+
+@pytest.mark.parametrize(
+    ("provider", "requested_model"),
+    [
+        ("   ", "gpt-4.1"),
+        ("openai", "   "),
+        (None, "gpt-4.1"),
+        ("openai", None),
+        ("x" * 65, "gpt-4.1"),
+        ("openai", "x" * 129),
+    ],
+)
+def test_persist_consistency_check_plan_result_rejects_invalid_execution_identity_before_session_open(
+    monkeypatch: pytest.MonkeyPatch,
+    provider,
+    requested_model,
+) -> None:
+    plan, batch_results, execution_result, authenticated_source = _build_authoritative_fixture()
+    session_factory = SessionFactory()
+
+    with pytest.raises(
+        persistence_service.ConsistencyCheckPersistenceStateError,
+        match="consistency_check_persistence_execution_identity_invalid",
+    ):
+        run_async(
+            persistence_service.persist_consistency_check_plan_result(
+                session_factory,
+                plan=plan,
+                execution_result=execution_result,
+                prompt=PROMPT,
+                provider=provider,
+                requested_model=requested_model,
+            )
+        )
+
+    assert session_factory.open_count == 0
+    assert session_factory.sessions == []

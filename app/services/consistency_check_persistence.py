@@ -33,6 +33,7 @@ from app.schemas.consistency_check_persistence import (
 from app.services import consistency_check as consistency_check_service
 from app.services import consistency_check_execution as execution_service
 from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
+from app.services import inference as inference_service
 
 
 _APPLICATION_UNIQUE_CONSTRAINT = "uq_ccapp_exec_identity_hash"
@@ -78,6 +79,28 @@ def _immutable_mismatch() -> None:
     raise ConsistencyCheckPersistenceInvariantError(
         "consistency_check_persistence_immutable_ledger_mismatch"
     )
+
+
+def _normalize_execution_identity_inputs(
+    *,
+    provider: str,
+    requested_model: str,
+) -> tuple[str, str]:
+    try:
+        return (
+            inference_service.normalize_inference_identity_text(
+                provider,
+                field_name="provider",
+            ),
+            inference_service.normalize_inference_identity_text(
+                requested_model,
+                field_name="requested_model",
+            ),
+        )
+    except inference_service.InvalidInferenceInputError:
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_execution_identity_invalid"
+        ) from None
 
 
 def _validate_source_bindings(
@@ -443,6 +466,20 @@ def _assert_batch_record_matches_spec(
         _immutable_mismatch()
 
 
+def _build_unique_key_map(
+    records: Sequence[object],
+    *,
+    key_builder: Callable[[object], object],
+) -> dict[object, object]:
+    keyed: dict[object, object] = {}
+    for record in records:
+        key = key_builder(record)
+        if key in keyed:
+            _immutable_mismatch()
+        keyed[key] = record
+    return keyed
+
+
 async def _assert_existing_ledgers_match_plan(
     session: AsyncSession,
     *,
@@ -455,35 +492,62 @@ async def _assert_existing_ledgers_match_plan(
         session,
         consistency_check_application_id=application.id,
     )
-    if len(actual_batches) != len(persistence_plan.batches):
+    actual_batch_by_index = _build_unique_key_map(
+        actual_batches,
+        key_builder=lambda record: record.batch_index,
+    )
+    expected_batch_by_index = _build_unique_key_map(
+        persistence_plan.batches,
+        key_builder=lambda spec: spec.batch_index,
+    )
+    if set(actual_batch_by_index) != set(expected_batch_by_index):
         _immutable_mismatch()
-    for actual_batch, expected_batch in zip(actual_batches, persistence_plan.batches, strict=True):
+    for batch_index in sorted(expected_batch_by_index):
         _assert_batch_record_matches_spec(
-            actual_batch,
+            actual_batch_by_index[batch_index],
             application_id=application.id,
-            spec=expected_batch,
+            spec=expected_batch_by_index[batch_index],
         )
 
     actual_assessments = await consistency_check_repository.list_consistency_assessment_ledgers(
         session,
         consistency_check_application_id=application.id,
     )
-    if len(actual_assessments) != len(persistence_plan.assessments):
-        _immutable_mismatch()
-
     actual_citations = await consistency_check_repository.list_consistency_assessment_citation_ledgers(
         session,
         consistency_check_application_id=application.id,
     )
+    actual_assessment_by_key = _build_unique_key_map(
+        actual_assessments,
+        key_builder=lambda record: (
+            record.batch_index,
+            record.source_consistency_candidate_id,
+        ),
+    )
+    expected_assessment_by_key = _build_unique_key_map(
+        persistence_plan.assessments,
+        key_builder=lambda spec: (
+            spec.batch_index,
+            spec.source_consistency_candidate_id,
+        ),
+    )
+    if set(actual_assessment_by_key) != set(expected_assessment_by_key):
+        _immutable_mismatch()
+    if len(actual_citations) != sum(
+        len(assessment.citations) for assessment in persistence_plan.assessments
+    ):
+        _immutable_mismatch()
     citations_by_assessment_id: dict[uuid.UUID, list] = {}
     for citation in actual_citations:
         citations_by_assessment_id.setdefault(citation.assessment_id, []).append(citation)
-
-    for actual_assessment, expected_assessment in zip(
-        actual_assessments,
-        persistence_plan.assessments,
-        strict=True,
+    if not set(citations_by_assessment_id).issubset(
+        {record.id for record in actual_assessment_by_key.values()}
     ):
+        _immutable_mismatch()
+
+    for assessment_key in sorted(expected_assessment_by_key):
+        actual_assessment = actual_assessment_by_key[assessment_key]
+        expected_assessment = expected_assessment_by_key[assessment_key]
         if actual_assessment.consistency_check_application_id != application.id:
             _immutable_mismatch()
         if (
@@ -520,13 +584,19 @@ async def _assert_existing_ledgers_match_plan(
             _immutable_mismatch()
 
         actual_assessment_citations = citations_by_assessment_id.get(actual_assessment.id, [])
-        if len(actual_assessment_citations) != len(expected_assessment.citations):
-            _immutable_mismatch()
-        for actual_citation, expected_citation in zip(
+        actual_citation_by_order = _build_unique_key_map(
             actual_assessment_citations,
+            key_builder=lambda record: record.citation_order,
+        )
+        expected_citation_by_order = _build_unique_key_map(
             expected_assessment.citations,
-            strict=True,
-        ):
+            key_builder=lambda spec: spec.citation_order,
+        )
+        if set(actual_citation_by_order) != set(expected_citation_by_order):
+            _immutable_mismatch()
+        for citation_order in sorted(expected_citation_by_order):
+            actual_citation = actual_citation_by_order[citation_order]
+            expected_citation = expected_citation_by_order[citation_order]
             if actual_citation.assessment_id != actual_assessment.id:
                 _immutable_mismatch()
             if (
@@ -594,6 +664,10 @@ async def persist_consistency_check_plan_result(
     requested_model: str,
 ) -> ConsistencyCheckPersistenceResult:
     validate_consistency_check_prompt(prompt)
+    normalized_provider, normalized_requested_model = _normalize_execution_identity_inputs(
+        provider=provider,
+        requested_model=requested_model,
+    )
     authoritative_plan = await _rebuild_and_validate_authoritative_plan(
         session_factory,
         plan=plan,
@@ -616,8 +690,8 @@ async def persist_consistency_check_plan_result(
         authoritative_plan=authoritative_plan,
         execution_result=provided_execution_result,
         prompt=prompt,
-        provider=provider,
-        requested_model=requested_model,
+        provider=normalized_provider,
+        requested_model=normalized_requested_model,
     )
     authenticated_execution_result = _authenticate_execution_result(
         authoritative_plan=authoritative_plan,
@@ -630,8 +704,8 @@ async def persist_consistency_check_plan_result(
         authenticated_execution_result=authenticated_execution_result,
         batch_results=batch_results,
         prompt=prompt,
-        provider=provider,
-        requested_model=requested_model,
+        provider=normalized_provider,
+        requested_model=normalized_requested_model,
     )
 
     async with session_factory() as write_session:

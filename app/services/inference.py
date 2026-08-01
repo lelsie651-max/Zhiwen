@@ -1022,6 +1022,12 @@ def _require_identity_text(value: str, field_name: str) -> str:
     return normalized
 
 
+def normalize_inference_identity_text(value: str, *, field_name: str) -> str:
+    if field_name not in _RUN_IDENTITY_LIMITS:
+        raise InvalidInferenceInputError("field_name must be a known inference identity field.")
+    return _require_identity_text(value, field_name)
+
+
 def _require_block_ids(block_ids: Sequence[uuid.UUID]) -> list[uuid.UUID]:
     ordered = list(block_ids)
     if not ordered:
