@@ -28,6 +28,8 @@ from app.schemas.fact_value_duplicate_grouping import (
     DuplicateGroupingApplicationLedger,
     DuplicateGroupEvidenceProjection,
     FactValueConsistencyCandidateApplicationLedger,
+    FactValueConsistencyCandidateLedger,
+    FactValueConsistencyCandidateMemberLedger,
 )
 from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
 
@@ -161,6 +163,67 @@ def make_orchestration_state(
 
 async def return_second_arg(*args, **kwargs):
     return args[1]
+
+
+async def return_empty_tuple(*args, **kwargs):
+    return ()
+
+
+def make_consistency_candidate_application_ledger(
+    *,
+    source_application: DuplicateGroupingApplicationLedger,
+    write_plan,
+    consistency_application_id: uuid.UUID | None = None,
+) -> FactValueConsistencyCandidateApplicationLedger:
+    return FactValueConsistencyCandidateApplicationLedger(
+        id=consistency_application_id or uuid.uuid4(),
+        duplicate_grouping_application_id=source_application.id,
+        orchestration_id=source_application.orchestration_id,
+        extraction_run_id=source_application.extraction_run_id,
+        algorithm_version=write_plan.algorithm_version,
+        input_manifest_hash=write_plan.input_manifest_hash,
+        result_manifest_hash=write_plan.result_manifest_hash,
+        candidate_count=write_plan.candidate_count,
+        member_count=write_plan.member_count,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def build_consistency_candidate_subledgers_from_plan(
+    write_plan,
+    *,
+    application: FactValueConsistencyCandidateApplicationLedger,
+) -> tuple[tuple[FactValueConsistencyCandidateLedger, ...], tuple[FactValueConsistencyCandidateMemberLedger, ...]]:
+    candidate_ledgers: list[FactValueConsistencyCandidateLedger] = []
+    member_ledgers: list[FactValueConsistencyCandidateMemberLedger] = []
+    for candidate_plan in write_plan.candidates:
+        candidate_id = uuid.uuid4()
+        candidate_ledgers.append(
+            FactValueConsistencyCandidateLedger(
+                id=candidate_id,
+                consistency_application_id=application.id,
+                fact_id=candidate_plan.fact_id,
+                candidate_kind=candidate_plan.candidate_kind,
+                member_count=candidate_plan.member_count,
+                distinct_semantic_key_count=candidate_plan.distinct_semantic_key_count,
+                distinct_batch_count=candidate_plan.distinct_batch_count,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        for member_plan in candidate_plan.members:
+            member_ledgers.append(
+                FactValueConsistencyCandidateMemberLedger(
+                    id=uuid.uuid4(),
+                    consistency_application_id=application.id,
+                    candidate_id=candidate_id,
+                    orchestration_id=application.orchestration_id,
+                    fact_value_id=member_plan.fact_value_id,
+                    source_batch_id=member_plan.source_batch_id,
+                    semantic_key_hash=member_plan.semantic_key_hash,
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+    return tuple(candidate_ledgers), tuple(member_ledgers)
 
 
 def test_duplicate_grouping_tables_are_registered() -> None:
@@ -1858,6 +1921,12 @@ def test_ensure_cross_batch_multi_value_consistency_candidates_writes_zero_candi
     )
     monkeypatch.setattr(duplicate_grouping_repository, "create_consistency_candidates", return_second_arg)
     monkeypatch.setattr(duplicate_grouping_repository, "create_consistency_candidate_members", return_second_arg)
+    monkeypatch.setattr(duplicate_grouping_repository, "list_consistency_candidate_ledgers", return_empty_tuple)
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_member_ledgers",
+        return_empty_tuple,
+    )
 
     first_result = run_async(
         duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
@@ -1921,6 +1990,10 @@ def test_ensure_cross_batch_multi_value_consistency_candidates_handles_target_co
         member_count=write_plan.member_count,
         created_at=datetime.now(timezone.utc),
     )
+    existing_candidate_ledgers, existing_member_ledgers = build_consistency_candidate_subledgers_from_plan(
+        write_plan,
+        application=existing_application,
+    )
     session_factory = SessionFactory([FakeSession(), FakeSession(), FakeSession()])
 
     async def fake_source_application(_session, *, grouping_application_id):
@@ -1973,6 +2046,22 @@ def test_ensure_cross_batch_multi_value_consistency_candidates_handles_target_co
         duplicate_grouping_repository,
         "get_consistency_candidate_application_ledger",
         fake_get_existing,
+    )
+    async def fake_candidate_ledgers(_session, *, consistency_application_id):
+        return existing_candidate_ledgers
+
+    async def fake_member_ledgers(_session, *, consistency_application_id):
+        return existing_member_ledgers
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_ledgers",
+        fake_candidate_ledgers,
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_member_ledgers",
+        fake_member_ledgers,
     )
 
     result = run_async(
@@ -2117,6 +2206,601 @@ def test_ensure_cross_batch_multi_value_consistency_candidates_fails_closed_when
     with pytest.raises(
         duplicate_grouping_service.FactValueConsistencyCandidateInvariantError,
         match="single orchestration",
+    ):
+        run_async(
+            duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
+                session_factory,
+                duplicate_grouping_application_id=source_application.id,
+            )
+        )
+
+
+@pytest.mark.parametrize("source_algorithm_version", ["cross_batch_exact_v1", "cross_batch_exact_v9"])
+def test_build_fact_value_consistency_candidate_write_plan_rejects_unsupported_source_algorithm(
+    source_algorithm_version: str,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    fact_id = uuid.uuid4()
+    candidates = (
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value A",
+            value_type="string",
+        ),
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value B",
+            value_type="string",
+        ),
+    )
+    base_application = make_duplicate_grouping_application_ledger(candidates)
+    source_application = DuplicateGroupingApplicationLedger(
+        id=base_application.id,
+        orchestration_id=base_application.orchestration_id,
+        extraction_run_id=base_application.extraction_run_id,
+        algorithm_version=source_algorithm_version,
+        input_manifest_hash=base_application.input_manifest_hash,
+        result_manifest_hash=base_application.result_manifest_hash,
+        input_fact_value_count=base_application.input_fact_value_count,
+        duplicate_group_count=base_application.duplicate_group_count,
+        duplicate_member_count=base_application.duplicate_member_count,
+        created_at=base_application.created_at,
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.FactValueConsistencyCandidateStateError,
+        match="fact_value_consistency_candidate_source_algorithm_unsupported",
+    ):
+        duplicate_grouping_service.build_fact_value_consistency_candidate_write_plan(
+            candidates,
+            source_duplicate_grouping_application=source_application,
+        )
+
+
+@pytest.mark.parametrize("source_algorithm_version", ["cross_batch_exact_v1", "cross_batch_exact_v9"])
+def test_ensure_cross_batch_multi_value_consistency_candidates_rejects_unsupported_source_algorithm(
+    monkeypatch: pytest.MonkeyPatch,
+    source_algorithm_version: str,
+) -> None:
+    source_application = DuplicateGroupingApplicationLedger(
+        id=uuid.uuid4(),
+        orchestration_id=uuid.uuid4(),
+        extraction_run_id=uuid.uuid4(),
+        algorithm_version=source_algorithm_version,
+        input_manifest_hash="a" * 64,
+        result_manifest_hash="b" * 64,
+        input_fact_value_count=0,
+        duplicate_group_count=0,
+        duplicate_member_count=0,
+        created_at=datetime.now(timezone.utc),
+    )
+    session_factory = SessionFactory([FakeSession()])
+
+    async def fake_source_application(_session, *, grouping_application_id):
+        return source_application
+
+    monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_ledger_by_id", fake_source_application)
+
+    with pytest.raises(
+        duplicate_grouping_service.FactValueConsistencyCandidateStateError,
+        match="fact_value_consistency_candidate_source_algorithm_unsupported",
+    ):
+        run_async(
+            duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
+                session_factory,
+                duplicate_grouping_application_id=source_application.id,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    [
+        ("algorithm_version", "cross_batch_exact_v9"),
+        ("input_manifest_hash", "f" * 64),
+        ("input_fact_value_count", 999),
+    ],
+)
+def test_ensure_cross_batch_multi_value_consistency_candidates_fails_closed_on_write_session_source_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    changed_value,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    fact_id = uuid.uuid4()
+    candidates = (
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value A",
+            value_type="string",
+        ),
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value B",
+            value_type="string",
+        ),
+    )
+    read_source_application = make_duplicate_grouping_application_ledger(candidates)
+    write_source_application = DuplicateGroupingApplicationLedger(
+        id=read_source_application.id,
+        orchestration_id=read_source_application.orchestration_id,
+        extraction_run_id=read_source_application.extraction_run_id,
+        algorithm_version=read_source_application.algorithm_version,
+        input_manifest_hash=read_source_application.input_manifest_hash,
+        result_manifest_hash=read_source_application.result_manifest_hash,
+        input_fact_value_count=read_source_application.input_fact_value_count,
+        duplicate_group_count=read_source_application.duplicate_group_count,
+        duplicate_member_count=read_source_application.duplicate_member_count,
+        created_at=read_source_application.created_at,
+    )
+    write_source_application = DuplicateGroupingApplicationLedger(
+        id=write_source_application.id,
+        orchestration_id=write_source_application.orchestration_id,
+        extraction_run_id=write_source_application.extraction_run_id,
+        algorithm_version=changed_value if field_name == "algorithm_version" else write_source_application.algorithm_version,
+        input_manifest_hash=changed_value if field_name == "input_manifest_hash" else write_source_application.input_manifest_hash,
+        result_manifest_hash=write_source_application.result_manifest_hash,
+        input_fact_value_count=changed_value if field_name == "input_fact_value_count" else write_source_application.input_fact_value_count,
+        duplicate_group_count=write_source_application.duplicate_group_count,
+        duplicate_member_count=write_source_application.duplicate_member_count,
+        created_at=write_source_application.created_at,
+    )
+    session_factory = SessionFactory([FakeSession(), FakeSession()])
+    source_reads = [read_source_application, write_source_application]
+
+    async def fake_source_application(_session, *, grouping_application_id):
+        return source_reads.pop(0)
+
+    async def fake_state(_session, *, orchestration_id):
+        return make_orchestration_state(
+            orchestration_id,
+            extraction_run_id=extraction_run_id,
+            orchestration_status="completed",
+        )
+
+    async def fake_invalid_bindings(_session, *, orchestration_id):
+        return False
+
+    async def fake_count(_session, *, orchestration_id):
+        return len(candidates)
+
+    async def fake_candidates(_session, *, orchestration_id):
+        return candidates
+
+    monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_ledger_by_id", fake_source_application)
+    monkeypatch.setattr(duplicate_grouping_repository, "get_duplicate_grouping_orchestration_state", fake_state)
+    monkeypatch.setattr(duplicate_grouping_repository, "has_invalid_completed_batch_bindings", fake_invalid_bindings)
+    monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
+    monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
+
+    with pytest.raises(
+        duplicate_grouping_service.FactValueConsistencyCandidateInvariantError,
+        match="fact_value_consistency_candidate_source_snapshot_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
+                session_factory,
+                duplicate_grouping_application_id=read_source_application.id,
+            )
+        )
+
+
+def test_ensure_cross_batch_multi_value_consistency_candidates_returns_existing_valid_non_zero_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    fact_id = uuid.uuid4()
+    candidates = (
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value A",
+            value_type="string",
+        ),
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value B",
+            value_type="string",
+        ),
+    )
+    source_application = make_duplicate_grouping_application_ledger(candidates)
+    write_plan = duplicate_grouping_service.build_fact_value_consistency_candidate_write_plan(
+        candidates,
+        source_duplicate_grouping_application=source_application,
+    )
+    existing_application = make_consistency_candidate_application_ledger(
+        source_application=source_application,
+        write_plan=write_plan,
+    )
+    existing_candidate_ledgers, existing_member_ledgers = build_consistency_candidate_subledgers_from_plan(
+        write_plan,
+        application=existing_application,
+    )
+    session_factory = SessionFactory([FakeSession(), FakeSession()])
+
+    async def fake_source_application(_session, *, grouping_application_id):
+        return source_application
+
+    async def fake_state(_session, *, orchestration_id):
+        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id)
+
+    async def fake_invalid_bindings(_session, *, orchestration_id):
+        return False
+
+    async def fake_count(_session, *, orchestration_id):
+        return len(candidates)
+
+    async def fake_candidates(_session, *, orchestration_id):
+        return candidates
+
+    async def fake_existing_for_update(_session, *, duplicate_grouping_application_id, algorithm_version):
+        return type(
+            "ExistingConsistencyApplication",
+            (),
+            {
+                "id": existing_application.id,
+                "duplicate_grouping_application_id": existing_application.duplicate_grouping_application_id,
+                "orchestration_id": existing_application.orchestration_id,
+                "extraction_run_id": existing_application.extraction_run_id,
+                "algorithm_version": existing_application.algorithm_version,
+                "input_manifest_hash": existing_application.input_manifest_hash,
+                "result_manifest_hash": existing_application.result_manifest_hash,
+                "candidate_count": existing_application.candidate_count,
+                "member_count": existing_application.member_count,
+                "created_at": existing_application.created_at,
+            },
+        )()
+
+    monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_ledger_by_id", fake_source_application)
+    monkeypatch.setattr(duplicate_grouping_repository, "get_duplicate_grouping_orchestration_state", fake_state)
+    monkeypatch.setattr(duplicate_grouping_repository, "has_invalid_completed_batch_bindings", fake_invalid_bindings)
+    monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
+    monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_consistency_candidate_application_for_update",
+        fake_existing_for_update,
+    )
+    async def fake_candidate_ledgers(_session, *, consistency_application_id):
+        return existing_candidate_ledgers
+
+    async def fake_member_ledgers(_session, *, consistency_application_id):
+        return existing_member_ledgers
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_ledgers",
+        fake_candidate_ledgers,
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_member_ledgers",
+        fake_member_ledgers,
+    )
+
+    result = run_async(
+        duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
+            session_factory,
+            duplicate_grouping_application_id=source_application.id,
+        )
+    )
+
+    assert result.created_new is False
+    assert result.consistency_application_id == existing_application.id
+    assert session_factory.created_sessions[1].commit_count == 1
+
+
+@pytest.mark.parametrize("corruption_kind", ["missing_candidate", "extra_member", "member_semantic_hash", "member_source_batch", "member_candidate_binding", "candidate_stats"])
+def test_ensure_cross_batch_multi_value_consistency_candidates_fails_closed_on_existing_subledger_corruption(
+    monkeypatch: pytest.MonkeyPatch,
+    corruption_kind: str,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    fact_id = uuid.uuid4()
+    candidates = (
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value A",
+            value_type="string",
+        ),
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value B",
+            value_type="string",
+        ),
+    )
+    source_application = make_duplicate_grouping_application_ledger(candidates)
+    write_plan = duplicate_grouping_service.build_fact_value_consistency_candidate_write_plan(
+        candidates,
+        source_duplicate_grouping_application=source_application,
+    )
+    existing_application = make_consistency_candidate_application_ledger(
+        source_application=source_application,
+        write_plan=write_plan,
+    )
+    candidate_ledgers, member_ledgers = build_consistency_candidate_subledgers_from_plan(
+        write_plan,
+        application=existing_application,
+    )
+    candidate_ledgers = list(candidate_ledgers)
+    member_ledgers = list(member_ledgers)
+    if corruption_kind == "missing_candidate":
+        candidate_ledgers = []
+    elif corruption_kind == "extra_member":
+        member_ledgers.append(
+            FactValueConsistencyCandidateMemberLedger(
+                id=uuid.uuid4(),
+                consistency_application_id=existing_application.id,
+                candidate_id=candidate_ledgers[0].id,
+                orchestration_id=existing_application.orchestration_id,
+                fact_value_id=uuid.uuid4(),
+                source_batch_id=uuid.uuid4(),
+                semantic_key_hash="a" * 64,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+    elif corruption_kind == "member_semantic_hash":
+        member_ledgers[0] = FactValueConsistencyCandidateMemberLedger(
+            id=member_ledgers[0].id,
+            consistency_application_id=member_ledgers[0].consistency_application_id,
+            candidate_id=member_ledgers[0].candidate_id,
+            orchestration_id=member_ledgers[0].orchestration_id,
+            fact_value_id=member_ledgers[0].fact_value_id,
+            source_batch_id=member_ledgers[0].source_batch_id,
+            semantic_key_hash="f" * 64,
+            created_at=member_ledgers[0].created_at,
+        )
+    elif corruption_kind == "member_source_batch":
+        member_ledgers[0] = FactValueConsistencyCandidateMemberLedger(
+            id=member_ledgers[0].id,
+            consistency_application_id=member_ledgers[0].consistency_application_id,
+            candidate_id=member_ledgers[0].candidate_id,
+            orchestration_id=member_ledgers[0].orchestration_id,
+            fact_value_id=member_ledgers[0].fact_value_id,
+            source_batch_id=uuid.uuid4(),
+            semantic_key_hash=member_ledgers[0].semantic_key_hash,
+            created_at=member_ledgers[0].created_at,
+        )
+    elif corruption_kind == "member_candidate_binding":
+        member_ledgers[0] = FactValueConsistencyCandidateMemberLedger(
+            id=member_ledgers[0].id,
+            consistency_application_id=member_ledgers[0].consistency_application_id,
+            candidate_id=uuid.uuid4(),
+            orchestration_id=member_ledgers[0].orchestration_id,
+            fact_value_id=member_ledgers[0].fact_value_id,
+            source_batch_id=member_ledgers[0].source_batch_id,
+            semantic_key_hash=member_ledgers[0].semantic_key_hash,
+            created_at=member_ledgers[0].created_at,
+        )
+    elif corruption_kind == "candidate_stats":
+        candidate_ledgers[0] = FactValueConsistencyCandidateLedger(
+            id=candidate_ledgers[0].id,
+            consistency_application_id=candidate_ledgers[0].consistency_application_id,
+            fact_id=candidate_ledgers[0].fact_id,
+            candidate_kind=candidate_ledgers[0].candidate_kind,
+            member_count=99,
+            distinct_semantic_key_count=candidate_ledgers[0].distinct_semantic_key_count,
+            distinct_batch_count=candidate_ledgers[0].distinct_batch_count,
+            created_at=candidate_ledgers[0].created_at,
+        )
+
+    session_factory = SessionFactory([FakeSession(), FakeSession()])
+
+    async def fake_source_application(_session, *, grouping_application_id):
+        return source_application
+
+    async def fake_state(_session, *, orchestration_id):
+        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id)
+
+    async def fake_invalid_bindings(_session, *, orchestration_id):
+        return False
+
+    async def fake_count(_session, *, orchestration_id):
+        return len(candidates)
+
+    async def fake_candidates(_session, *, orchestration_id):
+        return candidates
+
+    async def fake_existing_for_update(_session, *, duplicate_grouping_application_id, algorithm_version):
+        return type(
+            "ExistingConsistencyApplication",
+            (),
+            {
+                "id": existing_application.id,
+                "duplicate_grouping_application_id": existing_application.duplicate_grouping_application_id,
+                "orchestration_id": existing_application.orchestration_id,
+                "extraction_run_id": existing_application.extraction_run_id,
+                "algorithm_version": existing_application.algorithm_version,
+                "input_manifest_hash": existing_application.input_manifest_hash,
+                "result_manifest_hash": existing_application.result_manifest_hash,
+                "candidate_count": existing_application.candidate_count,
+                "member_count": existing_application.member_count,
+                "created_at": existing_application.created_at,
+            },
+        )()
+
+    monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_ledger_by_id", fake_source_application)
+    monkeypatch.setattr(duplicate_grouping_repository, "get_duplicate_grouping_orchestration_state", fake_state)
+    monkeypatch.setattr(duplicate_grouping_repository, "has_invalid_completed_batch_bindings", fake_invalid_bindings)
+    monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
+    monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_consistency_candidate_application_for_update",
+        fake_existing_for_update,
+    )
+    async def fake_candidate_ledgers(_session, *, consistency_application_id):
+        return tuple(candidate_ledgers)
+
+    async def fake_member_ledgers(_session, *, consistency_application_id):
+        return tuple(member_ledgers)
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_ledgers",
+        fake_candidate_ledgers,
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_member_ledgers",
+        fake_member_ledgers,
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.FactValueConsistencyCandidateInvariantError,
+        match="fact_value_consistency_candidate_subledger_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
+                session_factory,
+                duplicate_grouping_application_id=source_application.id,
+            )
+        )
+
+
+def test_ensure_cross_batch_multi_value_consistency_candidates_concurrency_readback_revalidates_subledgers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    fact_id = uuid.uuid4()
+    candidates = (
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value A",
+            value_type="string",
+        ),
+        candidate(
+            orchestration_id=orchestration_id,
+            extraction_run_id=extraction_run_id,
+            fact_id=fact_id,
+            source_batch_id=uuid.uuid4(),
+            value_json="Value B",
+            value_type="string",
+        ),
+    )
+    source_application = make_duplicate_grouping_application_ledger(candidates)
+    write_plan = duplicate_grouping_service.build_fact_value_consistency_candidate_write_plan(
+        candidates,
+        source_duplicate_grouping_application=source_application,
+    )
+    existing_application = make_consistency_candidate_application_ledger(
+        source_application=source_application,
+        write_plan=write_plan,
+    )
+    existing_candidate_ledgers, existing_member_ledgers = build_consistency_candidate_subledgers_from_plan(
+        write_plan,
+        application=existing_application,
+    )
+    corrupted_member_ledgers = (
+        FactValueConsistencyCandidateMemberLedger(
+            id=existing_member_ledgers[0].id,
+            consistency_application_id=existing_member_ledgers[0].consistency_application_id,
+            candidate_id=existing_member_ledgers[0].candidate_id,
+            orchestration_id=existing_member_ledgers[0].orchestration_id,
+            fact_value_id=existing_member_ledgers[0].fact_value_id,
+            source_batch_id=existing_member_ledgers[0].source_batch_id,
+            semantic_key_hash="f" * 64,
+            created_at=existing_member_ledgers[0].created_at,
+        ),
+        existing_member_ledgers[1],
+    )
+    session_factory = SessionFactory([FakeSession(), FakeSession(), FakeSession()])
+
+    async def fake_source_application(_session, *, grouping_application_id):
+        return source_application
+
+    async def fake_state(_session, *, orchestration_id):
+        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id)
+
+    async def fake_invalid_bindings(_session, *, orchestration_id):
+        return False
+
+    async def fake_count(_session, *, orchestration_id):
+        return len(candidates)
+
+    async def fake_candidates(_session, *, orchestration_id):
+        return candidates
+
+    async def fake_existing_for_update(_session, *, duplicate_grouping_application_id, algorithm_version):
+        return None
+
+    async def fake_create_application(_session, application):
+        raise make_integrity_error("uq_fvcca_dupgrp_alg")
+
+    async def fake_get_existing(_session, *, duplicate_grouping_application_id, algorithm_version):
+        return existing_application
+
+    monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_ledger_by_id", fake_source_application)
+    monkeypatch.setattr(duplicate_grouping_repository, "get_duplicate_grouping_orchestration_state", fake_state)
+    monkeypatch.setattr(duplicate_grouping_repository, "has_invalid_completed_batch_bindings", fake_invalid_bindings)
+    monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
+    monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_consistency_candidate_application_for_update",
+        fake_existing_for_update,
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "create_consistency_candidate_application",
+        fake_create_application,
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_consistency_candidate_application_ledger",
+        fake_get_existing,
+    )
+    async def fake_candidate_ledgers(_session, *, consistency_application_id):
+        return existing_candidate_ledgers
+
+    async def fake_member_ledgers(_session, *, consistency_application_id):
+        return corrupted_member_ledgers
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_ledgers",
+        fake_candidate_ledgers,
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_consistency_candidate_member_ledgers",
+        fake_member_ledgers,
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.FactValueConsistencyCandidateInvariantError,
+        match="fact_value_consistency_candidate_subledger_mismatch",
     ):
         run_async(
             duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
