@@ -387,12 +387,19 @@ async def list_duplicate_group_evidence_projections(
 
     projections: list[DuplicateGroupEvidenceProjection] = []
     current_fact_value_id: uuid.UUID | None = None
-    current_link_ids: set[uuid.UUID] = set()
-    current_evidence_ids: set[uuid.UUID] = set()
+    current_link_ids: list[uuid.UUID] = []
+    current_link_ids_seen: set[uuid.UUID] = set()
+    current_evidence_ids: list[uuid.UUID] = []
+    current_evidence_ids_seen: set[uuid.UUID] = set()
     current_fields: dict[str, object] | None = None
 
     def flush_current() -> None:
-        nonlocal current_fact_value_id, current_link_ids, current_evidence_ids, current_fields
+        nonlocal current_fact_value_id
+        nonlocal current_link_ids
+        nonlocal current_link_ids_seen
+        nonlocal current_evidence_ids
+        nonlocal current_evidence_ids_seen
+        nonlocal current_fields
         if current_fields is None:
             return
         projections.append(
@@ -401,13 +408,15 @@ async def list_duplicate_group_evidence_projections(
                 duplicate_key_hash=current_fields["duplicate_key_hash"],
                 fact_value_id=current_fields["fact_value_id"],
                 source_batch_id=current_fields["source_batch_id"],
-                evidence_link_ids=tuple(sorted(current_link_ids, key=str)),
-                evidence_ids=tuple(sorted(current_evidence_ids, key=str)),
+                evidence_link_ids=tuple(current_link_ids),
+                evidence_ids=tuple(current_evidence_ids),
             )
         )
         current_fact_value_id = None
-        current_link_ids = set()
-        current_evidence_ids = set()
+        current_link_ids = []
+        current_link_ids_seen = set()
+        current_evidence_ids = []
+        current_evidence_ids_seen = set()
         current_fields = None
 
     for row in rows:
@@ -420,10 +429,12 @@ async def list_duplicate_group_evidence_projections(
                 "fact_value_id": row.fact_value_id,
                 "source_batch_id": row.source_batch_id,
             }
-        if row.evidence_link_id is not None:
-            current_link_ids.add(row.evidence_link_id)
-        if row.evidence_id is not None:
-            current_evidence_ids.add(row.evidence_id)
+        if row.evidence_link_id is not None and row.evidence_link_id not in current_link_ids_seen:
+            current_link_ids_seen.add(row.evidence_link_id)
+            current_link_ids.append(row.evidence_link_id)
+        if row.evidence_id is not None and row.evidence_id not in current_evidence_ids_seen:
+            current_evidence_ids_seen.add(row.evidence_id)
+            current_evidence_ids.append(row.evidence_id)
     flush_current()
     return tuple(projections)
 

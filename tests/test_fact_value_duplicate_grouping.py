@@ -501,6 +501,36 @@ def test_build_duplicate_group_evidence_union_deduplicates_by_evidence_id() -> N
     )
 
 
+def test_build_duplicate_group_evidence_union_preserves_first_seen_projection_order() -> None:
+    evidence_first = uuid.UUID("ffffffff-ffff-ffff-ffff-fffffffffff0")
+    evidence_second = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    evidence_third = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    projections = (
+        DuplicateGroupEvidenceProjection(
+            group_id=uuid.uuid4(),
+            duplicate_key_hash="a" * 64,
+            fact_value_id=uuid.uuid4(),
+            source_batch_id=uuid.uuid4(),
+            evidence_link_ids=(uuid.uuid4(),),
+            evidence_ids=(evidence_first, evidence_second),
+        ),
+        DuplicateGroupEvidenceProjection(
+            group_id=uuid.uuid4(),
+            duplicate_key_hash="b" * 64,
+            fact_value_id=uuid.uuid4(),
+            source_batch_id=uuid.uuid4(),
+            evidence_link_ids=(uuid.uuid4(),),
+            evidence_ids=(evidence_second, evidence_third),
+        ),
+    )
+
+    assert duplicate_grouping_service.build_duplicate_group_evidence_union(projections) == (
+        evidence_first,
+        evidence_second,
+        evidence_third,
+    )
+
+
 def test_same_extraction_run_different_orchestrations_create_independent_v2_ledgers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1360,6 +1390,10 @@ def test_duplicate_group_evidence_projection_reads_member_evidence_order() -> No
     group_id = uuid.uuid4()
     fact_value_id = uuid.uuid4()
     source_batch_id = uuid.uuid4()
+    first_link_id = uuid.UUID("ffffffff-ffff-ffff-ffff-fffffffffff0")
+    second_link_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    first_evidence_id = uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeee0")
+    second_evidence_id = uuid.UUID("00000000-0000-0000-0000-000000000002")
     rows = [
         type(
             "Row",
@@ -1369,8 +1403,8 @@ def test_duplicate_group_evidence_projection_reads_member_evidence_order() -> No
                 "duplicate_key_hash": "a" * 64,
                 "fact_value_id": fact_value_id,
                 "source_batch_id": source_batch_id,
-                "evidence_link_id": uuid.UUID("00000000-0000-0000-0000-000000000002"),
-                "evidence_id": uuid.UUID("00000000-0000-0000-0000-000000000010"),
+                "evidence_link_id": first_link_id,
+                "evidence_id": first_evidence_id,
             },
         )(),
         type(
@@ -1381,8 +1415,20 @@ def test_duplicate_group_evidence_projection_reads_member_evidence_order() -> No
                 "duplicate_key_hash": "a" * 64,
                 "fact_value_id": fact_value_id,
                 "source_batch_id": source_batch_id,
-                "evidence_link_id": uuid.UUID("00000000-0000-0000-0000-000000000003"),
-                "evidence_id": uuid.UUID("00000000-0000-0000-0000-000000000011"),
+                "evidence_link_id": second_link_id,
+                "evidence_id": second_evidence_id,
+            },
+        )(),
+        type(
+            "Row",
+            (),
+            {
+                "group_id": group_id,
+                "duplicate_key_hash": "a" * 64,
+                "fact_value_id": fact_value_id,
+                "source_batch_id": source_batch_id,
+                "evidence_link_id": first_link_id,
+                "evidence_id": first_evidence_id,
             },
         )(),
     ]
@@ -1401,12 +1447,12 @@ def test_duplicate_group_evidence_projection_reads_member_evidence_order() -> No
             fact_value_id=fact_value_id,
             source_batch_id=source_batch_id,
             evidence_link_ids=(
-                uuid.UUID("00000000-0000-0000-0000-000000000002"),
-                uuid.UUID("00000000-0000-0000-0000-000000000003"),
+                first_link_id,
+                second_link_id,
             ),
             evidence_ids=(
-                uuid.UUID("00000000-0000-0000-0000-000000000010"),
-                uuid.UUID("00000000-0000-0000-0000-000000000011"),
+                first_evidence_id,
+                second_evidence_id,
             ),
         ),
     )
