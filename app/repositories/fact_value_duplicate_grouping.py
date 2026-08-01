@@ -547,6 +547,33 @@ async def get_consistency_candidate_application_ledger(
     )
 
 
+async def get_consistency_candidate_application_ledger_by_id(
+    session: AsyncSession,
+    *,
+    consistency_application_id: uuid.UUID,
+) -> FactValueConsistencyCandidateApplicationLedger | None:
+    result = await session.execute(
+        select(FactValueConsistencyCandidateApplication).where(
+            FactValueConsistencyCandidateApplication.id == consistency_application_id,
+        )
+    )
+    application = result.scalar_one_or_none()
+    if application is None:
+        return None
+    return FactValueConsistencyCandidateApplicationLedger(
+        id=application.id,
+        duplicate_grouping_application_id=application.duplicate_grouping_application_id,
+        orchestration_id=application.orchestration_id,
+        extraction_run_id=application.extraction_run_id,
+        algorithm_version=application.algorithm_version,
+        input_manifest_hash=application.input_manifest_hash,
+        result_manifest_hash=application.result_manifest_hash,
+        candidate_count=application.candidate_count,
+        member_count=application.member_count,
+        created_at=application.created_at,
+    )
+
+
 async def list_consistency_candidate_ledgers(
     session: AsyncSession,
     *,
