@@ -31,6 +31,7 @@ from app.schemas.fact_extraction_orchestration import (
 )
 from app.schemas.fact_extraction_plan import FactExtractionPlannerConfig
 from app.services import fact_extraction_orchestration as orchestration_service
+from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
 
 
 PROMPT = get_prompt("agent1_fact_extraction", "1.0.0")
@@ -256,6 +257,27 @@ def _make_batch(
         failure_code="llm_transport_error" if status == "failed" else None,
         started_at=utc_now() if running or terminal else None,
         completed_at=utc_now() if terminal else None,
+    )
+
+
+def _make_orchestration_result(
+    *,
+    status: FactExtractionOrchestrationStatus = FactExtractionOrchestrationStatus.COMPLETED,
+) -> FactExtractionOrchestrationResult:
+    return FactExtractionOrchestrationResult(
+        orchestration_id=uuid.uuid4(),
+        attempt_no=1,
+        request_hash="a" * 64,
+        plan_hash="b" * 64,
+        status=status,
+        batch_count=1,
+        completed_batch_count=1 if status != FactExtractionOrchestrationStatus.FAILED else 0,
+        failed_batch_count=0 if status != FactExtractionOrchestrationStatus.FAILED else 1,
+        proposal_count=1 if status != FactExtractionOrchestrationStatus.FAILED else 0,
+        created_count=1 if status != FactExtractionOrchestrationStatus.FAILED else 0,
+        reused_count=0,
+        withheld_count=0,
+        batches=(),
     )
 
 
@@ -2070,6 +2092,108 @@ def test_execute_orchestration_cancelled_cleans_up_and_reraises(monkeypatch) -> 
     assert cleanup_calls == []
 
 
+def test_execute_orchestration_reused_completed_result_triggers_duplicate_grouping(
+    monkeypatch,
+) -> None:
+    session_factory = SessionFactory()
+    extraction_run_id, plan = _planned_fixture()
+    expected_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+    ensure_calls: list[uuid.UUID] = []
+
+    async def fake_prepare(*_args, **_kwargs):
+        return orchestration_service.PreparedFactExtractionOrchestration(
+            orchestration_id=expected_result.orchestration_id,
+            attempt_no=1,
+            request_hash=expected_result.request_hash,
+            plan_hash=expected_result.plan_hash,
+            reused_completed=True,
+        )
+
+    async def fake_read_completed(*_args, **_kwargs):
+        return expected_result
+
+    async def fake_ensure(_session_factory, *, extraction_run_id, algorithm_version="cross_batch_exact_v1"):
+        assert algorithm_version == "cross_batch_exact_v1"
+        ensure_calls.append(extraction_run_id)
+        return SimpleNamespace(created_new=True)
+
+    monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
+    monkeypatch.setattr(orchestration_service, "_read_completed_orchestration_result", fake_read_completed)
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_duplicate_grouping",
+        fake_ensure,
+    )
+
+    result = run_async(
+        orchestration_service.execute_fact_extraction_orchestration(
+            session_factory,
+            project_id=uuid.uuid4(),
+            extraction_run_id=extraction_run_id,
+            plan=plan,
+            prompt=PROMPT,
+            llm_client=SimpleNamespace(),
+            provider="deepseek",
+            requested_model="deepseek-v4-flash",
+            worker_token=uuid.uuid4(),
+        )
+    )
+
+    assert result == expected_result
+    assert ensure_calls == [extraction_run_id]
+
+
+def test_execute_orchestration_duplicate_grouping_failure_keeps_terminal_result(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_factory = SessionFactory()
+    extraction_run_id, plan = _planned_fixture()
+    expected_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.PARTIAL)
+
+    async def fake_prepare(*_args, **_kwargs):
+        return orchestration_service.PreparedFactExtractionOrchestration(
+            orchestration_id=expected_result.orchestration_id,
+            attempt_no=1,
+            request_hash=expected_result.request_hash,
+            plan_hash=expected_result.plan_hash,
+            reused_completed=True,
+        )
+
+    async def fake_read_completed(*_args, **_kwargs):
+        return expected_result
+
+    async def fake_ensure(_session_factory, *, extraction_run_id, algorithm_version="cross_batch_exact_v1"):
+        raise duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_immutable_ledger_mismatch"
+        )
+
+    monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
+    monkeypatch.setattr(orchestration_service, "_read_completed_orchestration_result", fake_read_completed)
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_duplicate_grouping",
+        fake_ensure,
+    )
+
+    result = run_async(
+        orchestration_service.execute_fact_extraction_orchestration(
+            session_factory,
+            project_id=uuid.uuid4(),
+            extraction_run_id=extraction_run_id,
+            plan=plan,
+            prompt=PROMPT,
+            llm_client=SimpleNamespace(),
+            provider="deepseek",
+            requested_model="deepseek-v4-flash",
+            worker_token=uuid.uuid4(),
+        )
+    )
+
+    assert result == expected_result
+    assert "Cross-batch duplicate grouping did not complete after orchestration finalization" in caplog.text
+
+
 def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:
     from alembic.config import Config
     from alembic.script import ScriptDirectory
@@ -2093,4 +2217,4 @@ def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202607312230"]
+    assert list(script.get_heads()) == ["202608010100"]

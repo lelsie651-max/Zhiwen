@@ -10,11 +10,24 @@ from sqlalchemy.schema import CreateTable
 from app.models import Base
 from app.models.entity import Entity
 from app.models.fact import Fact, FactEvidenceLink, FactValue
+from app.models.fact_value_duplicate_grouping import (
+    FactValueDuplicateGroup,
+    FactValueDuplicateGroupMember,
+    FactValueDuplicateGroupingApplication,
+)
 from app.schemas.fact import FactIdentityInput, FactRead, FactValueInput, FactValueRead
 
 
 def test_fact_tables_are_registered() -> None:
     assert {"facts", "fact_values", "fact_evidence_links"} <= set(Base.metadata.tables)
+
+
+def test_duplicate_grouping_tables_are_registered() -> None:
+    assert {
+        "fact_value_duplicate_grouping_applications",
+        "fact_value_duplicate_groups",
+        "fact_value_duplicate_group_members",
+    } <= set(Base.metadata.tables)
 
 
 def test_fact_identity_unique_constraint_exists() -> None:
@@ -444,6 +457,7 @@ def test_fact_migrations_include_inference_provenance_followup() -> None:
         "202607311800_fact_value_inference_replay.py",
         "202607312200_fact_extraction_orchestration.py",
         "202607312230_orchestration_recovery_hardening.py",
+        "202608010100_fact_value_duplicate_grouping.py",
     ]
     fact_migrations = sorted(
         path.name
@@ -459,7 +473,52 @@ def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
 
     facts_sql = str(CreateTable(Fact.__table__).compile(dialect=dialect))
     fact_values_sql = str(CreateTable(FactValue.__table__).compile(dialect=dialect))
+    dupgrp_app_sql = str(CreateTable(FactValueDuplicateGroupingApplication.__table__).compile(dialect=dialect))
+    dupgrp_group_sql = str(CreateTable(FactValueDuplicateGroup.__table__).compile(dialect=dialect))
+    dupgrp_member_sql = str(CreateTable(FactValueDuplicateGroupMember.__table__).compile(dialect=dialect))
 
     assert "subject_entity_id" in facts_sql
     assert "referenced_entity_id" in fact_values_sql
     assert "ck_fv_entity_ref_pair" in fact_values_sql
+    assert "uq_dupgrp_app_run_alg" in dupgrp_app_sql
+    assert "uq_dupgrp_group_app_key" in dupgrp_group_sql
+    assert "uq_dupgrp_member_app_fv" in dupgrp_member_sql
+    assert "fk_dupgrp_member_group_id_grouping_application_id_dupgrp_group" in dupgrp_member_sql
+
+
+def test_duplicate_grouping_migration_adds_tables_constraints_and_indexes() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202608010100_fact_value_duplicate_grouping.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert 'down_revision: str | None = "202607312230"' in content
+    assert '"fact_value_duplicate_grouping_applications"' in content
+    assert '"fact_value_duplicate_groups"' in content
+    assert '"fact_value_duplicate_group_members"' in content
+    assert 'name="uq_dupgrp_app_run_alg"' in content
+    assert 'name="uq_dupgrp_group_app_key"' in content
+    assert 'name="uq_dupgrp_member_app_fv"' in content
+    assert 'name="uq_dupgrp_member_group_fv"' in content
+    assert '"ix_dupgrp_app_extraction_run_id"' in content
+    assert '"ix_dupgrp_member_source_batch_id"' in content
+
+
+def test_duplicate_grouping_migration_downgrade_drops_tables_in_dependency_order() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202608010100_fact_value_duplicate_grouping.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert content.index('op.drop_table("fact_value_duplicate_group_members")') < content.index(
+        'op.drop_table("fact_value_duplicate_groups")'
+    )
+    assert content.index('op.drop_table("fact_value_duplicate_groups")') < content.index(
+        'op.drop_table("fact_value_duplicate_grouping_applications")'
+    )

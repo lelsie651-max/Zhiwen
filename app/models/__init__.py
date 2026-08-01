@@ -36,6 +36,11 @@ from app.models.fact import (
     FactValueType,
 )
 from app.models.fact_extraction_application import FactExtractionBatchApplication
+from app.models.fact_value_duplicate_grouping import (
+    FactValueDuplicateGroup,
+    FactValueDuplicateGroupMember,
+    FactValueDuplicateGroupingApplication,
+)
 from app.models.fact_extraction_orchestration import (
     FactExtractionOrchestration,
     FactExtractionOrchestrationBatch,
@@ -113,6 +118,9 @@ __all__ = [
     "FactEvidenceLink",
     "FactEvidenceRole",
     "FactExtractionBatchApplication",
+    "FactValueDuplicateGroupingApplication",
+    "FactValueDuplicateGroup",
+    "FactValueDuplicateGroupMember",
     "FactExtractionOrchestration",
     "FactExtractionOrchestrationBatch",
     "Document",

@@ -39,6 +39,7 @@ from app.schemas.fact_extraction_orchestration import (
 from app.schemas.fact_extraction_persistence import FactExtractionBatchPersistenceResult
 from app.schemas.fact_extraction_plan import FactExtractionPlan
 import app.services.fact_extraction_execution as execution_service
+import app.services.fact_value_duplicate_grouping as duplicate_grouping_service
 from app.services.fact_extraction_execution import (
     PreparedFactExtractionRunNotice,
     execute_fact_extraction_batch,
@@ -1839,6 +1840,35 @@ def _build_batch_result(batch: FactExtractionOrchestrationBatch) -> FactExtracti
     )
 
 
+async def _maybe_ensure_cross_batch_duplicate_grouping(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    extraction_run_id: uuid.UUID,
+    orchestration_result: FactExtractionOrchestrationResult,
+) -> FactExtractionOrchestrationResult:
+    if orchestration_result.status not in {
+        FactExtractionOrchestrationStatus.COMPLETED,
+        FactExtractionOrchestrationStatus.PARTIAL,
+    }:
+        return orchestration_result
+    try:
+        await duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
+            session_factory,
+            extraction_run_id=extraction_run_id,
+        )
+    except BaseException as error:
+        logger.warning(
+            "Cross-batch duplicate grouping did not complete after orchestration finalization",
+            extra={
+                "extraction_run_id": str(extraction_run_id),
+                "orchestration_id": str(orchestration_result.orchestration_id),
+                "orchestration_status": orchestration_result.status.value,
+                "error_type": type(error).__name__,
+            },
+        )
+    return orchestration_result
+
+
 async def _read_completed_orchestration_result(
     session: AsyncSession,
     *,
@@ -2063,10 +2093,15 @@ async def execute_fact_extraction_orchestration(
         )
     if prepared.reused_completed:
         async with session_factory() as session:
-            return await _read_completed_orchestration_result(
+            result = await _read_completed_orchestration_result(
                 session,
                 orchestration_id=prepared.orchestration_id,
             )
+        return await _maybe_ensure_cross_batch_duplicate_grouping(
+            session_factory,
+            extraction_run_id=extraction_run_id,
+            orchestration_result=result,
+        )
 
     async with session_factory() as session:
         try:
@@ -2208,7 +2243,12 @@ async def execute_fact_extraction_orchestration(
                     break
 
     async with session_factory() as session:
-        return await _finalize_orchestration(
+        result = await _finalize_orchestration(
             session,
             orchestration_id=prepared.orchestration_id,
         )
+    return await _maybe_ensure_cross_batch_duplicate_grouping(
+        session_factory,
+        extraction_run_id=extraction_run_id,
+        orchestration_result=result,
+    )
