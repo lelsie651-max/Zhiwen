@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,14 +18,19 @@ from app.models.consistency_check import (
 )
 from app.repositories import consistency_check as consistency_check_repository
 from app.repositories import fact_value_duplicate_grouping as duplicate_grouping_repository
+from app.repositories import consistency_projection as consistency_projection_repository
 from app.schemas.consistency_check import ConsistencyCheckPlan
 from app.schemas.consistency_check_execution import (
+    ConsistencyCheckAssessment,
+    ConsistencyCheckResponse,
     ConsistencyCheckBatchExecutionResult,
     ConsistencyCheckPlanExecutionResult,
 )
 from app.schemas.consistency_check_persistence import (
     ConsistencyAssessmentCitationSpec,
+    ConsistencyAssessmentCitationLedgerRecord,
     ConsistencyAssessmentSpec,
+    ConsistencyAssessmentLedgerRecord,
     ConsistencyCheckApplicationLedgerRecord,
     ConsistencyCheckBatchLedgerRecord,
     ConsistencyCheckBatchSpec,
@@ -49,6 +56,17 @@ class ConsistencyCheckPersistenceStateError(ConsistencyCheckPersistenceError):
 
 class ConsistencyCheckPersistenceInvariantError(ConsistencyCheckPersistenceError):
     """Raised when immutable persisted ledgers diverge from the authoritative projection."""
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedConsistencyCheckLedgerProjectionContext:
+    application: ConsistencyCheckApplicationLedgerRecord
+    authenticated_source: duplicate_grouping_service.AuthenticatedFactValueConsistencyCandidateApplication
+    candidate_bundles: tuple[object, ...]
+    source_rows: tuple[consistency_projection_repository.ConsistencyProjectionSourceRow, ...]
+    batches: tuple[ConsistencyCheckBatchLedgerRecord, ...]
+    assessments: tuple[ConsistencyAssessmentLedgerRecord, ...]
+    citations: tuple[ConsistencyAssessmentCitationLedgerRecord, ...]
 
 
 def _require_plan(plan: ConsistencyCheckPlan) -> ConsistencyCheckPlan:
@@ -615,6 +633,222 @@ async def _assert_existing_ledgers_match_plan(
                 _immutable_mismatch()
             if actual_citation.citation_order != expected_citation.citation_order:
                 _immutable_mismatch()
+
+
+async def authenticate_persisted_consistency_check_application(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    project_id: uuid.UUID,
+    consistency_check_application_id: uuid.UUID,
+) -> AuthenticatedConsistencyCheckLedgerProjectionContext:
+    if not isinstance(project_id, uuid.UUID):
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_project_id_invalid"
+        )
+    if not isinstance(consistency_check_application_id, uuid.UUID):
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_application_id_invalid"
+        )
+
+    async with session_factory() as read_session:
+        try:
+            snapshot = await consistency_projection_repository.load_consistency_projection_snapshot(
+                read_session,
+                consistency_check_application_id=consistency_check_application_id,
+            )
+        except BaseException:
+            await read_session.rollback()
+            raise
+        else:
+            await read_session.rollback()
+    if snapshot is None:
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_application_not_found"
+        )
+    if snapshot.application.project_id != project_id:
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_project_id_mismatch"
+        )
+
+    authenticated_source = (
+        await duplicate_grouping_service.authenticate_fact_value_consistency_candidate_application(
+            session_factory,
+            consistency_application_id=snapshot.application.consistency_application_id,
+        )
+    )
+    if snapshot.application.project_id != authenticated_source.project_id:
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_project_id_mismatch"
+        )
+    if snapshot.application.consistency_application_id != authenticated_source.application.id:
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_source_application_mismatch"
+        )
+    if snapshot.application.orchestration_id != authenticated_source.application.orchestration_id:
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_source_orchestration_mismatch"
+        )
+    if (
+        snapshot.application.source_result_manifest_hash
+        != authenticated_source.application.result_manifest_hash
+    ):
+        raise ConsistencyCheckPersistenceStateError(
+            "consistency_check_persistence_source_manifest_mismatch"
+        )
+
+    candidate_bundles = consistency_check_service._build_candidate_bundles(
+        authenticated_source,
+        snapshot.source_rows,
+    )
+    candidate_by_id = _build_unique_key_map(
+        candidate_bundles,
+        key_builder=lambda candidate: candidate.candidate_id,
+    )
+    batch_by_index = _build_unique_key_map(
+        snapshot.batches,
+        key_builder=lambda batch: batch.batch_index,
+    )
+    assessment_by_key = _build_unique_key_map(
+        snapshot.assessments,
+        key_builder=lambda assessment: (
+            assessment.batch_index,
+            assessment.source_consistency_candidate_id,
+        ),
+    )
+    assessment_by_id = _build_unique_key_map(
+        snapshot.assessments,
+        key_builder=lambda assessment: assessment.id,
+    )
+    if len(snapshot.batches) != snapshot.application.batch_count:
+        _immutable_mismatch()
+    if len(snapshot.assessments) != snapshot.application.assessment_count:
+        _immutable_mismatch()
+    if sum(1 for batch in snapshot.batches if batch.skipped_empty) != snapshot.application.skipped_empty_batch_count:
+        _immutable_mismatch()
+    if sum(1 for batch in snapshot.batches if batch.inference_run_id is not None) != snapshot.application.inference_run_count:
+        _immutable_mismatch()
+    if set(batch_by_index) != set(range(snapshot.application.batch_count)):
+        _immutable_mismatch()
+    if len(candidate_bundles) != len(snapshot.assessments):
+        _immutable_mismatch()
+    if {candidate.candidate_id for candidate in candidate_bundles} != {
+        assessment.source_consistency_candidate_id for assessment in snapshot.assessments
+    }:
+        _immutable_mismatch()
+
+    citations_by_assessment_id: dict[uuid.UUID, list[ConsistencyAssessmentCitationLedgerRecord]] = {}
+    for citation in snapshot.citations:
+        if citation.assessment_id not in assessment_by_id:
+            _immutable_mismatch()
+        citations_by_assessment_id.setdefault(citation.assessment_id, []).append(citation)
+
+    ordered_batch_results: list[ConsistencyCheckBatchExecutionResult] = []
+    ordered_assessments_by_batch: list[tuple[ConsistencyCheckAssessment, ...]] = []
+    for batch_index in range(snapshot.application.batch_count):
+        batch = batch_by_index[batch_index]
+        batch_assessments: list[ConsistencyCheckAssessment] = []
+        for candidate in candidate_bundles:
+            assessment_record = assessment_by_key.get((batch_index, candidate.candidate_id))
+            if assessment_record is None:
+                continue
+            if (
+                assessment_record.consistency_check_application_id != snapshot.application.id
+                or assessment_record.source_consistency_application_id
+                != snapshot.application.consistency_application_id
+                or candidate.candidate_id not in candidate_by_id
+            ):
+                _immutable_mismatch()
+
+            member_by_fact_value_id = {
+                member.fact_value_id: {
+                    evidence.evidence_link_id for evidence in member.evidences
+                }
+                for member in candidate.members
+            }
+            citations = citations_by_assessment_id.get(assessment_record.id, [])
+            citation_by_order = _build_unique_key_map(
+                citations,
+                key_builder=lambda citation: citation.citation_order,
+            )
+            cited_evidence_link_ids: list[uuid.UUID] = []
+            for citation_order in sorted(citation_by_order):
+                citation = citation_by_order[citation_order]
+                if (
+                    citation.source_consistency_application_id
+                    != snapshot.application.consistency_application_id
+                    or citation.source_consistency_candidate_id != candidate.candidate_id
+                ):
+                    _immutable_mismatch()
+                member_evidence_ids = member_by_fact_value_id.get(citation.source_fact_value_id)
+                if member_evidence_ids is None or citation.evidence_link_id not in member_evidence_ids:
+                    _immutable_mismatch()
+                cited_evidence_link_ids.append(citation.evidence_link_id)
+
+            assessment_model = ConsistencyCheckAssessment(
+                candidate_id=assessment_record.source_consistency_candidate_id,
+                verdict=assessment_record.verdict,
+                severity=assessment_record.severity,
+                confidence=assessment_record.confidence,
+                explanation=assessment_record.explanation,
+                cited_evidence_link_ids=cited_evidence_link_ids,
+                impact=list(assessment_record.impact_json),
+                recommended_actions=list(assessment_record.recommended_actions_json),
+            )
+            recomputed_hash = duplicate_grouping_service.hash_deterministic_payload(
+                execution_service._assessment_manifest_payload(assessment_model)
+            )
+            if recomputed_hash != assessment_record.assessment_manifest_hash:
+                _immutable_mismatch()
+            batch_assessments.append(assessment_model)
+
+        if batch.skipped_empty != (len(batch_assessments) == 0):
+            _immutable_mismatch()
+        ordered_assessments = tuple(batch_assessments)
+        ordered_assessments_by_batch.append(ordered_assessments)
+        ordered_batch_results.append(
+            ConsistencyCheckBatchExecutionResult(
+                project_id=snapshot.application.project_id,
+                consistency_application_id=snapshot.application.consistency_application_id,
+                source_result_manifest_hash=snapshot.application.source_result_manifest_hash,
+                plan_manifest_hash=snapshot.application.plan_manifest_hash,
+                batch_index=batch.batch_index,
+                batch_manifest_hash=batch.batch_manifest_hash,
+                input_batch_id=batch.input_batch_id,
+                inference_run_id=batch.inference_run_id,
+                request_hash=batch.request_hash,
+                message_content_hash=batch.message_content_hash,
+                skipped_empty=batch.skipped_empty,
+                reused_completed_run=False,
+                response=ConsistencyCheckResponse(assessments=list(ordered_assessments)),
+                response_model=None,
+                prompt_tokens=None,
+                completion_tokens=None,
+                total_tokens=None,
+            )
+        )
+
+    result_manifest_hash = execution_service._build_plan_result_manifest_hash(
+        authoritative_plan=SimpleNamespace(
+            project_id=snapshot.application.project_id,
+            consistency_application_id=snapshot.application.consistency_application_id,
+            source_result_manifest_hash=snapshot.application.source_result_manifest_hash,
+            plan_manifest_hash=snapshot.application.plan_manifest_hash,
+        ),
+        ordered_batch_results=tuple(ordered_batch_results),
+        ordered_assessments_by_batch=tuple(ordered_assessments_by_batch),
+    )
+    if result_manifest_hash != snapshot.application.result_manifest_hash:
+        _immutable_mismatch()
+
+    return AuthenticatedConsistencyCheckLedgerProjectionContext(
+        application=snapshot.application,
+        authenticated_source=authenticated_source,
+        candidate_bundles=tuple(candidate_bundles),
+        source_rows=snapshot.source_rows,
+        batches=snapshot.batches,
+        assessments=snapshot.assessments,
+        citations=snapshot.citations,
+    )
 
 def _build_result(
     *,
