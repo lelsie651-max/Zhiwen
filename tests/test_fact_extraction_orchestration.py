@@ -2507,4 +2507,4 @@ def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202608010400"]
+    assert list(script.get_heads()) == ["202608010500"]

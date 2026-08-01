@@ -1715,7 +1715,7 @@ def test_single_migration_head_is_fact_value_replay() -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202608010400"]
+    assert list(script.get_heads()) == ["202608010500"]
 
 
 def test_postgresql_offline_ddl_for_new_unique_constraint_compiles() -> None:

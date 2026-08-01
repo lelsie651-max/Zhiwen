@@ -61,6 +61,11 @@ from app.models.consistency_check import (
     ConsistencyCheckApplication,
     ConsistencyCheckBatchLedger,
 )
+from app.models.consistency_review import (
+    ConsistencyReviewDecision,
+    ConsistencyReviewDecisionKind,
+    ConsistencyReviewDecisionSelection,
+)
 from app.models.inference import (
     InferenceInputBatch,
     InferenceInputBlock,
@@ -145,6 +150,9 @@ __all__ = [
     "ConsistencyCheckBatchLedger",
     "ConsistencyAssessmentLedger",
     "ConsistencyAssessmentCitation",
+    "ConsistencyReviewDecision",
+    "ConsistencyReviewDecisionKind",
+    "ConsistencyReviewDecisionSelection",
     "IngestionValidationReport",
     "ValidationReportStatus",
     "ValidationReportOutcome",

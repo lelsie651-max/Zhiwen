@@ -36,7 +36,7 @@ def test_single_migration_head_is_consistency_check_ledger() -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202608010400"]
+    assert list(script.get_heads()) == ["202608010500"]
 
 
 def test_consistency_check_tables_compile_with_postgresql_offline_ddl() -> None:

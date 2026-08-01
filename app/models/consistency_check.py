@@ -33,6 +33,7 @@ from app.schemas.agent_consistency_check import (
 from app.utils.validation import normalize_text
 
 if TYPE_CHECKING:
+    from app.models.consistency_review import ConsistencyReviewDecision
     from app.models.fact import FactEvidenceLink
     from app.models.fact_extraction_orchestration import FactExtractionOrchestration
     from app.models.fact_value_duplicate_grouping import (
@@ -190,6 +191,11 @@ class ConsistencyCheckApplication(UUIDPrimaryKeyMixin, Base):
         UniqueConstraint(
             "execution_identity_hash",
             name="uq_ccapp_exec_identity_hash",
+        ),
+        UniqueConstraint(
+            "id",
+            "project_id",
+            name="uq_ccapp_id_project",
         ),
         UniqueConstraint(
             "id",
@@ -459,6 +465,13 @@ class ConsistencyAssessmentLedger(UUIDPrimaryKeyMixin, Base):
             "source_consistency_candidate_id",
             name="uq_ccasmt_id_srcapp_candidate",
         ),
+        UniqueConstraint(
+            "id",
+            "consistency_check_application_id",
+            "source_consistency_application_id",
+            "source_consistency_candidate_id",
+            name="uq_ccasmt_id_app_srccand",
+        ),
         CheckConstraint("batch_index >= 0", name="batch_index_nn"),
         CheckConstraint(f"verdict IN {_VERDICT_SQL}", name="verdict_valid"),
         CheckConstraint(f"severity IN {_SEVERITY_SQL}", name="severity_valid"),
@@ -528,6 +541,16 @@ class ConsistencyAssessmentLedger(UUIDPrimaryKeyMixin, Base):
             "ConsistencyAssessmentCitation.source_consistency_candidate_id]"
         ),
         order_by="ConsistencyAssessmentCitation.citation_order",
+    )
+    review_decisions: Mapped[list["ConsistencyReviewDecision"]] = relationship(
+        back_populates="assessment",
+        foreign_keys=(
+            "[ConsistencyReviewDecision.assessment_id, "
+            "ConsistencyReviewDecision.consistency_check_application_id, "
+            "ConsistencyReviewDecision.source_consistency_application_id, "
+            "ConsistencyReviewDecision.source_consistency_candidate_id]"
+        ),
+        order_by="ConsistencyReviewDecision.decision_no",
     )
 
     @validates("verdict")

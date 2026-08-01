@@ -10,6 +10,7 @@ from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.utils.validation import normalize_optional_email, normalize_text, validate_handle
 
 if TYPE_CHECKING:
+    from app.models.consistency_review import ConsistencyReviewDecision
     from app.models.document import Document
     from app.models.document_revision import DocumentRevision
     from app.models.dynamic_schema import DynamicSchema, DynamicSchemaVersion
@@ -108,6 +109,10 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     decided_fact_values: Mapped[list["FactValue"]] = relationship(
         back_populates="decided_by",
         foreign_keys="FactValue.decided_by_id",
+    )
+    consistency_review_decisions: Mapped[list["ConsistencyReviewDecision"]] = relationship(
+        back_populates="actor",
+        foreign_keys="ConsistencyReviewDecision.actor_id",
     )
     created_dynamic_schemas: Mapped[list["DynamicSchema"]] = relationship(
         back_populates="created_by",
