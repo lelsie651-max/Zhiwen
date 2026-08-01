@@ -48,6 +48,19 @@ class DuplicateGroupingOrchestrationState:
     extraction_run_status: str
     extraction_run_outcome: str | None
     orchestration_status: str
+    planner_name: str = ""
+    planner_version: str = ""
+    agent_name: str = ""
+    agent_version: str = ""
+    prompt_contract_hash: str = ""
+    provider: str = ""
+    requested_model: str = ""
+    executor_name: str = ""
+    executor_version: str = ""
+    persistence_name: str = ""
+    persistence_version: str = ""
+    entity_resolution_policy_name: str = ""
+    entity_resolution_policy_version: str = ""
 
 
 async def get_duplicate_grouping_orchestration_state(
@@ -63,6 +76,23 @@ async def get_duplicate_grouping_orchestration_state(
             FactExtractionOrchestration.status.label("orchestration_status"),
             DocumentExtractionRun.status.label("extraction_run_status"),
             DocumentExtractionRun.outcome.label("extraction_run_outcome"),
+            FactExtractionOrchestration.planner_name.label("planner_name"),
+            FactExtractionOrchestration.planner_version.label("planner_version"),
+            FactExtractionOrchestration.agent_name.label("agent_name"),
+            FactExtractionOrchestration.agent_version.label("agent_version"),
+            FactExtractionOrchestration.prompt_contract_hash.label("prompt_contract_hash"),
+            FactExtractionOrchestration.provider.label("provider"),
+            FactExtractionOrchestration.requested_model.label("requested_model"),
+            FactExtractionOrchestration.executor_name.label("executor_name"),
+            FactExtractionOrchestration.executor_version.label("executor_version"),
+            FactExtractionOrchestration.persistence_name.label("persistence_name"),
+            FactExtractionOrchestration.persistence_version.label("persistence_version"),
+            FactExtractionOrchestration.entity_resolution_policy_name.label(
+                "entity_resolution_policy_name"
+            ),
+            FactExtractionOrchestration.entity_resolution_policy_version.label(
+                "entity_resolution_policy_version"
+            ),
         )
         .select_from(FactExtractionOrchestration)
         .join(DocumentExtractionRun, FactExtractionOrchestration.extraction_run_id == DocumentExtractionRun.id)
@@ -80,6 +110,19 @@ async def get_duplicate_grouping_orchestration_state(
         extraction_run_status=row.extraction_run_status,
         extraction_run_outcome=row.extraction_run_outcome,
         orchestration_status=row.orchestration_status,
+        planner_name=row.planner_name,
+        planner_version=row.planner_version,
+        agent_name=row.agent_name,
+        agent_version=row.agent_version,
+        prompt_contract_hash=row.prompt_contract_hash,
+        provider=row.provider,
+        requested_model=row.requested_model,
+        executor_name=row.executor_name,
+        executor_version=row.executor_version,
+        persistence_name=row.persistence_name,
+        persistence_version=row.persistence_version,
+        entity_resolution_policy_name=row.entity_resolution_policy_name,
+        entity_resolution_policy_version=row.entity_resolution_policy_version,
     )
 
 

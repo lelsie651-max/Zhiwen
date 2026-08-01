@@ -92,6 +92,13 @@ class AuthenticatedFactValueConsistencyCandidateApplication:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthenticatedDuplicateGroupingSourceSnapshot:
+    state: duplicate_grouping_repository.DuplicateGroupingOrchestrationState
+    candidate_count: int
+    candidates: tuple[DuplicateCandidate, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _ConsistencyCandidateSourceItem:
     fact_value_id: uuid.UUID
     fact_id: uuid.UUID
@@ -978,41 +985,12 @@ async def ensure_cross_batch_duplicate_grouping(
 ) -> DuplicateGroupingResult:
     orchestration_id = _require_uuid(orchestration_id, field_name="orchestration_id")
     algorithm_version = normalize_duplicate_grouping_algorithm_version(algorithm_version)
-
-    async with session_factory() as read_session:
-        try:
-            state = await duplicate_grouping_repository.get_duplicate_grouping_orchestration_state(
-                read_session,
-                orchestration_id=orchestration_id,
-            )
-            state = _validate_run_state(state, orchestration_id=orchestration_id)
-            if await duplicate_grouping_repository.has_invalid_completed_batch_bindings(
-                read_session,
-                orchestration_id=orchestration_id,
-            ):
-                raise CrossBatchDuplicateGroupingInvariantError(
-                    "cross_batch_duplicate_grouping_completed_batch_binding_mismatch"
-                )
-            candidate_count = await duplicate_grouping_repository.count_duplicate_candidate_fact_values(
-                read_session,
-                orchestration_id=orchestration_id,
-            )
-            candidates = await duplicate_grouping_repository.list_duplicate_candidates(
-                read_session,
-                orchestration_id=orchestration_id,
-            )
-            if candidate_count != len(candidates):
-                raise CrossBatchDuplicateGroupingInvariantError(
-                    "cross_batch_duplicate_grouping_candidate_source_mismatch"
-                )
-        except duplicate_grouping_repository.DuplicateGroupingRepositoryInvariantError as error:
-            await read_session.rollback()
-            raise CrossBatchDuplicateGroupingInvariantError(str(error)) from None
-        except BaseException:
-            await read_session.rollback()
-            raise
-        else:
-            await read_session.rollback()
+    source_snapshot = await authenticate_duplicate_grouping_source_snapshot(
+        session_factory,
+        orchestration_id=orchestration_id,
+    )
+    state = source_snapshot.state
+    candidates = source_snapshot.candidates
 
     write_plan = build_duplicate_grouping_write_plan(
         candidates,
@@ -1189,6 +1167,55 @@ async def ensure_cross_batch_duplicate_grouping(
             "cross_batch_duplicate_grouping_concurrent_ledger_missing"
         )
     return existing_result
+
+
+async def authenticate_duplicate_grouping_source_snapshot(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    orchestration_id: uuid.UUID,
+) -> AuthenticatedDuplicateGroupingSourceSnapshot:
+    orchestration_id = _require_uuid(orchestration_id, field_name="orchestration_id")
+
+    async with session_factory() as read_session:
+        try:
+            state = await duplicate_grouping_repository.get_duplicate_grouping_orchestration_state(
+                read_session,
+                orchestration_id=orchestration_id,
+            )
+            state = _validate_run_state(state, orchestration_id=orchestration_id)
+            if await duplicate_grouping_repository.has_invalid_completed_batch_bindings(
+                read_session,
+                orchestration_id=orchestration_id,
+            ):
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_completed_batch_binding_mismatch"
+                )
+            candidate_count = await duplicate_grouping_repository.count_duplicate_candidate_fact_values(
+                read_session,
+                orchestration_id=orchestration_id,
+            )
+            candidates = await duplicate_grouping_repository.list_duplicate_candidates(
+                read_session,
+                orchestration_id=orchestration_id,
+            )
+            if candidate_count != len(candidates):
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_candidate_source_mismatch"
+                )
+        except duplicate_grouping_repository.DuplicateGroupingRepositoryInvariantError as error:
+            await read_session.rollback()
+            raise CrossBatchDuplicateGroupingInvariantError(str(error)) from None
+        except BaseException:
+            await read_session.rollback()
+            raise
+        else:
+            await read_session.rollback()
+
+    return AuthenticatedDuplicateGroupingSourceSnapshot(
+        state=state,
+        candidate_count=candidate_count,
+        candidates=candidates,
+    )
 
 
 async def _read_existing_consistency_candidate_result(

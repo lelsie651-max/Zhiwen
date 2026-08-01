@@ -72,6 +72,14 @@ from app.services.document_revision_diff import (
     DocumentRevisionBlockDiffStateError,
     get_document_revision_block_diff,
 )
+from app.services.document_revision_fact_diff import (
+    DOCUMENT_REVISION_FACT_DIFF_ALGORITHM_NAME,
+    DOCUMENT_REVISION_FACT_DIFF_ALGORITHM_VERSION,
+    DocumentRevisionFactDiffError,
+    DocumentRevisionFactDiffInvariantError,
+    DocumentRevisionFactDiffStateError,
+    get_document_revision_fact_diff,
+)
 from app.services.document_extraction import extract_document
 from app.services.document_upload import (
     ProjectDocumentSummary,
@@ -156,6 +164,9 @@ __all__ = [
     "DocumentRevisionBlockDiffError",
     "DocumentRevisionBlockDiffStateError",
     "DocumentRevisionBlockDiffInvariantError",
+    "DocumentRevisionFactDiffError",
+    "DocumentRevisionFactDiffStateError",
+    "DocumentRevisionFactDiffInvariantError",
     "DynamicSchemaServiceError",
     "DynamicSchemaProjectionError",
     "DynamicSchemaProjectionNotFoundError",
@@ -210,6 +221,9 @@ __all__ = [
     "persist_extraction_result",
     "create_source_evidence",
     "get_document_revision_block_diff",
+    "DOCUMENT_REVISION_FACT_DIFF_ALGORITHM_NAME",
+    "DOCUMENT_REVISION_FACT_DIFF_ALGORITHM_VERSION",
+    "get_document_revision_fact_diff",
     "extract_document",
     "UploadAccessError",
     "UploadFormError",

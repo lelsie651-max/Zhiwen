@@ -98,6 +98,14 @@ from app.schemas.document_revision_diff import (
     DocumentRevisionBlockDiffItem,
     DocumentRevisionDiffBlockSnapshot,
 )
+from app.schemas.document_revision_fact_diff import (
+    DocumentRevisionFactDiff,
+    DocumentRevisionFactDiffEvidenceLocator,
+    DocumentRevisionFactDiffEvidenceSnapshot,
+    DocumentRevisionFactDiffFactSnapshot,
+    DocumentRevisionFactDiffItem,
+    DocumentRevisionFactDiffValueGroup,
+)
 from app.schemas.document_upload import DocumentUploadSubmit
 from app.schemas.document_revision import (
     DocumentRevisionCreate,
@@ -211,6 +219,12 @@ __all__ = [
     "DocumentRevisionDiffBlockSnapshot",
     "DocumentRevisionBlockDiffItem",
     "DocumentRevisionBlockDiff",
+    "DocumentRevisionFactDiffEvidenceLocator",
+    "DocumentRevisionFactDiffEvidenceSnapshot",
+    "DocumentRevisionFactDiffFactSnapshot",
+    "DocumentRevisionFactDiffValueGroup",
+    "DocumentRevisionFactDiffItem",
+    "DocumentRevisionFactDiff",
     "DocumentUploadSubmit",
     "DocumentRevisionCreate",
     "DocumentRevisionRead",
