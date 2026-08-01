@@ -1840,7 +1840,7 @@ def _build_batch_result(batch: FactExtractionOrchestrationBatch) -> FactExtracti
     )
 
 
-async def _maybe_ensure_cross_batch_duplicate_grouping(
+async def _maybe_run_terminal_consistency_postprocessing(
     session_factory: Callable[[], AsyncSession],
     *,
     orchestration_result: FactExtractionOrchestrationResult,
@@ -1850,19 +1850,42 @@ async def _maybe_ensure_cross_batch_duplicate_grouping(
         FactExtractionOrchestrationStatus.PARTIAL,
     }:
         return orchestration_result
+    grouping_application_id: uuid.UUID | None = None
     try:
-        await duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
+        grouping_result = await duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
             session_factory,
             orchestration_id=orchestration_result.orchestration_id,
+        )
+        grouping_application_id = grouping_result.grouping_application_id
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning(
+            "Terminal orchestration consistency postprocessing step failed",
+            extra={
+                "stage": "duplicate_grouping",
+                "orchestration_id": str(orchestration_result.orchestration_id),
+                "orchestration_status": orchestration_result.status.value,
+                "error_type": type(error).__name__,
+            },
+        )
+        return orchestration_result
+
+    try:
+        await duplicate_grouping_service.ensure_cross_batch_multi_value_consistency_candidates(
+            session_factory,
+            duplicate_grouping_application_id=grouping_application_id,
         )
     except asyncio.CancelledError:
         raise
     except Exception as error:
         logger.warning(
-            "Cross-batch duplicate grouping did not complete after orchestration finalization",
+            "Terminal orchestration consistency postprocessing step failed",
             extra={
+                "stage": "consistency_candidates",
                 "orchestration_id": str(orchestration_result.orchestration_id),
                 "orchestration_status": orchestration_result.status.value,
+                "grouping_application_id": str(grouping_application_id),
                 "error_type": type(error).__name__,
             },
         )
@@ -2097,7 +2120,7 @@ async def execute_fact_extraction_orchestration(
                 session,
                 orchestration_id=prepared.orchestration_id,
             )
-        return await _maybe_ensure_cross_batch_duplicate_grouping(
+        return await _maybe_run_terminal_consistency_postprocessing(
             session_factory,
             orchestration_result=result,
         )
@@ -2246,7 +2269,7 @@ async def execute_fact_extraction_orchestration(
             session,
             orchestration_id=prepared.orchestration_id,
         )
-    return await _maybe_ensure_cross_batch_duplicate_grouping(
+    return await _maybe_run_terminal_consistency_postprocessing(
         session_factory,
         orchestration_result=result,
     )

@@ -2098,158 +2098,387 @@ def test_execute_orchestration_cancelled_cleans_up_and_reraises(monkeypatch) -> 
     assert cleanup_calls == []
 
 
-def test_execute_orchestration_reused_completed_result_triggers_duplicate_grouping(
+@pytest.mark.parametrize(
+    ("status", "expected_stage_calls"),
+    [
+        (
+            FactExtractionOrchestrationStatus.COMPLETED,
+            ("duplicate_grouping", "consistency_candidates"),
+        ),
+        (
+            FactExtractionOrchestrationStatus.PARTIAL,
+            ("duplicate_grouping", "consistency_candidates"),
+        ),
+    ],
+)
+def test_terminal_consistency_postprocessing_calls_grouping_then_candidates(
     monkeypatch,
+    status: FactExtractionOrchestrationStatus,
+    expected_stage_calls: tuple[str, str],
 ) -> None:
     session_factory = SessionFactory()
-    extraction_run_id, plan = _planned_fixture()
-    expected_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
-    ensure_calls: list[uuid.UUID] = []
+    orchestration_result = _make_orchestration_result(status=status)
+    grouping_application_id = uuid.uuid4()
+    calls: list[tuple[str, uuid.UUID]] = []
 
-    async def fake_prepare(*_args, **_kwargs):
-        return orchestration_service.PreparedFactExtractionOrchestration(
-            orchestration_id=expected_result.orchestration_id,
-            attempt_no=1,
-            request_hash=expected_result.request_hash,
-            plan_hash=expected_result.plan_hash,
-            reused_completed=True,
+    async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        assert algorithm_version == "cross_batch_exact_v2"
+        calls.append(("duplicate_grouping", orchestration_id))
+        return duplicate_grouping_service.DuplicateGroupingResult(
+            grouping_application_id=grouping_application_id,
+            algorithm_version=algorithm_version,
+            input_fact_value_count=2,
+            duplicate_group_count=0,
+            duplicate_member_count=0,
+            created_new=(status == FactExtractionOrchestrationStatus.COMPLETED),
         )
 
-    async def fake_read_completed(*_args, **_kwargs):
-        return expected_result
-
-    async def fake_ensure(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
-        assert algorithm_version == "cross_batch_exact_v2"
-        ensure_calls.append(orchestration_id)
+    async def fake_candidates(_session_factory, *, duplicate_grouping_application_id, algorithm_version="cross_batch_multi_value_v1"):
+        assert algorithm_version == "cross_batch_multi_value_v1"
+        calls.append(("consistency_candidates", duplicate_grouping_application_id))
         return SimpleNamespace(created_new=True)
 
-    monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
-    monkeypatch.setattr(orchestration_service, "_read_completed_orchestration_result", fake_read_completed)
     monkeypatch.setattr(
         orchestration_service.duplicate_grouping_service,
         "ensure_cross_batch_duplicate_grouping",
-        fake_ensure,
+        fake_grouping,
+    )
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_multi_value_consistency_candidates",
+        fake_candidates,
     )
 
     result = run_async(
-        orchestration_service.execute_fact_extraction_orchestration(
+        orchestration_service._maybe_run_terminal_consistency_postprocessing(
             session_factory,
-            project_id=uuid.uuid4(),
-            extraction_run_id=extraction_run_id,
-            plan=plan,
-            prompt=PROMPT,
-            llm_client=SimpleNamespace(),
-            provider="deepseek",
-            requested_model="deepseek-v4-flash",
-            worker_token=uuid.uuid4(),
+            orchestration_result=orchestration_result,
         )
     )
 
-    assert result == expected_result
-    assert ensure_calls == [expected_result.orchestration_id]
+    assert result == orchestration_result
+    assert calls == [
+        ("duplicate_grouping", orchestration_result.orchestration_id),
+        ("consistency_candidates", grouping_application_id),
+    ]
+    assert tuple(item[0] for item in calls) == expected_stage_calls
 
 
-def test_execute_orchestration_duplicate_grouping_failure_keeps_terminal_result(
+def test_terminal_consistency_postprocessing_skips_non_terminal_failure_status(
+    monkeypatch,
+) -> None:
+    session_factory = SessionFactory()
+    orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.FAILED)
+    calls: list[str] = []
+
+    async def fake_grouping(*_args, **_kwargs):
+        calls.append("grouping")
+        return None
+
+    async def fake_candidates(*_args, **_kwargs):
+        calls.append("candidate")
+        return None
+
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_duplicate_grouping",
+        fake_grouping,
+    )
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_multi_value_consistency_candidates",
+        fake_candidates,
+    )
+
+    result = run_async(
+        orchestration_service._maybe_run_terminal_consistency_postprocessing(
+            session_factory,
+            orchestration_result=orchestration_result,
+        )
+    )
+
+    assert result == orchestration_result
+    assert calls == []
+
+
+def test_terminal_consistency_postprocessing_grouping_idempotent_hit_still_runs_candidates(
+    monkeypatch,
+) -> None:
+    session_factory = SessionFactory()
+    orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+    grouping_application_id = uuid.uuid4()
+    calls: list[str] = []
+
+    async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        calls.append("grouping")
+        return duplicate_grouping_service.DuplicateGroupingResult(
+            grouping_application_id=grouping_application_id,
+            algorithm_version=algorithm_version,
+            input_fact_value_count=2,
+            duplicate_group_count=1,
+            duplicate_member_count=2,
+            created_new=False,
+        )
+
+    async def fake_candidates(_session_factory, *, duplicate_grouping_application_id, algorithm_version="cross_batch_multi_value_v1"):
+        assert duplicate_grouping_application_id == grouping_application_id
+        calls.append("candidate")
+        return SimpleNamespace(created_new=True)
+
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_duplicate_grouping",
+        fake_grouping,
+    )
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_multi_value_consistency_candidates",
+        fake_candidates,
+    )
+
+    result = run_async(
+        orchestration_service._maybe_run_terminal_consistency_postprocessing(
+            session_factory,
+            orchestration_result=orchestration_result,
+        )
+    )
+
+    assert result == orchestration_result
+    assert calls == ["grouping", "candidate"]
+
+
+def test_terminal_consistency_postprocessing_grouping_failure_keeps_terminal_result_and_skips_candidates(
     monkeypatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     session_factory = SessionFactory()
-    extraction_run_id, plan = _planned_fixture()
-    expected_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.PARTIAL)
-
-    async def fake_prepare(*_args, **_kwargs):
-        return orchestration_service.PreparedFactExtractionOrchestration(
-            orchestration_id=expected_result.orchestration_id,
-            attempt_no=1,
-            request_hash=expected_result.request_hash,
-            plan_hash=expected_result.plan_hash,
-            reused_completed=True,
-        )
-
-    async def fake_read_completed(*_args, **_kwargs):
-        return expected_result
-
+    orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.PARTIAL)
     sentinel = "SENSITIVE_DUPLICATE_GROUPING_SENTINEL"
+    candidate_called = False
 
-    async def fake_ensure(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
-        raise duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError(
-            sentinel
-        )
+    async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        raise duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError(sentinel)
 
-    monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
-    monkeypatch.setattr(orchestration_service, "_read_completed_orchestration_result", fake_read_completed)
+    async def fake_candidates(_session_factory, *, duplicate_grouping_application_id, algorithm_version="cross_batch_multi_value_v1"):
+        nonlocal candidate_called
+        candidate_called = True
+        return SimpleNamespace(created_new=True)
+
     monkeypatch.setattr(
         orchestration_service.duplicate_grouping_service,
         "ensure_cross_batch_duplicate_grouping",
-        fake_ensure,
+        fake_grouping,
+    )
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_multi_value_consistency_candidates",
+        fake_candidates,
     )
 
     result = run_async(
-        orchestration_service.execute_fact_extraction_orchestration(
+        orchestration_service._maybe_run_terminal_consistency_postprocessing(
             session_factory,
-            project_id=uuid.uuid4(),
-            extraction_run_id=extraction_run_id,
-            plan=plan,
-            prompt=PROMPT,
-            llm_client=SimpleNamespace(),
-            provider="deepseek",
-            requested_model="deepseek-v4-flash",
-            worker_token=uuid.uuid4(),
+            orchestration_result=orchestration_result,
         )
     )
 
-    assert result == expected_result
-    assert "Cross-batch duplicate grouping did not complete after orchestration finalization" in caplog.text
+    assert result == orchestration_result
+    assert candidate_called is False
+    assert "Terminal orchestration consistency postprocessing step failed" in caplog.text
+    assert any(getattr(record, "stage", None) == "duplicate_grouping" for record in caplog.records)
+    assert any(getattr(record, "error_type", None) == "CrossBatchDuplicateGroupingInvariantError" for record in caplog.records)
     assert sentinel not in caplog.text
 
 
-def test_execute_orchestration_duplicate_grouping_cancelled_error_propagates(
+def test_terminal_consistency_postprocessing_candidate_failure_keeps_terminal_result(
     monkeypatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     session_factory = SessionFactory()
-    extraction_run_id, plan = _planned_fixture()
-    expected_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+    orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+    grouping_application_id = uuid.uuid4()
+    sentinel = "SENSITIVE_CONSISTENCY_CANDIDATE_SENTINEL"
 
-    async def fake_prepare(*_args, **_kwargs):
-        return orchestration_service.PreparedFactExtractionOrchestration(
-            orchestration_id=expected_result.orchestration_id,
-            attempt_no=1,
-            request_hash=expected_result.request_hash,
-            plan_hash=expected_result.plan_hash,
-            reused_completed=True,
+    async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        return duplicate_grouping_service.DuplicateGroupingResult(
+            grouping_application_id=grouping_application_id,
+            algorithm_version=algorithm_version,
+            input_fact_value_count=2,
+            duplicate_group_count=1,
+            duplicate_member_count=2,
+            created_new=True,
         )
 
-    async def fake_read_completed(*_args, **_kwargs):
-        return expected_result
+    async def fake_candidates(_session_factory, *, duplicate_grouping_application_id, algorithm_version="cross_batch_multi_value_v1"):
+        raise duplicate_grouping_service.FactValueConsistencyCandidateInvariantError(sentinel)
 
-    async def fake_ensure(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
-        raise asyncio.CancelledError()
-
-    monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
-    monkeypatch.setattr(orchestration_service, "_read_completed_orchestration_result", fake_read_completed)
     monkeypatch.setattr(
         orchestration_service.duplicate_grouping_service,
         "ensure_cross_batch_duplicate_grouping",
-        fake_ensure,
+        fake_grouping,
+    )
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_multi_value_consistency_candidates",
+        fake_candidates,
+    )
+
+    result = run_async(
+        orchestration_service._maybe_run_terminal_consistency_postprocessing(
+            session_factory,
+            orchestration_result=orchestration_result,
+        )
+    )
+
+    assert result == orchestration_result
+    assert "Terminal orchestration consistency postprocessing step failed" in caplog.text
+    assert any(getattr(record, "stage", None) == "consistency_candidates" for record in caplog.records)
+    assert any(
+        getattr(record, "grouping_application_id", None) == str(grouping_application_id)
+        for record in caplog.records
+    )
+    assert any(
+        getattr(record, "error_type", None) == "FactValueConsistencyCandidateInvariantError"
+        for record in caplog.records
+    )
+    assert sentinel not in caplog.text
+
+
+def test_terminal_consistency_postprocessing_grouping_cancelled_error_propagates(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_factory = SessionFactory()
+    orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+
+    async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_duplicate_grouping",
+        fake_grouping,
     )
 
     with pytest.raises(asyncio.CancelledError):
         run_async(
-            orchestration_service.execute_fact_extraction_orchestration(
+            orchestration_service._maybe_run_terminal_consistency_postprocessing(
                 session_factory,
-                project_id=uuid.uuid4(),
-                extraction_run_id=extraction_run_id,
-                plan=plan,
-                prompt=PROMPT,
-                llm_client=SimpleNamespace(),
-                provider="deepseek",
-                requested_model="deepseek-v4-flash",
-                worker_token=uuid.uuid4(),
+                orchestration_result=orchestration_result,
             )
         )
 
-    assert "Cross-batch duplicate grouping did not complete after orchestration finalization" not in caplog.text
+    assert "Terminal orchestration consistency postprocessing step failed" not in caplog.text
+
+
+def test_terminal_consistency_postprocessing_candidate_cancelled_error_propagates(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_factory = SessionFactory()
+    orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+    grouping_application_id = uuid.uuid4()
+
+    async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        return duplicate_grouping_service.DuplicateGroupingResult(
+            grouping_application_id=grouping_application_id,
+            algorithm_version=algorithm_version,
+            input_fact_value_count=2,
+            duplicate_group_count=1,
+            duplicate_member_count=2,
+            created_new=True,
+        )
+
+    async def fake_candidates(_session_factory, *, duplicate_grouping_application_id, algorithm_version="cross_batch_multi_value_v1"):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_duplicate_grouping",
+        fake_grouping,
+    )
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_multi_value_consistency_candidates",
+        fake_candidates,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(
+            orchestration_service._maybe_run_terminal_consistency_postprocessing(
+                session_factory,
+                orchestration_result=orchestration_result,
+            )
+        )
+
+    assert "Terminal orchestration consistency postprocessing step failed" not in caplog.text
+
+
+@pytest.mark.parametrize("reused_completed", [True, False])
+def test_execute_orchestration_reused_completed_and_finalize_share_terminal_postprocessing_entry(
+    monkeypatch,
+    reused_completed: bool,
+) -> None:
+    session_factory = SessionFactory()
+    extraction_run_id, plan = _planned_fixture()
+    expected_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+    postprocess_calls: list[uuid.UUID] = []
+
+    async def fake_prepare(*_args, **_kwargs):
+        return orchestration_service.PreparedFactExtractionOrchestration(
+            orchestration_id=expected_result.orchestration_id,
+            attempt_no=1,
+            request_hash=expected_result.request_hash,
+            plan_hash=expected_result.plan_hash,
+            reused_completed=reused_completed,
+        )
+
+    async def fake_postprocess(_session_factory, *, orchestration_result):
+        postprocess_calls.append(orchestration_result.orchestration_id)
+        return orchestration_result
+
+    monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
+    monkeypatch.setattr(
+        orchestration_service,
+        "_maybe_run_terminal_consistency_postprocessing",
+        fake_postprocess,
+    )
+
+    if reused_completed:
+        async def fake_read_completed(*_args, **_kwargs):
+            return expected_result
+
+        monkeypatch.setattr(orchestration_service, "_read_completed_orchestration_result", fake_read_completed)
+    else:
+        async def fake_list_batches(*_args, **_kwargs):
+            return []
+
+        async def fake_finalize(*_args, **_kwargs):
+            return expected_result
+
+        monkeypatch.setattr(
+            orchestration_service.orchestration_repository,
+            "list_batches_for_orchestration",
+            fake_list_batches,
+        )
+        monkeypatch.setattr(orchestration_service, "_finalize_orchestration", fake_finalize)
+
+    result = run_async(
+        orchestration_service.execute_fact_extraction_orchestration(
+            session_factory,
+            project_id=uuid.uuid4(),
+            extraction_run_id=extraction_run_id,
+            plan=plan,
+            prompt=PROMPT,
+            llm_client=SimpleNamespace(),
+            provider="deepseek",
+            requested_model="deepseek-v4-flash",
+            worker_token=uuid.uuid4(),
+        )
+    )
+
+    assert result == expected_result
+    assert postprocess_calls == [expected_result.orchestration_id]
 
 
 def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:
