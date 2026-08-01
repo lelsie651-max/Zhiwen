@@ -330,10 +330,7 @@ def test_build_consistency_check_plan_builds_full_evidence_bundle_for_two_value_
 
     assert session_factory.open_count == 0
     assert plan.consistency_application_id == authenticated.application.id
-    assert (
-        plan.source_result_manifest_hash
-        == authenticated.source_duplicate_grouping_application.result_manifest_hash
-    )
+    assert plan.source_result_manifest_hash == authenticated.application.result_manifest_hash
     assert len(plan.batches) == 1
     batch = plan.batches[0]
     assert batch.candidate_ids == (candidate_specs[0]["candidate_id"],)
@@ -342,7 +339,7 @@ def test_build_consistency_check_plan_builds_full_evidence_bundle_for_two_value_
     assert candidate.candidate_id == candidate_specs[0]["candidate_id"]
     assert candidate.fact_id == candidate_specs[0]["fact_id"]
     assert candidate.candidate_kind == "multi_value"
-    assert plan.source_result_manifest_hash == authenticated.source_duplicate_grouping_application.result_manifest_hash
+    assert plan.source_result_manifest_hash == authenticated.application.result_manifest_hash
     assert [member.semantic_key_hash for member in candidate.members] == ["1" * 64, "2" * 64]
     assert candidate.members[0].value_json == "Alice"
     assert candidate.members[0].evidences[0].excerpt == "Alice lives in City A"
@@ -680,6 +677,217 @@ def test_build_consistency_check_plan_is_deterministic_for_same_input(
     ]
 
 
+def test_build_consistency_check_plan_hashes_anchor_to_consistency_source_and_application_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_specs = [
+        _candidate_spec(
+            candidate_id=uuid.UUID("00000000-0000-0000-0000-000000000301"),
+            fact_id=uuid.UUID("00000000-0000-0000-0000-000000000401"),
+            members=[
+                _member_spec(
+                    semantic_key_hash="1" * 64,
+                    value_json="A",
+                    evidences=[_evidence_spec(source_order=0, excerpt="alpha", location_key="md:a")],
+                ),
+                _member_spec(
+                    semantic_key_hash="2" * 64,
+                    value_json="B",
+                    evidences=[_evidence_spec(source_order=0, excerpt="beta", location_key="md:b")],
+                ),
+            ],
+        )
+    ]
+    baseline = make_authenticated_application(
+        candidate_specs,
+        consistency_application_id=uuid.UUID("00000000-0000-0000-0000-000000000501"),
+        result_manifest_hash="1" * 64,
+    )
+    different_source = make_authenticated_application(
+        candidate_specs,
+        consistency_application_id=uuid.UUID("00000000-0000-0000-0000-000000000503"),
+        duplicate_grouping_application_id=baseline.source_duplicate_grouping_application.id,
+        orchestration_id=baseline.application.orchestration_id,
+        extraction_run_id=baseline.application.extraction_run_id,
+        result_manifest_hash="2" * 64,
+    )
+    different_application = make_authenticated_application(
+        candidate_specs,
+        consistency_application_id=uuid.UUID("00000000-0000-0000-0000-000000000502"),
+        duplicate_grouping_application_id=baseline.source_duplicate_grouping_application.id,
+        orchestration_id=baseline.application.orchestration_id,
+        extraction_run_id=baseline.application.extraction_run_id,
+        result_manifest_hash=baseline.application.result_manifest_hash,
+    )
+    rows_by_application_id = {
+        baseline.application.id: make_rows(baseline, candidate_specs),
+        different_source.application.id: make_rows(different_source, candidate_specs),
+        different_application.application.id: make_rows(different_application, candidate_specs),
+    }
+    authenticated_by_application_id = {
+        baseline.application.id: baseline,
+        different_source.application.id: different_source,
+        different_application.application.id: different_application,
+    }
+    session_factory = SessionFactory()
+
+    async def fake_auth(_session_factory, *, consistency_application_id):
+        return authenticated_by_application_id[consistency_application_id]
+
+    async def fake_rows(_session, *, consistency_application_id):
+        return rows_by_application_id[consistency_application_id]
+
+    monkeypatch.setattr(
+        duplicate_grouping_service,
+        "authenticate_fact_value_consistency_candidate_application",
+        fake_auth,
+    )
+    monkeypatch.setattr(
+        consistency_check_repository,
+        "list_consistency_check_candidate_rows",
+        fake_rows,
+    )
+
+    baseline_plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=baseline.application.id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+    different_source_plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=different_source.application.id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+    different_application_plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=different_application.application.id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+
+    assert baseline_plan.source_result_manifest_hash == baseline.application.result_manifest_hash
+    assert different_source_plan.source_result_manifest_hash == different_source.application.result_manifest_hash
+    assert baseline_plan.batches[0].batch_manifest_hash != different_source_plan.batches[0].batch_manifest_hash
+    assert baseline_plan.plan_manifest_hash != different_source_plan.plan_manifest_hash
+    assert baseline_plan.batches[0].batch_manifest_hash != different_application_plan.batches[0].batch_manifest_hash
+    assert baseline_plan.plan_manifest_hash != different_application_plan.plan_manifest_hash
+
+
+def test_build_consistency_check_plan_does_not_anchor_to_duplicate_grouping_result_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_specs = [
+        _candidate_spec(
+            fact_id=uuid.uuid4(),
+            members=[
+                _member_spec(
+                    semantic_key_hash="1" * 64,
+                    value_json="A",
+                    evidences=[_evidence_spec(source_order=0, excerpt="alpha", location_key="md:a")],
+                ),
+                _member_spec(
+                    semantic_key_hash="2" * 64,
+                    value_json="B",
+                    evidences=[_evidence_spec(source_order=0, excerpt="beta", location_key="md:b")],
+                ),
+            ],
+        )
+    ]
+    baseline = make_authenticated_application(candidate_specs, result_manifest_hash="3" * 64)
+    drifted_upstream = make_authenticated_application(
+        candidate_specs,
+        consistency_application_id=baseline.application.id,
+        duplicate_grouping_application_id=baseline.source_duplicate_grouping_application.id,
+        orchestration_id=baseline.application.orchestration_id,
+        extraction_run_id=baseline.application.extraction_run_id,
+        result_manifest_hash=baseline.application.result_manifest_hash,
+    )
+    drifted_upstream = SimpleNamespace(
+        application=drifted_upstream.application,
+        source_duplicate_grouping_application=replace(
+            drifted_upstream.source_duplicate_grouping_application,
+            result_manifest_hash="9" * 64,
+        ),
+        write_plan=drifted_upstream.write_plan,
+        candidate_ledgers=drifted_upstream.candidate_ledgers,
+        member_ledgers=drifted_upstream.member_ledgers,
+    )
+    rows_by_application_id = {
+        baseline.application.id: make_rows(baseline, candidate_specs),
+    }
+    authenticated_by_key = {
+        "baseline": baseline,
+        "drifted": drifted_upstream,
+    }
+    session_factory = SessionFactory()
+
+    async def fake_rows(_session, *, consistency_application_id):
+        return rows_by_application_id[consistency_application_id]
+
+    monkeypatch.setattr(
+        consistency_check_repository,
+        "list_consistency_check_candidate_rows",
+        fake_rows,
+    )
+
+    async def baseline_auth(_session_factory, *, consistency_application_id):
+        return authenticated_by_key["baseline"]
+
+    monkeypatch.setattr(
+        duplicate_grouping_service,
+        "authenticate_fact_value_consistency_candidate_application",
+        baseline_auth,
+    )
+    baseline_plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=baseline.application.id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+
+    async def drifted_auth(_session_factory, *, consistency_application_id):
+        return authenticated_by_key["drifted"]
+
+    monkeypatch.setattr(
+        duplicate_grouping_service,
+        "authenticate_fact_value_consistency_candidate_application",
+        drifted_auth,
+    )
+    drifted_plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=baseline.application.id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+
+    assert drifted_plan.source_result_manifest_hash == baseline.application.result_manifest_hash
+    assert drifted_plan.source_result_manifest_hash != drifted_upstream.source_duplicate_grouping_application.result_manifest_hash
+    assert drifted_plan.batches[0].batch_manifest_hash == baseline_plan.batches[0].batch_manifest_hash
+    assert drifted_plan.plan_manifest_hash == baseline_plan.plan_manifest_hash
+
+
 def test_build_consistency_check_plan_batches_without_splitting_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -755,6 +963,193 @@ def test_build_consistency_check_plan_batches_without_splitting_candidates(
     assert plan.batches[1].candidate_ids == (candidate_specs[1]["candidate_id"],)
 
 
+def test_build_consistency_check_plan_recomputes_excerpt_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_specs = [
+        _candidate_spec(
+            fact_id=uuid.uuid4(),
+            members=[
+                _member_spec(
+                    semantic_key_hash="1" * 64,
+                    value_json="A",
+                    evidences=[_evidence_spec(source_order=0, excerpt="matched excerpt", location_key="md:a")],
+                ),
+                _member_spec(
+                    semantic_key_hash="2" * 64,
+                    value_json="B",
+                    evidences=[_evidence_spec(source_order=0, excerpt="other excerpt", location_key="md:b")],
+                ),
+            ],
+        )
+    ]
+    authenticated = make_authenticated_application(candidate_specs)
+    rows = make_rows(authenticated, candidate_specs)
+    session_factory = SessionFactory()
+
+    async def fake_auth(_session_factory, *, consistency_application_id):
+        return authenticated
+
+    async def fake_rows(_session, *, consistency_application_id):
+        return rows
+
+    monkeypatch.setattr(
+        duplicate_grouping_service,
+        "authenticate_fact_value_consistency_candidate_application",
+        fake_auth,
+    )
+    monkeypatch.setattr(
+        consistency_check_repository,
+        "list_consistency_check_candidate_rows",
+        fake_rows,
+    )
+
+    plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=authenticated.application.id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+
+    assert plan.batches[0].candidates[0].members[0].evidences[0].evidence_content_hash == sha256(
+        "matched excerpt"
+    )
+
+
+def test_build_consistency_check_plan_fails_closed_on_excerpt_hash_drift_without_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "SENSITIVE_EXCERPT_SENTINEL"
+    candidate_specs = [
+        _candidate_spec(
+            fact_id=uuid.uuid4(),
+            members=[
+                _member_spec(
+                    semantic_key_hash="1" * 64,
+                    value_json="A",
+                    evidences=[_evidence_spec(source_order=0, excerpt=sentinel, location_key="md:a")],
+                ),
+                _member_spec(
+                    semantic_key_hash="2" * 64,
+                    value_json="B",
+                    evidences=[_evidence_spec(source_order=0, excerpt="other", location_key="md:b")],
+                ),
+            ],
+        )
+    ]
+    authenticated = make_authenticated_application(candidate_specs)
+    rows = list(make_rows(authenticated, candidate_specs))
+    rows[0] = replace(rows[0], excerpt_hash="0" * 64)
+    session_factory = SessionFactory()
+
+    async def fake_auth(_session_factory, *, consistency_application_id):
+        return authenticated
+
+    async def fake_rows(_session, *, consistency_application_id):
+        return tuple(rows)
+
+    monkeypatch.setattr(
+        duplicate_grouping_service,
+        "authenticate_fact_value_consistency_candidate_application",
+        fake_auth,
+    )
+    monkeypatch.setattr(
+        consistency_check_repository,
+        "list_consistency_check_candidate_rows",
+        fake_rows,
+    )
+
+    with pytest.raises(
+        consistency_check_service.ConsistencyCheckPlanInvariantError,
+        match="consistency_check_plan_evidence_hash_mismatch",
+    ) as exc_info:
+        run_async(
+            consistency_check_service.build_consistency_check_plan(
+                session_factory,
+                consistency_application_id=authenticated.application.id,
+                config=ConsistencyCheckPlannerConfig(
+                    max_candidates_per_batch=8,
+                    max_evidence_characters_per_batch=500,
+                ),
+            )
+        )
+
+    assert sentinel not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "evidence_role",
+        "evidence_is_primary",
+        "evidence_source_order",
+        "start_offset",
+        "end_offset",
+    ],
+)
+def test_build_consistency_check_plan_rejects_missing_required_evidence_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+) -> None:
+    candidate_specs = [
+        _candidate_spec(
+            fact_id=uuid.uuid4(),
+            members=[
+                _member_spec(
+                    semantic_key_hash="1" * 64,
+                    value_json="A",
+                    evidences=[_evidence_spec(source_order=0, excerpt="alpha", location_key="md:a")],
+                ),
+                _member_spec(
+                    semantic_key_hash="2" * 64,
+                    value_json="B",
+                    evidences=[_evidence_spec(source_order=0, excerpt="beta", location_key="md:b")],
+                ),
+            ],
+        )
+    ]
+    authenticated = make_authenticated_application(candidate_specs)
+    rows = list(make_rows(authenticated, candidate_specs))
+    rows[0] = replace(rows[0], **{field_name: None})
+    session_factory = SessionFactory()
+
+    async def fake_auth(_session_factory, *, consistency_application_id):
+        return authenticated
+
+    async def fake_rows(_session, *, consistency_application_id):
+        return tuple(rows)
+
+    monkeypatch.setattr(
+        duplicate_grouping_service,
+        "authenticate_fact_value_consistency_candidate_application",
+        fake_auth,
+    )
+    monkeypatch.setattr(
+        consistency_check_repository,
+        "list_consistency_check_candidate_rows",
+        fake_rows,
+    )
+
+    with pytest.raises(
+        consistency_check_service.ConsistencyCheckPlanInvariantError,
+        match="consistency_check_plan_member_evidence_missing",
+    ):
+        run_async(
+            consistency_check_service.build_consistency_check_plan(
+                session_factory,
+                consistency_application_id=authenticated.application.id,
+                config=ConsistencyCheckPlannerConfig(
+                    max_candidates_per_batch=8,
+                    max_evidence_characters_per_batch=500,
+                ),
+            )
+        )
+
+
 def test_build_consistency_check_plan_rejects_oversized_single_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -810,3 +1205,42 @@ def test_build_consistency_check_plan_rejects_oversized_single_candidate(
                 ),
             )
         )
+
+
+def test_consistency_check_planner_config_accepts_only_positive_ints() -> None:
+    config = ConsistencyCheckPlannerConfig(
+        max_candidates_per_batch=1,
+        max_evidence_characters_per_batch=10,
+    )
+
+    assert config.max_candidates_per_batch == 1
+    assert config.max_evidence_characters_per_batch == 10
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_candidates_per_batch", True),
+        ("max_candidates_per_batch", 1.5),
+        ("max_candidates_per_batch", "1"),
+        ("max_candidates_per_batch", 0),
+        ("max_candidates_per_batch", -1),
+        ("max_evidence_characters_per_batch", True),
+        ("max_evidence_characters_per_batch", 1.5),
+        ("max_evidence_characters_per_batch", "1"),
+        ("max_evidence_characters_per_batch", 0),
+        ("max_evidence_characters_per_batch", -1),
+    ],
+)
+def test_consistency_check_planner_config_rejects_non_positive_or_non_int_values(
+    field_name: str,
+    value: object,
+) -> None:
+    kwargs = {
+        "max_candidates_per_batch": 1,
+        "max_evidence_characters_per_batch": 10,
+    }
+    kwargs[field_name] = value
+
+    with pytest.raises(ValueError):
+        ConsistencyCheckPlannerConfig(**kwargs)

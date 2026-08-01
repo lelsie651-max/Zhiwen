@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
+import hashlib
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -87,6 +88,10 @@ def _build_candidate_manifest_payload(
 
 def _candidate_evidence_character_count(candidate: ConsistencyCheckCandidateBundle) -> int:
     return sum(len(evidence.excerpt) for member in candidate.members for evidence in member.evidences)
+
+
+def _hash_excerpt_text(excerpt: str) -> str:
+    return hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
 
 
 def _build_candidate_bundles(
@@ -186,6 +191,18 @@ def _build_candidate_bundles(
             raise ConsistencyCheckPlanInvariantError("consistency_check_plan_member_evidence_missing")
         if row.location_key is None:
             raise ConsistencyCheckPlanInvariantError("consistency_check_plan_member_evidence_missing")
+        if row.evidence_role is None:
+            raise ConsistencyCheckPlanInvariantError("consistency_check_plan_member_evidence_missing")
+        if row.evidence_is_primary is None:
+            raise ConsistencyCheckPlanInvariantError("consistency_check_plan_member_evidence_missing")
+        if row.evidence_source_order is None:
+            raise ConsistencyCheckPlanInvariantError("consistency_check_plan_member_evidence_missing")
+        if row.start_offset is None:
+            raise ConsistencyCheckPlanInvariantError("consistency_check_plan_member_evidence_missing")
+        if row.end_offset is None:
+            raise ConsistencyCheckPlanInvariantError("consistency_check_plan_member_evidence_missing")
+        if _hash_excerpt_text(row.excerpt) != row.excerpt_hash:
+            raise ConsistencyCheckPlanInvariantError("consistency_check_plan_evidence_hash_mismatch")
 
         seen_candidate_ids.add(row.candidate_id)
         seen_member_ids.add(row.member_id)
@@ -203,16 +220,16 @@ def _build_candidate_bundles(
             ConsistencyCheckEvidenceBundle(
                 evidence_link_id=row.evidence_link_id,
                 evidence_id=row.evidence_id,
-                role=row.evidence_role or "supporting",
-                is_primary=bool(row.evidence_is_primary),
-                source_order=row.evidence_source_order if row.evidence_source_order is not None else 0,
+                role=row.evidence_role,
+                is_primary=row.evidence_is_primary,
+                source_order=row.evidence_source_order,
                 document_block_id=row.block_id,
                 location_key=row.location_key,
                 page_no=row.page_no,
                 start_line=row.start_line,
                 end_line=row.end_line,
-                start_offset=row.start_offset if row.start_offset is not None else 0,
-                end_offset=row.end_offset if row.end_offset is not None else 0,
+                start_offset=row.start_offset,
+                end_offset=row.end_offset,
                 excerpt=row.excerpt,
                 evidence_content_hash=row.excerpt_hash,
             )
@@ -299,6 +316,8 @@ def _build_consistency_check_batches(
         batch_index = len(batches)
         batch_manifest_hash = duplicate_grouping_service.hash_deterministic_payload(
             {
+                "consistency_application_id": str(consistency_application_id),
+                "source_result_manifest_hash": source_result_manifest_hash,
                 "batch_index": batch_index,
                 "candidate_count": len(current_candidates),
                 "candidate_ids": [str(candidate.candidate_id) for candidate in current_candidates],
@@ -343,6 +362,8 @@ def _build_consistency_check_batches(
     if not batches and authenticated_candidate_count == 0:
         batch_manifest_hash = duplicate_grouping_service.hash_deterministic_payload(
             {
+                "consistency_application_id": str(consistency_application_id),
+                "source_result_manifest_hash": source_result_manifest_hash,
                 "batch_index": 0,
                 "candidate_count": 0,
                 "candidate_ids": [],
@@ -403,7 +424,7 @@ async def build_consistency_check_plan(
     plan_manifest_hash = duplicate_grouping_service.hash_deterministic_payload(
         {
             "consistency_application_id": str(consistency_application_id),
-            "source_result_manifest_hash": authenticated.source_duplicate_grouping_application.result_manifest_hash,
+            "source_result_manifest_hash": authenticated.application.result_manifest_hash,
             "planner_name": CONSISTENCY_CHECK_PLANNER_NAME,
             "planner_version": CONSISTENCY_CHECK_PLANNER_VERSION,
             "config": asdict(config),
@@ -421,7 +442,7 @@ async def build_consistency_check_plan(
     )
     return ConsistencyCheckPlan(
         consistency_application_id=consistency_application_id,
-        source_result_manifest_hash=authenticated.source_duplicate_grouping_application.result_manifest_hash,
+        source_result_manifest_hash=authenticated.application.result_manifest_hash,
         planner_name=CONSISTENCY_CHECK_PLANNER_NAME,
         planner_version=CONSISTENCY_CHECK_PLANNER_VERSION,
         config=config,

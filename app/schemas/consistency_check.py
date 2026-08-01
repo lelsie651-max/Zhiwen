@@ -15,10 +15,15 @@ class ConsistencyCheckPlannerConfig:
     max_evidence_characters_per_batch: int
 
     def __post_init__(self) -> None:
-        if isinstance(self.max_candidates_per_batch, bool) or self.max_candidates_per_batch <= 0:
+        if (
+            not isinstance(self.max_candidates_per_batch, int)
+            or isinstance(self.max_candidates_per_batch, bool)
+            or self.max_candidates_per_batch <= 0
+        ):
             raise ValueError("max_candidates_per_batch must be a positive integer")
         if (
-            isinstance(self.max_evidence_characters_per_batch, bool)
+            not isinstance(self.max_evidence_characters_per_batch, int)
+            or isinstance(self.max_evidence_characters_per_batch, bool)
             or self.max_evidence_characters_per_batch <= 0
         ):
             raise ValueError("max_evidence_characters_per_batch must be a positive integer")
