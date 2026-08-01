@@ -548,6 +548,7 @@ def test_full_alembic_upgrade_head_sql_generates_to_current_head() -> None:
     assert result.returncode == 0, result.stderr or result.stdout
     assert "-- Running upgrade 202607310330 -> 202607311030" in result.stdout
     assert "-- Running upgrade 202608010200 -> 202608010300" in result.stdout
+    assert "-- Running upgrade 202608010300 -> 202608010400" in result.stdout
     assert "INSERT INTO alembic_version" in result.stdout
 
 

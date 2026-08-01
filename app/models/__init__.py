@@ -55,6 +55,12 @@ from app.models.document_revision import (
     SourceAuthority,
     UploadIntent,
 )
+from app.models.consistency_check import (
+    ConsistencyAssessmentCitation,
+    ConsistencyAssessmentLedger,
+    ConsistencyCheckApplication,
+    ConsistencyCheckBatchLedger,
+)
 from app.models.inference import (
     InferenceInputBatch,
     InferenceInputBlock,
@@ -135,6 +141,10 @@ __all__ = [
     "DocumentRevisionStatus",
     "UploadIntent",
     "SourceAuthority",
+    "ConsistencyCheckApplication",
+    "ConsistencyCheckBatchLedger",
+    "ConsistencyAssessmentLedger",
+    "ConsistencyAssessmentCitation",
     "IngestionValidationReport",
     "ValidationReportStatus",
     "ValidationReportOutcome",

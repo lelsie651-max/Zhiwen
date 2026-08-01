@@ -270,7 +270,7 @@ def test_processing_job_single_head_and_result_link_migration_exist() -> None:
     migration_path = root / "alembic" / "versions" / "202607311600_processing_job_result_links.py"
     content = migration_path.read_text(encoding="utf-8")
 
-    assert list(script.get_heads()) == ["202608010300"]
+    assert list(script.get_heads()) == ["202608010400"]
     assert 'down_revision: str | None = "202607311430"' in content
     assert '"uq_pj_result_run_id"' in content
     assert "multiple processing jobs reference the same extraction run" in content
