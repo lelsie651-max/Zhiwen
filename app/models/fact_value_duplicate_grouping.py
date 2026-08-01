@@ -36,6 +36,15 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "fact_value_duplicate_grouping_applications"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["orchestration_id", "extraction_run_id"],
+            [
+                "fact_extraction_orchestrations.id",
+                "fact_extraction_orchestrations.extraction_run_id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_dupgrp_app_orch_run_feo",
+        ),
         UniqueConstraint(
             "orchestration_id",
             "algorithm_version",
@@ -63,10 +72,7 @@ class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
         ForeignKey("extraction_runs.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    orchestration_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("fact_extraction_orchestrations.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
+    orchestration_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
     input_manifest_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     result_manifest_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -95,8 +101,14 @@ class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
         server_default=text("CURRENT_TIMESTAMP"),
     )
 
-    extraction_run: Mapped["ExtractionRun"] = relationship(foreign_keys=[extraction_run_id])
-    orchestration: Mapped["FactExtractionOrchestration"] = relationship(foreign_keys=[orchestration_id])
+    extraction_run: Mapped["ExtractionRun"] = relationship(
+        foreign_keys=[extraction_run_id],
+        overlaps="orchestration",
+    )
+    orchestration: Mapped["FactExtractionOrchestration"] = relationship(
+        foreign_keys=[orchestration_id, extraction_run_id],
+        overlaps="extraction_run",
+    )
     groups: Mapped[list["FactValueDuplicateGroup"]] = relationship(
         back_populates="grouping_application",
         foreign_keys="FactValueDuplicateGroup.grouping_application_id",

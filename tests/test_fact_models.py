@@ -10,6 +10,7 @@ from sqlalchemy.schema import CreateTable
 from app.models import Base
 from app.models.entity import Entity
 from app.models.fact import Fact, FactEvidenceLink, FactValue
+from app.models.fact_extraction_orchestration import FactExtractionOrchestration
 from app.models.fact_value_duplicate_grouping import (
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
@@ -472,22 +473,54 @@ def test_fact_migrations_include_inference_provenance_followup() -> None:
 def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
     dialect = postgresql.dialect()
 
+    orchestration_sql = str(CreateTable(FactExtractionOrchestration.__table__).compile(dialect=dialect))
     facts_sql = str(CreateTable(Fact.__table__).compile(dialect=dialect))
     fact_values_sql = str(CreateTable(FactValue.__table__).compile(dialect=dialect))
     dupgrp_app_sql = str(CreateTable(FactValueDuplicateGroupingApplication.__table__).compile(dialect=dialect))
     dupgrp_group_sql = str(CreateTable(FactValueDuplicateGroup.__table__).compile(dialect=dialect))
     dupgrp_member_sql = str(CreateTable(FactValueDuplicateGroupMember.__table__).compile(dialect=dialect))
 
+    assert "uq_feo_id_extraction_run" in orchestration_sql
     assert "subject_entity_id" in facts_sql
     assert "referenced_entity_id" in fact_values_sql
     assert "ck_fv_entity_ref_pair" in fact_values_sql
     assert "uq_dupgrp_app_orch_alg" in dupgrp_app_sql
     assert "uq_dupgrp_app_id_orch" in dupgrp_app_sql
+    assert "fk_dupgrp_app_orch_run_feo" in dupgrp_app_sql
+    assert 'FOREIGN KEY(orchestration_id, extraction_run_id) REFERENCES fact_extraction_orchestrations (id, extraction_run_id) ON DELETE RESTRICT' in dupgrp_app_sql
     assert "uq_dupgrp_group_app_key" in dupgrp_group_sql
     assert "uq_dupgrp_member_app_fv" in dupgrp_member_sql
     assert "fk_dupgrp_member_group_id_grouping_application_id_dupgrp_group" in dupgrp_member_sql
     assert "fk_dupgrp_member_app_orch_dupgrp_app" in dupgrp_member_sql
     assert "fk_dupgrp_member_batch_orch_feob" in dupgrp_member_sql
+
+
+def test_duplicate_grouping_application_metadata_uses_composite_orchestration_fk() -> None:
+    app_table = Base.metadata.tables["fact_value_duplicate_grouping_applications"]
+    orch_table = Base.metadata.tables["fact_extraction_orchestrations"]
+
+    orchestration_uniques = {
+        tuple(constraint.columns.keys()): constraint.name
+        for constraint in orch_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    app_foreign_keys = {
+        tuple(constraint.column_keys): (
+            constraint.name,
+            tuple(element.column.name for element in constraint.elements),
+            constraint.ondelete,
+        )
+        for constraint in app_table.foreign_key_constraints
+    }
+
+    assert orchestration_uniques[("id", "extraction_run_id")] == "uq_feo_id_extraction_run"
+    assert app_foreign_keys[("extraction_run_id",)][0] == "fk_fact_value_duplicate_grouping_applications_extraction_run_id_extraction_runs"
+    assert app_foreign_keys[("orchestration_id", "extraction_run_id")] == (
+        "fk_dupgrp_app_orch_run_feo",
+        ("id", "extraction_run_id"),
+        "RESTRICT",
+    )
+    assert ("orchestration_id",) not in app_foreign_keys
 
 
 def test_duplicate_grouping_v1_migration_adds_tables_constraints_and_indexes() -> None:
@@ -539,15 +572,22 @@ def test_duplicate_grouping_v2_scope_migration_adds_orchestration_constraints_an
 
     assert 'down_revision: str | None = "202608010100"' in content
     assert 'sa.Column("orchestration_id", sa.Uuid(), nullable=True)' in content
+    assert "min(" not in content
+    assert "max(" not in content
+    assert "SELECT DISTINCT" in content
+    assert '"uq_feo_id_extraction_run"' in content
     assert '"uq_feob_id_orchestration"' in content
     assert '"uq_dupgrp_app_orch_alg"' in content
     assert '"uq_dupgrp_app_id_orch"' in content
     assert '"ix_dupgrp_app_orchestration_id"' in content
     assert '"ix_dupgrp_member_orchestration_id"' in content
+    assert '"fk_dupgrp_app_orch_run_feo"' in content
+    assert 'fk_fact_value_duplicate_grouping_applications_orchestration_id_fact_extraction_orchestrations' not in content
     assert '"fk_dupgrp_member_app_orch_dupgrp_app"' in content
     assert '"fk_dupgrp_member_batch_orch_feob"' in content
     assert "zero-member grouping applications do not map to exactly one completed or partial orchestration" in content
     assert "member-backed grouping applications map to multiple orchestration attempts" in content
+    assert "derived orchestration extraction_run_id does not match application extraction_run_id" in content
 
 
 def test_duplicate_grouping_v2_scope_migration_downgrade_fails_closed_when_run_scope_conflicts() -> None:
@@ -561,5 +601,11 @@ def test_duplicate_grouping_v2_scope_migration_downgrade_fails_closed_when_run_s
 
     assert "Cannot downgrade 202608010200" in content
     assert "multiple duplicate grouping applications share the same extraction_run_id and algorithm_version" in content
+    assert content.index('op.drop_constraint("fk_dupgrp_app_orch_run_feo"') < content.index(
+        'op.drop_column("fact_value_duplicate_grouping_applications", "orchestration_id")'
+    )
+    assert content.rindex('"uq_feo_id_extraction_run"') > content.index(
+        'op.drop_column("fact_value_duplicate_grouping_applications", "orchestration_id")'
+    )
     assert 'op.drop_column("fact_value_duplicate_group_members", "orchestration_id")' in content
     assert 'op.drop_column("fact_value_duplicate_grouping_applications", "orchestration_id")' in content
