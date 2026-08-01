@@ -330,6 +330,11 @@ class FactEvidenceLink(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "fact_evidence_links"
     __table_args__ = (
         UniqueConstraint(
+            "id",
+            "fact_value_id",
+            name="uq_fel_id_fact_value",
+        ),
+        UniqueConstraint(
             "fact_value_id",
             "evidence_id",
             "role",

@@ -167,6 +167,12 @@ def test_status_uses_string_and_check_not_native_enum():
 
 def test_run_composite_unique_constraint_exists():
     runs = Base.metadata.tables["inference_runs"]
+    unique_sets = {
+        tuple(c.columns.keys()): c.name
+        for c in runs.constraints
+        if isinstance(c, UniqueConstraint)
+    }
+    assert unique_sets[("id", "input_batch_id")] == "uq_ir_id_input_batch"
     assert any(
         isinstance(c, UniqueConstraint)
         and tuple(c.columns.keys())

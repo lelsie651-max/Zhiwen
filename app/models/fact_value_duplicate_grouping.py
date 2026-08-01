@@ -469,6 +469,12 @@ class FactValueConsistencyCandidateMember(UUIDPrimaryKeyMixin, Base):
             name="uq_fvccm_app_fv",
         ),
         UniqueConstraint(
+            "consistency_application_id",
+            "candidate_id",
+            "fact_value_id",
+            name="uq_fvccm_app_cand_fv",
+        ),
+        UniqueConstraint(
             "candidate_id",
             "fact_value_id",
             name="uq_fvccm_cand_fv",

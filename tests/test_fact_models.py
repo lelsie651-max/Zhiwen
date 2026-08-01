@@ -277,6 +277,7 @@ def test_fact_evidence_link_unique_and_source_order_constraints_exist() -> None:
         if isinstance(constraint, CheckConstraint)
     }
 
+    assert ("id", "fact_value_id") in unique_columns
     assert ("fact_value_id", "evidence_id", "role") in unique_columns
     assert any("source_order >= 0" in sql for sql in check_sql)
 
@@ -565,6 +566,7 @@ def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
     consistency_candidate_sql = str(CreateTable(FactValueConsistencyCandidate.__table__).compile(dialect=dialect))
     consistency_member_sql = str(CreateTable(FactValueConsistencyCandidateMember.__table__).compile(dialect=dialect))
 
+    assert "uq_feo_id_project" in orchestration_sql
     assert "uq_feo_id_extraction_run" in orchestration_sql
     assert "subject_entity_id" in facts_sql
     assert "referenced_entity_id" in fact_values_sql
@@ -582,6 +584,7 @@ def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
     assert "fk_fvcca_dupgrp_app_orch" in consistency_app_sql
     assert "fk_fvcca_orch_run_feo" in consistency_app_sql
     assert "uq_fvcc_app_fact_kind" in consistency_candidate_sql
+    assert "uq_fvccm_app_cand_fv" in consistency_member_sql
     assert "fk_fvccm_cand_app_fvcc" in consistency_member_sql
     assert "fk_fvccm_app_orch_fvcca" in consistency_member_sql
     assert "fk_fvccm_batch_orch_feob" in consistency_member_sql
@@ -605,6 +608,7 @@ def test_duplicate_grouping_application_metadata_uses_composite_orchestration_fk
         for constraint in app_table.foreign_key_constraints
     }
 
+    assert orchestration_uniques[("id", "project_id")] == "uq_feo_id_project"
     assert orchestration_uniques[("id", "extraction_run_id")] == "uq_feo_id_extraction_run"
     assert app_foreign_keys[("extraction_run_id",)][0] == "fk_fact_value_duplicate_grouping_applications_extraction_run_id_extraction_runs"
     assert app_foreign_keys[("orchestration_id", "extraction_run_id")] == (
@@ -653,6 +657,7 @@ def test_consistency_candidate_metadata_uses_application_and_batch_composite_for
         "RESTRICT",
     )
     assert candidate_uniques[("consistency_application_id", "fact_id", "candidate_kind")] == "uq_fvcc_app_fact_kind"
+    assert member_table is not None
     assert member_foreign_keys[("candidate_id", "consistency_application_id")] == (
         "fk_fvccm_cand_app_fvcc",
         ("id", "consistency_application_id"),
@@ -667,6 +672,14 @@ def test_consistency_candidate_metadata_uses_application_and_batch_composite_for
         "fk_fvccm_batch_orch_feob",
         ("id", "orchestration_id"),
         "RESTRICT",
+    )
+    member_uniques = {
+        tuple(constraint.columns.keys()): constraint.name
+        for constraint in member_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert member_uniques[("consistency_application_id", "candidate_id", "fact_value_id")] == (
+        "uq_fvccm_app_cand_fv"
     )
 
 

@@ -30,6 +30,11 @@ class FactExtractionOrchestration(UUIDPrimaryKeyMixin, Base):
     __table_args__ = (
         UniqueConstraint(
             "id",
+            "project_id",
+            name="uq_feo_id_project",
+        ),
+        UniqueConstraint(
+            "id",
             "extraction_run_id",
             name="uq_feo_id_extraction_run",
         ),

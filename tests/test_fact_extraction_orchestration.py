@@ -298,6 +298,7 @@ def test_orchestration_tables_constraints_and_active_index_exist() -> None:
     assert any(name.endswith("feo_completed_shape") for name in orch_checks)
     assert any(name.endswith("feo_partial_shape") for name in orch_checks)
     assert any(name.endswith("feo_failed_shape") for name in orch_checks)
+    assert orch_uniques[("id", "project_id")] == "uq_feo_id_project"
     assert orch_uniques[("id", "extraction_run_id")] == "uq_feo_id_extraction_run"
     assert any(name.endswith("feob_status_valid") for name in batch_checks)
     assert any(name.endswith("feob_pending_shape") for name in batch_checks)

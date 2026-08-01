@@ -19,11 +19,33 @@ depends_on = None
 
 
 def upgrade() -> None:
+    op.create_unique_constraint(
+        "uq_feo_id_project",
+        "fact_extraction_orchestrations",
+        ["id", "project_id"],
+    )
+    op.create_unique_constraint(
+        "uq_ir_id_input_batch",
+        "inference_runs",
+        ["id", "input_batch_id"],
+    )
+    op.create_unique_constraint(
+        "uq_fvccm_app_cand_fv",
+        "fact_value_consistency_candidate_members",
+        ["consistency_application_id", "candidate_id", "fact_value_id"],
+    )
+    op.create_unique_constraint(
+        "uq_fel_id_fact_value",
+        "fact_evidence_links",
+        ["id", "fact_value_id"],
+    )
+
     op.create_table(
         "consistency_check_applications",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("project_id", sa.Uuid(), nullable=False),
         sa.Column("consistency_application_id", sa.Uuid(), nullable=False),
+        sa.Column("orchestration_id", sa.Uuid(), nullable=False),
         sa.Column("source_result_manifest_hash", sa.String(length=64), nullable=False),
         sa.Column("plan_manifest_hash", sa.String(length=64), nullable=False),
         sa.Column("execution_identity_hash", sa.String(length=64), nullable=False),
@@ -51,9 +73,21 @@ def upgrade() -> None:
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
-            ["consistency_application_id"],
-            ["fact_value_consistency_candidate_applications.id"],
-            name="fk_ccapp_srcapp_fvcca",
+            ["consistency_application_id", "orchestration_id"],
+            [
+                "fact_value_consistency_candidate_applications.id",
+                "fact_value_consistency_candidate_applications.orchestration_id",
+            ],
+            name="fk_ccapp_srcapp_orch_fvcca",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["orchestration_id", "project_id"],
+            [
+                "fact_extraction_orchestrations.id",
+                "fact_extraction_orchestrations.project_id",
+            ],
+            name="fk_ccapp_orch_project_feo",
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_consistency_check_applications")),
@@ -92,7 +126,7 @@ def upgrade() -> None:
             "char_length(executor_version) BETWEEN 1 AND 32",
             name="executor_version_len",
         ),
-        sa.CheckConstraint("batch_count > 0", name="batch_count_pos"),
+        sa.CheckConstraint("batch_count >= 0", name="batch_count_nn"),
         sa.CheckConstraint("executed_batch_count >= 0", name="executed_count_nn"),
         sa.CheckConstraint(
             "skipped_empty_batch_count >= 0",
@@ -101,16 +135,12 @@ def upgrade() -> None:
         sa.CheckConstraint("inference_run_count >= 0", name="run_count_nn"),
         sa.CheckConstraint("assessment_count >= 0", name="assessment_count_nn"),
         sa.CheckConstraint(
-            "executed_batch_count <= batch_count",
-            name="executed_count_lte_batch",
+            "executed_batch_count = batch_count",
+            name="executed_eq_batch",
         ),
         sa.CheckConstraint(
-            "skipped_empty_batch_count <= executed_batch_count",
-            name="skipped_count_lte_executed",
-        ),
-        sa.CheckConstraint(
-            "inference_run_count <= executed_batch_count",
-            name="run_count_lte_executed",
+            "inference_run_count + skipped_empty_batch_count = batch_count",
+            name="run_skipped_eq_batch",
         ),
     )
     op.create_index("ix_ccapp_project_id", "consistency_check_applications", ["project_id"], unique=False)
@@ -118,6 +148,12 @@ def upgrade() -> None:
         "ix_ccapp_consistency_application_id",
         "consistency_check_applications",
         ["consistency_application_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_ccapp_orchestration_id",
+        "consistency_check_applications",
+        ["orchestration_id"],
         unique=False,
     )
 
@@ -151,9 +187,9 @@ def upgrade() -> None:
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
-            ["inference_run_id"],
-            ["inference_runs.id"],
-            name="fk_ccbatch_inference_run_id_ir",
+            ["inference_run_id", "input_batch_id"],
+            ["inference_runs.id", "inference_runs.input_batch_id"],
+            name="fk_ccbatch_run_input_ir",
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_consistency_check_batches")),
@@ -274,6 +310,12 @@ def upgrade() -> None:
             "source_consistency_candidate_id",
             name="uq_ccasmt_app_candidate_id",
         ),
+        sa.UniqueConstraint(
+            "id",
+            "source_consistency_application_id",
+            "source_consistency_candidate_id",
+            name="uq_ccasmt_id_srcapp_candidate",
+        ),
         sa.CheckConstraint("batch_index >= 0", name="batch_index_nn"),
         sa.CheckConstraint(
             "verdict IN ('conflict', 'compatible', 'insufficient_evidence')",
@@ -297,11 +339,28 @@ def upgrade() -> None:
             "AND CAST(confidence AS TEXT) NOT IN ('NaN', 'Infinity', '-Infinity')",
             name="confidence_valid",
         ),
-        sa.CheckConstraint("char_length(explanation) > 0", name="explanation_non_empty"),
-        sa.CheckConstraint("jsonb_typeof(impact_json) = 'array'", name="impact_json_is_array"),
         sa.CheckConstraint(
-            "jsonb_typeof(recommended_actions_json) = 'array'",
-            name="recommended_actions_json_is_array",
+            "char_length(explanation) BETWEEN 1 AND 2000",
+            name="explanation_len",
+        ),
+        sa.CheckConstraint(
+            "CASE WHEN jsonb_typeof(impact_json) = 'array' "
+            "THEN jsonb_array_length(impact_json) <= 20 "
+            "AND impact_json <@ "
+            '\'["data_quality_review","downstream_consumer_review","timeline_review",'
+            '"scope_review","unit_review","entity_resolution_review"]\'::jsonb '
+            "ELSE FALSE END",
+            name="impact_contract_valid",
+        ),
+        sa.CheckConstraint(
+            "CASE WHEN jsonb_typeof(recommended_actions_json) = 'array' "
+            "THEN jsonb_array_length(recommended_actions_json) <= 20 "
+            "AND recommended_actions_json <@ "
+            '\'["request_more_evidence","normalize_units","normalize_time_scope",'
+            '"review_entity_resolution","review_source_scope","escalate_human_review",'
+            '"leave_as_is"]\'::jsonb '
+            "ELSE FALSE END",
+            name="actions_contract_valid",
         ),
         sa.CheckConstraint(
             "assessment_manifest_hash ~ '^[0-9a-f]{64}$'",
@@ -332,6 +391,9 @@ def upgrade() -> None:
         "consistency_assessment_citations",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("assessment_id", sa.Uuid(), nullable=False),
+        sa.Column("source_consistency_application_id", sa.Uuid(), nullable=False),
+        sa.Column("source_consistency_candidate_id", sa.Uuid(), nullable=False),
+        sa.Column("source_fact_value_id", sa.Uuid(), nullable=False),
         sa.Column("evidence_link_id", sa.Uuid(), nullable=False),
         sa.Column("citation_order", sa.Integer(), nullable=False),
         sa.Column(
@@ -341,15 +403,37 @@ def upgrade() -> None:
             server_default=sa.text("CURRENT_TIMESTAMP"),
         ),
         sa.ForeignKeyConstraint(
-            ["assessment_id"],
-            ["consistency_assessments.id"],
-            name="fk_cccite_assessment_id_ccasmt",
+            [
+                "assessment_id",
+                "source_consistency_application_id",
+                "source_consistency_candidate_id",
+            ],
+            [
+                "consistency_assessments.id",
+                "consistency_assessments.source_consistency_application_id",
+                "consistency_assessments.source_consistency_candidate_id",
+            ],
+            name="fk_cccite_asmt_srccand_ccasmt",
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
-            ["evidence_link_id"],
-            ["fact_evidence_links.id"],
-            name="fk_cccite_evidence_link_id_fel",
+            [
+                "source_consistency_application_id",
+                "source_consistency_candidate_id",
+                "source_fact_value_id",
+            ],
+            [
+                "fact_value_consistency_candidate_members.consistency_application_id",
+                "fact_value_consistency_candidate_members.candidate_id",
+                "fact_value_consistency_candidate_members.fact_value_id",
+            ],
+            name="fk_cccite_srccand_fv_fvccm",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["evidence_link_id", "source_fact_value_id"],
+            ["fact_evidence_links.id", "fact_evidence_links.fact_value_id"],
+            name="fk_cccite_evid_fv_fel",
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_consistency_assessment_citations")),
@@ -363,7 +447,7 @@ def upgrade() -> None:
             "citation_order",
             name="uq_cccite_assessment_citation_order",
         ),
-        sa.CheckConstraint("citation_order >= 0", name="citation_order_nn"),
+        sa.CheckConstraint("citation_order BETWEEN 0 AND 199", name="citation_order_range"),
     )
     op.create_index(
         "ix_cccite_assessment_id",
@@ -377,9 +461,19 @@ def upgrade() -> None:
         ["evidence_link_id"],
         unique=False,
     )
+    op.create_index(
+        "ix_cccite_source_fact_value_id",
+        "consistency_assessment_citations",
+        ["source_fact_value_id"],
+        unique=False,
+    )
 
 
 def downgrade() -> None:
+    op.drop_index(
+        "ix_cccite_source_fact_value_id",
+        table_name="consistency_assessment_citations",
+    )
     op.drop_index("ix_cccite_evidence_link_id", table_name="consistency_assessment_citations")
     op.drop_index("ix_cccite_assessment_id", table_name="consistency_assessment_citations")
     op.drop_table("consistency_assessment_citations")
@@ -408,8 +502,25 @@ def downgrade() -> None:
     op.drop_table("consistency_check_batches")
 
     op.drop_index(
+        "ix_ccapp_orchestration_id",
+        table_name="consistency_check_applications",
+    )
+    op.drop_index(
         "ix_ccapp_consistency_application_id",
         table_name="consistency_check_applications",
     )
     op.drop_index("ix_ccapp_project_id", table_name="consistency_check_applications")
     op.drop_table("consistency_check_applications")
+
+    op.drop_constraint("uq_fel_id_fact_value", "fact_evidence_links", type_="unique")
+    op.drop_constraint(
+        "uq_fvccm_app_cand_fv",
+        "fact_value_consistency_candidate_members",
+        type_="unique",
+    )
+    op.drop_constraint("uq_ir_id_input_batch", "inference_runs", type_="unique")
+    op.drop_constraint(
+        "uq_feo_id_project",
+        "fact_extraction_orchestrations",
+        type_="unique",
+    )

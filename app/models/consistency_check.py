@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+import math
 import re
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, get_args
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
+    Float,
     Index,
     Integer,
     String,
@@ -21,13 +24,21 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, UUIDPrimaryKeyMixin, utc_now
+from app.schemas.agent_consistency_check import (
+    ConsistencyImpact,
+    ConsistencyRecommendedAction,
+    ConsistencySeverity,
+    ConsistencyVerdict,
+)
 from app.utils.validation import normalize_text
 
 if TYPE_CHECKING:
     from app.models.fact import FactEvidenceLink
+    from app.models.fact_extraction_orchestration import FactExtractionOrchestration
     from app.models.fact_value_duplicate_grouping import (
         FactValueConsistencyCandidate,
         FactValueConsistencyCandidateApplication,
+        FactValueConsistencyCandidateMember,
     )
     from app.models.inference import InferenceInputBatch, InferenceRun
     from app.models.project import Project
@@ -35,8 +46,24 @@ if TYPE_CHECKING:
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
-_VERDICT_SQL = "('conflict', 'compatible', 'insufficient_evidence')"
-_SEVERITY_SQL = "('red', 'yellow', 'none')"
+_ALLOWED_VERDICTS = tuple(get_args(ConsistencyVerdict))
+_ALLOWED_SEVERITIES = tuple(get_args(ConsistencySeverity))
+_ALLOWED_IMPACTS = tuple(get_args(ConsistencyImpact))
+_ALLOWED_ACTIONS = tuple(get_args(ConsistencyRecommendedAction))
+
+
+def _sql_string_tuple(values: tuple[str, ...]) -> str:
+    return f"({', '.join(repr(value) for value in values)})"
+
+
+def _sql_jsonb_array(values: tuple[str, ...]) -> str:
+    return f"'{json.dumps(list(values), separators=(',', ':'), ensure_ascii=True)}'::jsonb"
+
+
+_VERDICT_SQL = _sql_string_tuple(_ALLOWED_VERDICTS)
+_SEVERITY_SQL = _sql_string_tuple(_ALLOWED_SEVERITIES)
+_ALLOWED_IMPACTS_JSONB_SQL = _sql_jsonb_array(_ALLOWED_IMPACTS)
+_ALLOWED_ACTIONS_JSONB_SQL = _sql_jsonb_array(_ALLOWED_ACTIONS)
 _BATCH_SHAPE_SQL = (
     "("
     "skipped_empty = true "
@@ -64,6 +91,17 @@ _CONFIDENCE_SQL = (
     "AND confidence <= 1.0 "
     "AND CAST(confidence AS TEXT) NOT IN ('NaN', 'Infinity', '-Infinity')"
 )
+_IMPACT_JSON_SQL = (
+    "CASE WHEN jsonb_typeof(impact_json) = 'array' "
+    f"THEN jsonb_array_length(impact_json) <= 20 AND impact_json <@ {_ALLOWED_IMPACTS_JSONB_SQL} "
+    "ELSE FALSE END"
+)
+_ACTIONS_JSON_SQL = (
+    "CASE WHEN jsonb_typeof(recommended_actions_json) = 'array' "
+    f"THEN jsonb_array_length(recommended_actions_json) <= 20 "
+    f"AND recommended_actions_json <@ {_ALLOWED_ACTIONS_JSONB_SQL} "
+    "ELSE FALSE END"
+)
 
 
 def _normalize_short_text(value: str, *, field_name: str, max_length: int) -> str:
@@ -84,6 +122,44 @@ def _normalize_hash(value: str, *, field_name: str) -> str:
     return normalized
 
 
+def _normalize_enum_value(
+    value: str,
+    *,
+    field_name: str,
+    max_length: int,
+    allowed_values: tuple[str, ...],
+) -> str:
+    normalized = _normalize_short_text(value, field_name=field_name, max_length=max_length)
+    if normalized not in allowed_values:
+        raise ValueError(f"{field_name} must be one of: {', '.join(allowed_values)}")
+    return normalized
+
+
+def _validate_string_list(
+    value: list[str],
+    *,
+    field_name: str,
+    allowed_values: tuple[str, ...],
+) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    if len(value) > 20:
+        raise ValueError(f"{field_name} must contain at most 20 items")
+
+    normalized_values: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} items must be strings")
+        normalized = normalize_text(item)
+        if not normalized:
+            raise ValueError(f"{field_name} items must not be empty")
+        if normalized not in allowed_values:
+            raise ValueError(f"{field_name} items must be one of: {', '.join(allowed_values)}")
+        normalized_values.append(normalized)
+
+    return normalized_values
+
+
 class ConsistencyCheckApplication(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "consistency_check_applications"
     __table_args__ = (
@@ -94,9 +170,21 @@ class ConsistencyCheckApplication(UUIDPrimaryKeyMixin, Base):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["consistency_application_id"],
-            ["fact_value_consistency_candidate_applications.id"],
-            name="fk_ccapp_srcapp_fvcca",
+            ["consistency_application_id", "orchestration_id"],
+            [
+                "fact_value_consistency_candidate_applications.id",
+                "fact_value_consistency_candidate_applications.orchestration_id",
+            ],
+            name="fk_ccapp_srcapp_orch_fvcca",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["orchestration_id", "project_id"],
+            [
+                "fact_extraction_orchestrations.id",
+                "fact_extraction_orchestrations.project_id",
+            ],
+            name="fk_ccapp_orch_project_feo",
             ondelete="RESTRICT",
         ),
         UniqueConstraint(
@@ -141,7 +229,7 @@ class ConsistencyCheckApplication(UUIDPrimaryKeyMixin, Base):
             "char_length(executor_version) BETWEEN 1 AND 32",
             name="executor_version_len",
         ),
-        CheckConstraint("batch_count > 0", name="batch_count_pos"),
+        CheckConstraint("batch_count >= 0", name="batch_count_nn"),
         CheckConstraint(
             "executed_batch_count >= 0",
             name="executed_count_nn",
@@ -156,21 +244,18 @@ class ConsistencyCheckApplication(UUIDPrimaryKeyMixin, Base):
         ),
         CheckConstraint("assessment_count >= 0", name="assessment_count_nn"),
         CheckConstraint(
-            "executed_batch_count <= batch_count",
-            name="executed_count_lte_batch",
+            "executed_batch_count = batch_count",
+            name="executed_eq_batch",
         ),
         CheckConstraint(
-            "skipped_empty_batch_count <= executed_batch_count",
-            name="skipped_count_lte_executed",
-        ),
-        CheckConstraint(
-            "inference_run_count <= executed_batch_count",
-            name="run_count_lte_executed",
+            "inference_run_count + skipped_empty_batch_count = batch_count",
+            name="run_skipped_eq_batch",
         ),
     )
 
     project_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     consistency_application_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    orchestration_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     source_result_manifest_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     plan_manifest_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     execution_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -193,8 +278,13 @@ class ConsistencyCheckApplication(UUIDPrimaryKeyMixin, Base):
     )
 
     project: Mapped["Project"] = relationship(foreign_keys=[project_id])
+    orchestration: Mapped["FactExtractionOrchestration"] = relationship(
+        foreign_keys=[orchestration_id, project_id],
+        overlaps="project,source_consistency_application",
+    )
     source_consistency_application: Mapped["FactValueConsistencyCandidateApplication"] = relationship(
-        foreign_keys=[consistency_application_id],
+        foreign_keys=[consistency_application_id, orchestration_id],
+        overlaps="orchestration",
     )
     batches: Mapped[list["ConsistencyCheckBatchLedger"]] = relationship(
         back_populates="application",
@@ -253,9 +343,9 @@ class ConsistencyCheckBatchLedger(UUIDPrimaryKeyMixin, Base):
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["inference_run_id"],
-            ["inference_runs.id"],
-            name="fk_ccbatch_inference_run_id_ir",
+            ["inference_run_id", "input_batch_id"],
+            ["inference_runs.id", "inference_runs.input_batch_id"],
+            name="fk_ccbatch_run_input_ir",
             ondelete="RESTRICT",
         ),
         UniqueConstraint(
@@ -306,7 +396,10 @@ class ConsistencyCheckBatchLedger(UUIDPrimaryKeyMixin, Base):
         foreign_keys=[consistency_check_application_id],
     )
     input_batch: Mapped["InferenceInputBatch | None"] = relationship(foreign_keys=[input_batch_id])
-    inference_run: Mapped["InferenceRun | None"] = relationship(foreign_keys=[inference_run_id])
+    inference_run: Mapped["InferenceRun | None"] = relationship(
+        foreign_keys=[inference_run_id, input_batch_id],
+        overlaps="input_batch",
+    )
     assessments: Mapped[list["ConsistencyAssessmentLedger"]] = relationship(
         back_populates="batch",
         foreign_keys="[ConsistencyAssessmentLedger.consistency_check_application_id, ConsistencyAssessmentLedger.batch_index]",
@@ -360,19 +453,25 @@ class ConsistencyAssessmentLedger(UUIDPrimaryKeyMixin, Base):
             "source_consistency_candidate_id",
             name="uq_ccasmt_app_candidate_id",
         ),
+        UniqueConstraint(
+            "id",
+            "source_consistency_application_id",
+            "source_consistency_candidate_id",
+            name="uq_ccasmt_id_srcapp_candidate",
+        ),
         CheckConstraint("batch_index >= 0", name="batch_index_nn"),
         CheckConstraint(f"verdict IN {_VERDICT_SQL}", name="verdict_valid"),
         CheckConstraint(f"severity IN {_SEVERITY_SQL}", name="severity_valid"),
         CheckConstraint(_VERDICT_SEVERITY_SQL, name="verdict_severity_pair_valid"),
         CheckConstraint(_CONFIDENCE_SQL, name="confidence_valid"),
-        CheckConstraint("char_length(explanation) > 0", name="explanation_non_empty"),
+        CheckConstraint("char_length(explanation) BETWEEN 1 AND 2000", name="explanation_len"),
         CheckConstraint(
-            "jsonb_typeof(impact_json) = 'array'",
-            name="impact_json_is_array",
+            _IMPACT_JSON_SQL,
+            name="impact_contract_valid",
         ),
         CheckConstraint(
-            "jsonb_typeof(recommended_actions_json) = 'array'",
-            name="recommended_actions_json_is_array",
+            _ACTIONS_JSON_SQL,
+            name="actions_contract_valid",
         ),
         CheckConstraint(
             "assessment_manifest_hash ~ '^[0-9a-f]{64}$'",
@@ -386,15 +485,15 @@ class ConsistencyAssessmentLedger(UUIDPrimaryKeyMixin, Base):
     batch_index: Mapped[int] = mapped_column(Integer, nullable=False)
     verdict: Mapped[str] = mapped_column(String(32), nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
-    confidence: Mapped[float] = mapped_column(nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
     explanation: Mapped[str] = mapped_column(Text, nullable=False)
-    impact_json: Mapped[list[Any]] = mapped_column(
+    impact_json: Mapped[list[str]] = mapped_column(
         JSONB,
         nullable=False,
         default=list,
         server_default=text("'[]'::jsonb"),
     )
-    recommended_actions_json: Mapped[list[Any]] = mapped_column(
+    recommended_actions_json: Mapped[list[str]] = mapped_column(
         JSONB,
         nullable=False,
         default=list,
@@ -423,25 +522,67 @@ class ConsistencyAssessmentLedger(UUIDPrimaryKeyMixin, Base):
     )
     citations: Mapped[list["ConsistencyAssessmentCitation"]] = relationship(
         back_populates="assessment",
-        foreign_keys="ConsistencyAssessmentCitation.assessment_id",
+        foreign_keys=(
+            "[ConsistencyAssessmentCitation.assessment_id, "
+            "ConsistencyAssessmentCitation.source_consistency_application_id, "
+            "ConsistencyAssessmentCitation.source_consistency_candidate_id]"
+        ),
         order_by="ConsistencyAssessmentCitation.citation_order",
     )
 
     @validates("verdict")
     def validate_verdict(self, _key: str, value: str) -> str:
-        return _normalize_short_text(value, field_name="verdict", max_length=32)
+        return _normalize_enum_value(
+            value,
+            field_name="verdict",
+            max_length=32,
+            allowed_values=_ALLOWED_VERDICTS,
+        )
 
     @validates("severity")
     def validate_severity(self, _key: str, value: str) -> str:
-        return _normalize_short_text(value, field_name="severity", max_length=16)
+        return _normalize_enum_value(
+            value,
+            field_name="severity",
+            max_length=16,
+            allowed_values=_ALLOWED_SEVERITIES,
+        )
+
+    @validates("confidence")
+    def validate_confidence(self, _key: str, value: float) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("confidence must be a finite number between 0 and 1")
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0.0 or numeric > 1.0:
+            raise ValueError("confidence must be a finite number between 0 and 1")
+        return numeric
 
     @validates("explanation")
     def validate_explanation(self, _key: str, value: str) -> str:
         if not isinstance(value, str):
             raise ValueError("explanation must be a string")
-        if not value.strip():
+        normalized = value.strip()
+        if not normalized:
             raise ValueError("explanation must not be empty")
-        return value.strip()
+        if len(normalized) > 2000:
+            raise ValueError("explanation must be at most 2000 characters")
+        return normalized
+
+    @validates("impact_json")
+    def validate_impact_json(self, _key: str, value: list[str]) -> list[str]:
+        return _validate_string_list(
+            value,
+            field_name="impact_json",
+            allowed_values=_ALLOWED_IMPACTS,
+        )
+
+    @validates("recommended_actions_json")
+    def validate_recommended_actions_json(self, _key: str, value: list[str]) -> list[str]:
+        return _validate_string_list(
+            value,
+            field_name="recommended_actions_json",
+            allowed_values=_ALLOWED_ACTIONS,
+        )
 
     @validates("assessment_manifest_hash")
     def validate_assessment_manifest_hash(self, _key: str, value: str) -> str:
@@ -452,15 +593,37 @@ class ConsistencyAssessmentCitation(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "consistency_assessment_citations"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["assessment_id"],
-            ["consistency_assessments.id"],
-            name="fk_cccite_assessment_id_ccasmt",
+            [
+                "assessment_id",
+                "source_consistency_application_id",
+                "source_consistency_candidate_id",
+            ],
+            [
+                "consistency_assessments.id",
+                "consistency_assessments.source_consistency_application_id",
+                "consistency_assessments.source_consistency_candidate_id",
+            ],
+            name="fk_cccite_asmt_srccand_ccasmt",
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["evidence_link_id"],
-            ["fact_evidence_links.id"],
-            name="fk_cccite_evidence_link_id_fel",
+            [
+                "source_consistency_application_id",
+                "source_consistency_candidate_id",
+                "source_fact_value_id",
+            ],
+            [
+                "fact_value_consistency_candidate_members.consistency_application_id",
+                "fact_value_consistency_candidate_members.candidate_id",
+                "fact_value_consistency_candidate_members.fact_value_id",
+            ],
+            name="fk_cccite_srccand_fv_fvccm",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["evidence_link_id", "source_fact_value_id"],
+            ["fact_evidence_links.id", "fact_evidence_links.fact_value_id"],
+            name="fk_cccite_evid_fv_fel",
             ondelete="RESTRICT",
         ),
         UniqueConstraint(
@@ -473,10 +636,13 @@ class ConsistencyAssessmentCitation(UUIDPrimaryKeyMixin, Base):
             "citation_order",
             name="uq_cccite_assessment_citation_order",
         ),
-        CheckConstraint("citation_order >= 0", name="citation_order_nn"),
+        CheckConstraint("citation_order BETWEEN 0 AND 199", name="citation_order_range"),
     )
 
     assessment_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    source_consistency_application_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    source_consistency_candidate_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    source_fact_value_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     evidence_link_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     citation_order: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -488,13 +654,38 @@ class ConsistencyAssessmentCitation(UUIDPrimaryKeyMixin, Base):
 
     assessment: Mapped["ConsistencyAssessmentLedger"] = relationship(
         back_populates="citations",
-        foreign_keys=[assessment_id],
+        foreign_keys=[
+            assessment_id,
+            source_consistency_application_id,
+            source_consistency_candidate_id,
+        ],
+        overlaps="source_candidate_member,evidence_link",
     )
-    evidence_link: Mapped["FactEvidenceLink"] = relationship(foreign_keys=[evidence_link_id])
+    source_candidate_member: Mapped["FactValueConsistencyCandidateMember"] = relationship(
+        foreign_keys=[
+            source_consistency_application_id,
+            source_consistency_candidate_id,
+            source_fact_value_id,
+        ],
+        overlaps="assessment,citations,evidence_link",
+    )
+    evidence_link: Mapped["FactEvidenceLink"] = relationship(
+        foreign_keys=[evidence_link_id, source_fact_value_id],
+        overlaps="source_candidate_member",
+    )
+
+    @validates("citation_order")
+    def validate_citation_order(self, _key: str, value: int) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("citation_order must be an integer between 0 and 199")
+        if value < 0 or value > 199:
+            raise ValueError("citation_order must be an integer between 0 and 199")
+        return value
 
 
 Index("ix_ccapp_project_id", ConsistencyCheckApplication.project_id)
 Index("ix_ccapp_consistency_application_id", ConsistencyCheckApplication.consistency_application_id)
+Index("ix_ccapp_orchestration_id", ConsistencyCheckApplication.orchestration_id)
 Index("ix_ccbatch_consistency_check_application_id", ConsistencyCheckBatchLedger.consistency_check_application_id)
 Index("ix_ccbatch_input_batch_id", ConsistencyCheckBatchLedger.input_batch_id)
 Index("ix_ccbatch_inference_run_id", ConsistencyCheckBatchLedger.inference_run_id)
@@ -504,3 +695,4 @@ Index("ix_ccasmt_source_consistency_candidate_id", ConsistencyAssessmentLedger.s
 Index("ix_ccasmt_batch_index", ConsistencyAssessmentLedger.batch_index)
 Index("ix_cccite_assessment_id", ConsistencyAssessmentCitation.assessment_id)
 Index("ix_cccite_evidence_link_id", ConsistencyAssessmentCitation.evidence_link_id)
+Index("ix_cccite_source_fact_value_id", ConsistencyAssessmentCitation.source_fact_value_id)

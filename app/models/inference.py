@@ -320,6 +320,11 @@ class InferenceRun(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "inference_runs"
     __table_args__ = (
         UniqueConstraint(
+            "id",
+            "input_batch_id",
+            name="uq_ir_id_input_batch",
+        ),
+        UniqueConstraint(
             "input_batch_id",
             "agent_name",
             "prompt_version",
