@@ -458,6 +458,7 @@ def test_fact_migrations_include_inference_provenance_followup() -> None:
         "202607312200_fact_extraction_orchestration.py",
         "202607312230_orchestration_recovery_hardening.py",
         "202608010100_fact_value_duplicate_grouping.py",
+        "202608010200_duplicate_grouping_orchestration_scope.py",
     ]
     fact_migrations = sorted(
         path.name
@@ -480,13 +481,16 @@ def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
     assert "subject_entity_id" in facts_sql
     assert "referenced_entity_id" in fact_values_sql
     assert "ck_fv_entity_ref_pair" in fact_values_sql
-    assert "uq_dupgrp_app_run_alg" in dupgrp_app_sql
+    assert "uq_dupgrp_app_orch_alg" in dupgrp_app_sql
+    assert "uq_dupgrp_app_id_orch" in dupgrp_app_sql
     assert "uq_dupgrp_group_app_key" in dupgrp_group_sql
     assert "uq_dupgrp_member_app_fv" in dupgrp_member_sql
     assert "fk_dupgrp_member_group_id_grouping_application_id_dupgrp_group" in dupgrp_member_sql
+    assert "fk_dupgrp_member_app_orch_dupgrp_app" in dupgrp_member_sql
+    assert "fk_dupgrp_member_batch_orch_feob" in dupgrp_member_sql
 
 
-def test_duplicate_grouping_migration_adds_tables_constraints_and_indexes() -> None:
+def test_duplicate_grouping_v1_migration_adds_tables_constraints_and_indexes() -> None:
     migration_path = (
         Path(__file__).resolve().parents[1]
         / "alembic"
@@ -507,7 +511,7 @@ def test_duplicate_grouping_migration_adds_tables_constraints_and_indexes() -> N
     assert '"ix_dupgrp_member_source_batch_id"' in content
 
 
-def test_duplicate_grouping_migration_downgrade_drops_tables_in_dependency_order() -> None:
+def test_duplicate_grouping_v1_migration_downgrade_drops_tables_in_dependency_order() -> None:
     migration_path = (
         Path(__file__).resolve().parents[1]
         / "alembic"
@@ -522,3 +526,40 @@ def test_duplicate_grouping_migration_downgrade_drops_tables_in_dependency_order
     assert content.index('op.drop_table("fact_value_duplicate_groups")') < content.index(
         'op.drop_table("fact_value_duplicate_grouping_applications")'
     )
+
+
+def test_duplicate_grouping_v2_scope_migration_adds_orchestration_constraints_and_backfill() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202608010200_duplicate_grouping_orchestration_scope.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert 'down_revision: str | None = "202608010100"' in content
+    assert 'sa.Column("orchestration_id", sa.Uuid(), nullable=True)' in content
+    assert '"uq_feob_id_orchestration"' in content
+    assert '"uq_dupgrp_app_orch_alg"' in content
+    assert '"uq_dupgrp_app_id_orch"' in content
+    assert '"ix_dupgrp_app_orchestration_id"' in content
+    assert '"ix_dupgrp_member_orchestration_id"' in content
+    assert '"fk_dupgrp_member_app_orch_dupgrp_app"' in content
+    assert '"fk_dupgrp_member_batch_orch_feob"' in content
+    assert "zero-member grouping applications do not map to exactly one completed or partial orchestration" in content
+    assert "member-backed grouping applications map to multiple orchestration attempts" in content
+
+
+def test_duplicate_grouping_v2_scope_migration_downgrade_fails_closed_when_run_scope_conflicts() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202608010200_duplicate_grouping_orchestration_scope.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert "Cannot downgrade 202608010200" in content
+    assert "multiple duplicate grouping applications share the same extraction_run_id and algorithm_version" in content
+    assert 'op.drop_column("fact_value_duplicate_group_members", "orchestration_id")' in content
+    assert 'op.drop_column("fact_value_duplicate_grouping_applications", "orchestration_id")' in content

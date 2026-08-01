@@ -24,7 +24,10 @@ from app.utils.validation import normalize_text
 if TYPE_CHECKING:
     from app.models.document_content import ExtractionRun
     from app.models.fact import FactValue
-    from app.models.fact_extraction_orchestration import FactExtractionOrchestrationBatch
+    from app.models.fact_extraction_orchestration import (
+        FactExtractionOrchestration,
+        FactExtractionOrchestrationBatch,
+    )
 
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -34,9 +37,14 @@ class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "fact_value_duplicate_grouping_applications"
     __table_args__ = (
         UniqueConstraint(
-            "extraction_run_id",
+            "orchestration_id",
             "algorithm_version",
-            name="uq_dupgrp_app_run_alg",
+            name="uq_dupgrp_app_orch_alg",
+        ),
+        UniqueConstraint(
+            "id",
+            "orchestration_id",
+            name="uq_dupgrp_app_id_orch",
         ),
         CheckConstraint(
             "input_manifest_hash ~ '^[0-9a-f]{64}$'",
@@ -53,6 +61,10 @@ class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
 
     extraction_run_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("extraction_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    orchestration_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("fact_extraction_orchestrations.id", ondelete="RESTRICT"),
         nullable=False,
     )
     algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -84,6 +96,7 @@ class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
     )
 
     extraction_run: Mapped["ExtractionRun"] = relationship(foreign_keys=[extraction_run_id])
+    orchestration: Mapped["FactExtractionOrchestration"] = relationship(foreign_keys=[orchestration_id])
     groups: Mapped[list["FactValueDuplicateGroup"]] = relationship(
         back_populates="grouping_application",
         foreign_keys="FactValueDuplicateGroup.grouping_application_id",
@@ -180,10 +193,28 @@ class FactValueDuplicateGroupMember(UUIDPrimaryKeyMixin, Base):
             name="uq_dupgrp_member_group_fv",
         ),
         CheckConstraint("group_id IS NOT NULL", name="dupgrp_member_group_id_required"),
+        ForeignKeyConstraint(
+            ["grouping_application_id", "orchestration_id"],
+            [
+                "fact_value_duplicate_grouping_applications.id",
+                "fact_value_duplicate_grouping_applications.orchestration_id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_dupgrp_member_app_orch_dupgrp_app",
+        ),
+        ForeignKeyConstraint(
+            ["source_batch_id", "orchestration_id"],
+            ["fact_extraction_orch_batches.id", "fact_extraction_orch_batches.orchestration_id"],
+            ondelete="RESTRICT",
+            name="fk_dupgrp_member_batch_orch_feob",
+        ),
     )
 
+    orchestration_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("fact_extraction_orchestrations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
     grouping_application_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("fact_value_duplicate_grouping_applications.id", ondelete="RESTRICT"),
         nullable=False,
     )
     group_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
@@ -191,10 +222,7 @@ class FactValueDuplicateGroupMember(UUIDPrimaryKeyMixin, Base):
         ForeignKey("fact_values.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    source_batch_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("fact_extraction_orch_batches.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
+    source_batch_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -206,6 +234,7 @@ class FactValueDuplicateGroupMember(UUIDPrimaryKeyMixin, Base):
         back_populates="members",
         foreign_keys=[grouping_application_id],
     )
+    orchestration: Mapped["FactExtractionOrchestration"] = relationship(foreign_keys=[orchestration_id])
     group: Mapped["FactValueDuplicateGroup"] = relationship(
         back_populates="members",
         foreign_keys=[group_id],
@@ -218,7 +247,12 @@ Index(
     "ix_dupgrp_app_extraction_run_id",
     FactValueDuplicateGroupingApplication.extraction_run_id,
 )
+Index(
+    "ix_dupgrp_app_orchestration_id",
+    FactValueDuplicateGroupingApplication.orchestration_id,
+)
 Index("ix_dupgrp_group_grouping_application_id", FactValueDuplicateGroup.grouping_application_id)
+Index("ix_dupgrp_member_orchestration_id", FactValueDuplicateGroupMember.orchestration_id)
 Index("ix_dupgrp_member_grouping_application_id", FactValueDuplicateGroupMember.grouping_application_id)
 Index("ix_dupgrp_member_group_id", FactValueDuplicateGroupMember.group_id)
 Index("ix_dupgrp_member_fact_value_id", FactValueDuplicateGroupMember.fact_value_id)

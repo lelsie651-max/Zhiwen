@@ -207,6 +207,11 @@ class FactExtractionOrchestrationBatch(UUIDPrimaryKeyMixin, Base):
             name="uq_feob_orchestration_batch_index",
         ),
         UniqueConstraint(
+            "id",
+            "orchestration_id",
+            name="uq_feob_id_orchestration",
+        ),
+        UniqueConstraint(
             "orchestration_id",
             "current_inference_run_id",
             name="uq_feob_orchestration_inference_run",

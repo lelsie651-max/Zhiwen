@@ -2112,9 +2112,9 @@ def test_execute_orchestration_reused_completed_result_triggers_duplicate_groupi
     async def fake_read_completed(*_args, **_kwargs):
         return expected_result
 
-    async def fake_ensure(_session_factory, *, extraction_run_id, algorithm_version="cross_batch_exact_v1"):
-        assert algorithm_version == "cross_batch_exact_v1"
-        ensure_calls.append(extraction_run_id)
+    async def fake_ensure(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        assert algorithm_version == "cross_batch_exact_v2"
+        ensure_calls.append(orchestration_id)
         return SimpleNamespace(created_new=True)
 
     monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
@@ -2140,7 +2140,7 @@ def test_execute_orchestration_reused_completed_result_triggers_duplicate_groupi
     )
 
     assert result == expected_result
-    assert ensure_calls == [extraction_run_id]
+    assert ensure_calls == [expected_result.orchestration_id]
 
 
 def test_execute_orchestration_duplicate_grouping_failure_keeps_terminal_result(
@@ -2163,7 +2163,7 @@ def test_execute_orchestration_duplicate_grouping_failure_keeps_terminal_result(
     async def fake_read_completed(*_args, **_kwargs):
         return expected_result
 
-    async def fake_ensure(_session_factory, *, extraction_run_id, algorithm_version="cross_batch_exact_v1"):
+    async def fake_ensure(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
         raise duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError(
             "cross_batch_duplicate_grouping_immutable_ledger_mismatch"
         )
@@ -2217,4 +2217,4 @@ def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["202608010100"]
+    assert list(script.get_heads()) == ["202608010200"]

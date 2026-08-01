@@ -40,7 +40,7 @@ from app.schemas.fact_value_duplicate_grouping import (
 
 logger = logging.getLogger(__name__)
 
-_APPLICATION_UNIQUE_CONSTRAINT = "uq_dupgrp_app_run_alg"
+_APPLICATION_UNIQUE_CONSTRAINT = "uq_dupgrp_app_orch_alg"
 _MISSING = object()
 
 
@@ -148,6 +148,7 @@ def build_duplicate_fingerprint(
     canonical_bytes = _canonical_json_bytes(
         {
             "algorithm_version": algorithm_version,
+            "orchestration_id": candidate.orchestration_id,
             "extraction_run_id": candidate.extraction_run_id,
             "fact_identity": {
                 "fact_id": candidate.fact_id,
@@ -168,6 +169,7 @@ def build_duplicate_fingerprint(
 def _validate_candidate(candidate: DuplicateCandidate) -> None:
     _require_uuid(candidate.fact_value_id, field_name="candidate.fact_value_id")
     _require_uuid(candidate.fact_id, field_name="candidate.fact_id")
+    _require_uuid(candidate.orchestration_id, field_name="candidate.orchestration_id")
     _require_uuid(candidate.extraction_run_id, field_name="candidate.extraction_run_id")
     _require_uuid(candidate.source_batch_id, field_name="candidate.source_batch_id")
     if not isinstance(candidate.value_type, str) or not candidate.value_type:
@@ -185,7 +187,12 @@ def build_duplicate_grouping_write_plan(
 ) -> DuplicateGroupingWritePlan:
     digest_bytes_by_hash: dict[str, bytes] = {}
     fingerprint_by_fact_value_id: dict[uuid.UUID, DuplicateFingerprint] = {}
+    distinct_orchestration_ids = {candidate.orchestration_id for candidate in candidates}
     distinct_extraction_run_ids = {candidate.extraction_run_id for candidate in candidates}
+    if len(distinct_orchestration_ids) > 1:
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "duplicate grouping candidates must belong to a single orchestration"
+        )
     if len(distinct_extraction_run_ids) > 1:
         raise CrossBatchDuplicateGroupingInvariantError(
             "duplicate grouping candidates must belong to a single extraction run"
@@ -340,14 +347,16 @@ def _get_integrity_constraint_name(error: IntegrityError) -> str | None:
 
 
 def _validate_run_state(
-    state: duplicate_grouping_repository.DuplicateGroupingRunState | None,
+    state: duplicate_grouping_repository.DuplicateGroupingOrchestrationState | None,
     *,
-    extraction_run_id: uuid.UUID,
-) -> duplicate_grouping_repository.DuplicateGroupingRunState:
+    orchestration_id: uuid.UUID,
+) -> duplicate_grouping_repository.DuplicateGroupingOrchestrationState:
     if state is None:
-        raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_run_not_found")
-    if state.extraction_run_id != extraction_run_id:
-        raise CrossBatchDuplicateGroupingInvariantError("cross_batch_duplicate_grouping_run_identity_mismatch")
+        raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_orchestration_not_found")
+    if state.orchestration_id != orchestration_id:
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_orchestration_identity_mismatch"
+        )
     if state.extraction_run_status != ExtractionRunStatus.COMPLETED.value:
         raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_run_not_ready")
     if state.extraction_run_outcome not in {
@@ -355,26 +364,24 @@ def _validate_run_state(
         ExtractionRunOutcome.PARTIAL.value,
     }:
         raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_run_not_ready")
-    if state.active_orchestration_count:
-        raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_run_not_ready")
-    if state.latest_terminal_orchestration_status not in {
+    if state.orchestration_status not in {
         "completed",
         "partial",
     }:
-        raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_run_not_ready")
+        raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_orchestration_not_ready")
     return state
 
 
 async def _read_existing_application_result(
     session: AsyncSession,
     *,
-    extraction_run_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
     algorithm_version: str,
     plan: DuplicateGroupingWritePlan,
 ) -> DuplicateGroupingResult | None:
     existing_application = await duplicate_grouping_repository.get_grouping_application_ledger(
         session,
-        extraction_run_id=extraction_run_id,
+        orchestration_id=orchestration_id,
         algorithm_version=algorithm_version,
     )
     if existing_application is None:
@@ -419,27 +426,34 @@ async def list_duplicate_group_evidence_projections(
 async def ensure_cross_batch_duplicate_grouping(
     session_factory: Callable[[], AsyncSession],
     *,
-    extraction_run_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
     algorithm_version: str = CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
 ) -> DuplicateGroupingResult:
-    extraction_run_id = _require_uuid(extraction_run_id, field_name="extraction_run_id")
+    orchestration_id = _require_uuid(orchestration_id, field_name="orchestration_id")
     if not isinstance(algorithm_version, str) or not algorithm_version:
         raise CrossBatchDuplicateGroupingError("algorithm_version must be a non-empty string")
 
     async with session_factory() as read_session:
         try:
-            state = await duplicate_grouping_repository.get_duplicate_grouping_run_state(
+            state = await duplicate_grouping_repository.get_duplicate_grouping_orchestration_state(
                 read_session,
-                extraction_run_id=extraction_run_id,
+                orchestration_id=orchestration_id,
             )
-            _validate_run_state(state, extraction_run_id=extraction_run_id)
-            candidate_count = await duplicate_grouping_repository.count_ai_fact_values(
+            state = _validate_run_state(state, orchestration_id=orchestration_id)
+            if await duplicate_grouping_repository.has_invalid_completed_batch_bindings(
                 read_session,
-                extraction_run_id=extraction_run_id,
+                orchestration_id=orchestration_id,
+            ):
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_completed_batch_binding_mismatch"
+                )
+            candidate_count = await duplicate_grouping_repository.count_duplicate_candidate_fact_values(
+                read_session,
+                orchestration_id=orchestration_id,
             )
             candidates = await duplicate_grouping_repository.list_duplicate_candidates(
                 read_session,
-                extraction_run_id=extraction_run_id,
+                orchestration_id=orchestration_id,
             )
             if candidate_count != len(candidates):
                 raise CrossBatchDuplicateGroupingInvariantError(
@@ -458,20 +472,28 @@ async def ensure_cross_batch_duplicate_grouping(
 
     async with session_factory() as write_session:
         try:
-            state = await duplicate_grouping_repository.get_duplicate_grouping_run_state(
+            state = await duplicate_grouping_repository.get_duplicate_grouping_orchestration_state(
                 write_session,
-                extraction_run_id=extraction_run_id,
+                orchestration_id=orchestration_id,
             )
-            _validate_run_state(state, extraction_run_id=extraction_run_id)
+            state = _validate_run_state(state, orchestration_id=orchestration_id)
+            if await duplicate_grouping_repository.has_invalid_completed_batch_bindings(
+                write_session,
+                orchestration_id=orchestration_id,
+            ):
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_completed_batch_binding_mismatch"
+                )
 
             existing_application = await duplicate_grouping_repository.get_grouping_application_for_update(
                 write_session,
-                extraction_run_id=extraction_run_id,
+                orchestration_id=orchestration_id,
                 algorithm_version=algorithm_version,
             )
             if existing_application is not None:
                 existing_ledger = DuplicateGroupingApplicationLedger(
                     id=existing_application.id,
+                    orchestration_id=existing_application.orchestration_id,
                     extraction_run_id=existing_application.extraction_run_id,
                     algorithm_version=existing_application.algorithm_version,
                     input_manifest_hash=existing_application.input_manifest_hash,
@@ -486,7 +508,8 @@ async def ensure_cross_batch_duplicate_grouping(
                 logger.info(
                     "Cross-batch duplicate grouping hit existing ledger",
                     extra={
-                        "extraction_run_id": str(extraction_run_id),
+                        "extraction_run_id": str(existing_ledger.extraction_run_id),
+                        "orchestration_id": str(orchestration_id),
                         "grouping_application_id": str(existing_ledger.id),
                         "algorithm_version": algorithm_version,
                         "candidate_count": write_plan.input_fact_value_count,
@@ -498,7 +521,8 @@ async def ensure_cross_batch_duplicate_grouping(
 
             application = FactValueDuplicateGroupingApplication(
                 id=uuid.uuid4(),
-                extraction_run_id=extraction_run_id,
+                orchestration_id=orchestration_id,
+                extraction_run_id=state.extraction_run_id,
                 algorithm_version=algorithm_version,
                 input_manifest_hash=write_plan.input_manifest_hash,
                 result_manifest_hash=write_plan.result_manifest_hash,
@@ -532,6 +556,7 @@ async def ensure_cross_batch_duplicate_grouping(
                     members.append(
                         FactValueDuplicateGroupMember(
                             id=uuid.uuid4(),
+                            orchestration_id=orchestration_id,
                             grouping_application_id=application.id,
                             group_id=group_id,
                             fact_value_id=member_plan.fact_value_id,
@@ -553,6 +578,7 @@ async def ensure_cross_batch_duplicate_grouping(
             await write_session.commit()
             application_ledger = DuplicateGroupingApplicationLedger(
                 id=application.id,
+                orchestration_id=application.orchestration_id,
                 extraction_run_id=application.extraction_run_id,
                 algorithm_version=application.algorithm_version,
                 input_manifest_hash=application.input_manifest_hash,
@@ -565,7 +591,8 @@ async def ensure_cross_batch_duplicate_grouping(
             logger.info(
                 "Cross-batch duplicate grouping created new ledger",
                 extra={
-                    "extraction_run_id": str(extraction_run_id),
+                    "extraction_run_id": str(application.extraction_run_id),
+                    "orchestration_id": str(orchestration_id),
                     "grouping_application_id": str(application.id),
                     "algorithm_version": algorithm_version,
                     "candidate_count": write_plan.input_fact_value_count,
@@ -582,7 +609,8 @@ async def ensure_cross_batch_duplicate_grouping(
             logger.info(
                 "Cross-batch duplicate grouping hit concurrent application create",
                 extra={
-                    "extraction_run_id": str(extraction_run_id),
+                    "extraction_run_id": str(state.extraction_run_id),
+                    "orchestration_id": str(orchestration_id),
                     "algorithm_version": algorithm_version,
                     "constraint_name": constraint_name,
                     "candidate_count": write_plan.input_fact_value_count,
@@ -598,7 +626,7 @@ async def ensure_cross_batch_duplicate_grouping(
         try:
             existing_result = await _read_existing_application_result(
                 read_session,
-                extraction_run_id=extraction_run_id,
+                orchestration_id=orchestration_id,
                 algorithm_version=algorithm_version,
                 plan=write_plan,
             )

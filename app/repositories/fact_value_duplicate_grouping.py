@@ -4,7 +4,7 @@ import copy
 from dataclasses import dataclass
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
@@ -31,69 +31,100 @@ from app.schemas.fact_value_duplicate_grouping import (
 
 
 @dataclass(frozen=True, slots=True)
-class DuplicateGroupingRunState:
+class DuplicateGroupingOrchestrationState:
+    orchestration_id: uuid.UUID
     extraction_run_id: uuid.UUID
     project_id: uuid.UUID
     extraction_run_status: str
     extraction_run_outcome: str | None
-    latest_terminal_orchestration_status: str | None
-    active_orchestration_count: int
+    orchestration_status: str
 
 
-async def get_duplicate_grouping_run_state(
+async def get_duplicate_grouping_orchestration_state(
     session: AsyncSession,
     *,
-    extraction_run_id: uuid.UUID,
-) -> DuplicateGroupingRunState | None:
-    run_result = await session.execute(
+    orchestration_id: uuid.UUID,
+) -> DuplicateGroupingOrchestrationState | None:
+    result = await session.execute(
         select(
-            DocumentExtractionRun.id.label("extraction_run_id"),
-            Document.project_id.label("project_id"),
+            FactExtractionOrchestration.id.label("orchestration_id"),
+            FactExtractionOrchestration.extraction_run_id.label("extraction_run_id"),
+            FactExtractionOrchestration.project_id.label("project_id"),
+            FactExtractionOrchestration.status.label("orchestration_status"),
             DocumentExtractionRun.status.label("extraction_run_status"),
             DocumentExtractionRun.outcome.label("extraction_run_outcome"),
         )
+        .select_from(FactExtractionOrchestration)
+        .join(DocumentExtractionRun, FactExtractionOrchestration.extraction_run_id == DocumentExtractionRun.id)
         .join(DocumentRevision, DocumentExtractionRun.revision_id == DocumentRevision.id)
         .join(Document, DocumentRevision.document_id == Document.id)
-        .where(DocumentExtractionRun.id == extraction_run_id)
+        .where(FactExtractionOrchestration.id == orchestration_id)
     )
-    run_row = run_result.one_or_none()
-    if run_row is None:
+    row = result.one_or_none()
+    if row is None:
         return None
+    return DuplicateGroupingOrchestrationState(
+        orchestration_id=row.orchestration_id,
+        extraction_run_id=row.extraction_run_id,
+        project_id=row.project_id,
+        extraction_run_status=row.extraction_run_status,
+        extraction_run_outcome=row.extraction_run_outcome,
+        orchestration_status=row.orchestration_status,
+    )
 
-    orchestration_result = await session.execute(
-        select(FactExtractionOrchestration.status)
-        .where(FactExtractionOrchestration.extraction_run_id == extraction_run_id)
-        .order_by(
-            FactExtractionOrchestration.attempt_no.desc(),
-            FactExtractionOrchestration.created_at.desc(),
+
+async def has_invalid_completed_batch_bindings(
+    session: AsyncSession,
+    *,
+    orchestration_id: uuid.UUID,
+) -> bool:
+    result = await session.execute(
+        select(FactExtractionOrchestrationBatch.id)
+        .select_from(FactExtractionOrchestrationBatch)
+        .join(FactExtractionOrchestration, FactExtractionOrchestrationBatch.orchestration_id == FactExtractionOrchestration.id)
+        .outerjoin(
+            FactExtractionBatchApplication,
+            FactExtractionOrchestrationBatch.application_id == FactExtractionBatchApplication.id,
         )
+        .where(
+            FactExtractionOrchestrationBatch.orchestration_id == orchestration_id,
+            FactExtractionOrchestrationBatch.status == "completed",
+            case(
+                (
+                    FactExtractionBatchApplication.id.is_(None),
+                    True,
+                ),
+                (
+                    FactExtractionBatchApplication.status != "completed",
+                    True,
+                ),
+                (
+                    FactExtractionBatchApplication.extraction_run_id != FactExtractionOrchestration.extraction_run_id,
+                    True,
+                ),
+                (
+                    FactExtractionOrchestrationBatch.current_inference_run_id
+                    != FactExtractionBatchApplication.inference_run_id,
+                    True,
+                ),
+                else_=False,
+            ),
+        )
+        .limit(1)
     )
-    orchestration_statuses = list(orchestration_result.scalars().all())
-    active_orchestration_count = sum(status in {"planned", "running"} for status in orchestration_statuses)
-    latest_terminal_orchestration_status = next(
-        (status for status in orchestration_statuses if status in {"completed", "partial", "failed"}),
-        None,
-    )
-
-    return DuplicateGroupingRunState(
-        extraction_run_id=run_row.extraction_run_id,
-        project_id=run_row.project_id,
-        extraction_run_status=run_row.extraction_run_status,
-        extraction_run_outcome=run_row.extraction_run_outcome,
-        latest_terminal_orchestration_status=latest_terminal_orchestration_status,
-        active_orchestration_count=active_orchestration_count,
-    )
+    return result.first() is not None
 
 
 async def list_duplicate_candidates(
     session: AsyncSession,
     *,
-    extraction_run_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
 ) -> tuple[DuplicateCandidate, ...]:
     result = await session.execute(
         select(
             FactValue.id.label("fact_value_id"),
             FactValue.fact_id.label("fact_id"),
+            FactExtractionOrchestration.id.label("orchestration_id"),
             FactValue.extraction_run_id.label("extraction_run_id"),
             FactExtractionOrchestrationBatch.id.label("source_batch_id"),
             FactValue.value_type.label("value_type"),
@@ -101,22 +132,23 @@ async def list_duplicate_candidates(
             FactValue.referenced_entity_id.label("referenced_entity_id"),
             FactEvidenceLink.id.label("evidence_link_id"),
         )
-        .select_from(FactValue)
-        .join(Fact, FactValue.fact_id == Fact.id)
+        .select_from(FactExtractionOrchestrationBatch)
+        .join(FactExtractionOrchestration, FactExtractionOrchestrationBatch.orchestration_id == FactExtractionOrchestration.id)
         .join(
             FactExtractionBatchApplication,
-            FactExtractionBatchApplication.inference_run_id == FactValue.inference_run_id,
-        )
-        .join(
-            FactExtractionOrchestrationBatch,
             FactExtractionOrchestrationBatch.application_id == FactExtractionBatchApplication.id,
         )
+        .join(FactValue, FactValue.inference_run_id == FactExtractionBatchApplication.inference_run_id)
+        .join(Fact, FactValue.fact_id == Fact.id)
         .outerjoin(FactEvidenceLink, FactEvidenceLink.fact_value_id == FactValue.id)
         .where(
-            FactValue.extraction_run_id == extraction_run_id,
-            FactValue.source_kind == FactValueSourceKind.AI.value,
-            FactExtractionBatchApplication.extraction_run_id == extraction_run_id,
+            FactExtractionOrchestrationBatch.orchestration_id == orchestration_id,
+            FactExtractionOrchestrationBatch.status == "completed",
             FactExtractionBatchApplication.status == "completed",
+            FactExtractionBatchApplication.extraction_run_id == FactExtractionOrchestration.extraction_run_id,
+            FactExtractionBatchApplication.inference_run_id == FactExtractionOrchestrationBatch.current_inference_run_id,
+            FactValue.extraction_run_id == FactExtractionOrchestration.extraction_run_id,
+            FactValue.source_kind == FactValueSourceKind.AI.value,
         )
         .order_by(
             FactValue.id.asc(),
@@ -141,6 +173,7 @@ async def list_duplicate_candidates(
             DuplicateCandidate(
                 fact_value_id=current_candidate_fields["fact_value_id"],
                 fact_id=current_candidate_fields["fact_id"],
+                orchestration_id=current_candidate_fields["orchestration_id"],
                 extraction_run_id=current_candidate_fields["extraction_run_id"],
                 source_batch_id=current_candidate_fields["source_batch_id"],
                 value_type=current_candidate_fields["value_type"],
@@ -160,6 +193,7 @@ async def list_duplicate_candidates(
             current_candidate_fields = {
                 "fact_value_id": row.fact_value_id,
                 "fact_id": row.fact_id,
+                "orchestration_id": row.orchestration_id,
                 "extraction_run_id": row.extraction_run_id,
                 "source_batch_id": row.source_batch_id,
                 "value_type": row.value_type,
@@ -172,15 +206,27 @@ async def list_duplicate_candidates(
     return tuple(candidates)
 
 
-async def count_ai_fact_values(
+async def count_duplicate_candidate_fact_values(
     session: AsyncSession,
     *,
-    extraction_run_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
 ) -> int:
     result = await session.execute(
         select(FactValue.id)
+        .select_from(FactExtractionOrchestrationBatch)
+        .join(FactExtractionOrchestration, FactExtractionOrchestrationBatch.orchestration_id == FactExtractionOrchestration.id)
+        .join(
+            FactExtractionBatchApplication,
+            FactExtractionOrchestrationBatch.application_id == FactExtractionBatchApplication.id,
+        )
+        .join(FactValue, FactValue.inference_run_id == FactExtractionBatchApplication.inference_run_id)
         .where(
-            FactValue.extraction_run_id == extraction_run_id,
+            FactExtractionOrchestrationBatch.orchestration_id == orchestration_id,
+            FactExtractionOrchestrationBatch.status == "completed",
+            FactExtractionBatchApplication.status == "completed",
+            FactExtractionBatchApplication.inference_run_id == FactExtractionOrchestrationBatch.current_inference_run_id,
+            FactExtractionBatchApplication.extraction_run_id == FactExtractionOrchestration.extraction_run_id,
+            FactValue.extraction_run_id == FactExtractionOrchestration.extraction_run_id,
             FactValue.source_kind == FactValueSourceKind.AI.value,
         )
         .order_by(FactValue.id.asc())
@@ -191,13 +237,13 @@ async def count_ai_fact_values(
 async def get_grouping_application_for_update(
     session: AsyncSession,
     *,
-    extraction_run_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
     algorithm_version: str,
 ) -> FactValueDuplicateGroupingApplication | None:
     result = await session.execute(
         select(FactValueDuplicateGroupingApplication)
         .where(
-            FactValueDuplicateGroupingApplication.extraction_run_id == extraction_run_id,
+            FactValueDuplicateGroupingApplication.orchestration_id == orchestration_id,
             FactValueDuplicateGroupingApplication.algorithm_version == algorithm_version,
         )
         .with_for_update()
@@ -208,13 +254,13 @@ async def get_grouping_application_for_update(
 async def get_grouping_application_ledger(
     session: AsyncSession,
     *,
-    extraction_run_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
     algorithm_version: str,
 ) -> DuplicateGroupingApplicationLedger | None:
     result = await session.execute(
         select(FactValueDuplicateGroupingApplication)
         .where(
-            FactValueDuplicateGroupingApplication.extraction_run_id == extraction_run_id,
+            FactValueDuplicateGroupingApplication.orchestration_id == orchestration_id,
             FactValueDuplicateGroupingApplication.algorithm_version == algorithm_version,
         )
     )
@@ -223,6 +269,7 @@ async def get_grouping_application_ledger(
         return None
     return DuplicateGroupingApplicationLedger(
         id=application.id,
+        orchestration_id=application.orchestration_id,
         extraction_run_id=application.extraction_run_id,
         algorithm_version=application.algorithm_version,
         input_manifest_hash=application.input_manifest_hash,
@@ -278,6 +325,7 @@ async def list_member_ledgers(
     return tuple(
         DuplicateGroupMemberLedger(
             id=member.id,
+            orchestration_id=member.orchestration_id,
             grouping_application_id=member.grouping_application_id,
             group_id=member.group_id,
             fact_value_id=member.fact_value_id,

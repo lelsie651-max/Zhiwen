@@ -7,7 +7,7 @@ from typing import Any
 import uuid
 
 
-CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION = "cross_batch_exact_v1"
+CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION = "cross_batch_exact_v2"
 
 
 class DuplicateGroupingMemberSourceKind(StrEnum):
@@ -18,6 +18,7 @@ class DuplicateGroupingMemberSourceKind(StrEnum):
 class DuplicateCandidate:
     fact_value_id: uuid.UUID
     fact_id: uuid.UUID
+    orchestration_id: uuid.UUID
     extraction_run_id: uuid.UUID
     source_batch_id: uuid.UUID
     value_type: str
@@ -70,6 +71,7 @@ class DuplicateGroupingResult:
 @dataclass(frozen=True, slots=True)
 class DuplicateGroupingApplicationLedger:
     id: uuid.UUID
+    orchestration_id: uuid.UUID
     extraction_run_id: uuid.UUID
     algorithm_version: str
     input_manifest_hash: str
@@ -93,6 +95,7 @@ class DuplicateGroupLedger:
 @dataclass(frozen=True, slots=True)
 class DuplicateGroupMemberLedger:
     id: uuid.UUID
+    orchestration_id: uuid.UUID
     grouping_application_id: uuid.UUID
     group_id: uuid.UUID
     fact_value_id: uuid.UUID

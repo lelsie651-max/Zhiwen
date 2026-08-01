@@ -1843,7 +1843,6 @@ def _build_batch_result(batch: FactExtractionOrchestrationBatch) -> FactExtracti
 async def _maybe_ensure_cross_batch_duplicate_grouping(
     session_factory: Callable[[], AsyncSession],
     *,
-    extraction_run_id: uuid.UUID,
     orchestration_result: FactExtractionOrchestrationResult,
 ) -> FactExtractionOrchestrationResult:
     if orchestration_result.status not in {
@@ -1854,13 +1853,12 @@ async def _maybe_ensure_cross_batch_duplicate_grouping(
     try:
         await duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
             session_factory,
-            extraction_run_id=extraction_run_id,
+            orchestration_id=orchestration_result.orchestration_id,
         )
     except BaseException as error:
         logger.warning(
             "Cross-batch duplicate grouping did not complete after orchestration finalization",
             extra={
-                "extraction_run_id": str(extraction_run_id),
                 "orchestration_id": str(orchestration_result.orchestration_id),
                 "orchestration_status": orchestration_result.status.value,
                 "error_type": type(error).__name__,
@@ -2099,7 +2097,6 @@ async def execute_fact_extraction_orchestration(
             )
         return await _maybe_ensure_cross_batch_duplicate_grouping(
             session_factory,
-            extraction_run_id=extraction_run_id,
             orchestration_result=result,
         )
 
@@ -2249,6 +2246,5 @@ async def execute_fact_extraction_orchestration(
         )
     return await _maybe_ensure_cross_batch_duplicate_grouping(
         session_factory,
-        extraction_run_id=extraction_run_id,
         orchestration_result=result,
     )
