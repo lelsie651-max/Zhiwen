@@ -87,7 +87,7 @@ class ConsistencyCheckAssessment(BaseModel):
 
 
 class ConsistencyCheckResponse(BaseModel):
-    assessments: list[ConsistencyCheckAssessment] = Field(min_length=1, max_length=200)
+    assessments: list[ConsistencyCheckAssessment] = Field(max_length=200)
 
     model_config = ConfigDict(extra="forbid")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 
 import pytest
 from pydantic import ValidationError
@@ -249,6 +250,69 @@ def test_renderer_rejects_tampered_batch_manifest_or_counts():
         cc.render_consistency_check_messages(prompt=PROMPT, plan=plan, batch=bad_batch)
 
 
+def test_parse_accepts_empty_assessments_for_empty_batch():
+    _, batch = _plan(())
+
+    response = cc.parse_consistency_check_response_object(
+        {"assessments": []},
+        batch=batch,
+    )
+
+    assert response.assessments == []
+
+
+def test_parse_rejects_empty_assessments_for_non_empty_batch():
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_type="string",
+                value_json="A",
+                evidences=(_evidence(1, excerpt="alpha"),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_type="string",
+                value_json="B",
+                evidences=(_evidence(2, excerpt="beta"),),
+            ),
+        ),
+    )
+    _, batch = _plan((candidate,))
+
+    with pytest.raises(cc.AgentConsistencyCheckResponseError):
+        cc.parse_consistency_check_response_object(
+            {"assessments": []},
+            batch=batch,
+        )
+
+
+def test_parse_rejects_non_empty_assessments_for_empty_batch():
+    _, batch = _plan(())
+
+    with pytest.raises(cc.AgentConsistencyCheckResponseError):
+        cc.parse_consistency_check_response_object(
+            {
+                "assessments": [
+                    {
+                        "candidate_id": str(uuid.uuid4()),
+                        "verdict": "compatible",
+                        "severity": "none",
+                        "confidence": 0.5,
+                        "explanation": "ok",
+                        "cited_evidence_link_ids": [str(uuid.uuid4())],
+                        "impact": [],
+                        "recommended_actions": [],
+                    }
+                ]
+            },
+            batch=batch,
+        )
+
+
 def test_parse_accepts_all_three_verdicts():
     candidates = (
         _candidate(
@@ -359,6 +423,69 @@ def test_parse_accepts_all_three_verdicts():
         "compatible",
         "insufficient_evidence",
     ]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value", "expected_message"),
+    [
+        ("planner_name", "tampered_planner", "plan planner_name mismatch"),
+        ("planner_version", "9.9.9", "plan planner_version mismatch"),
+    ],
+)
+def test_renderer_rejects_planner_identity_mismatch(
+    field_name: str,
+    field_value: str,
+    expected_message: str,
+) -> None:
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_type="string",
+                value_json="A",
+                evidences=(_evidence(1, excerpt="alpha"),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_type="string",
+                value_json="B",
+                evidences=(_evidence(2, excerpt="beta"),),
+            ),
+        ),
+    )
+    plan, batch = _plan((candidate,))
+    bad_plan = replace(plan, **{field_name: field_value})
+
+    with pytest.raises(cc.AgentConsistencyCheckContextError, match=expected_message):
+        cc.render_consistency_check_messages(prompt=PROMPT, plan=bad_plan, batch=batch)
+
+
+def test_validate_batch_plan_accepts_valid_manifest_and_planner_identity():
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_type="string",
+                value_json="A",
+                evidences=(_evidence(1, excerpt="alpha"),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_type="string",
+                value_json="B",
+                evidences=(_evidence(2, excerpt="beta"),),
+            ),
+        ),
+    )
+    plan, batch = _plan((candidate,))
+
+    cc.validate_consistency_check_batch_plan(plan=plan, batch=batch)
 
 
 @pytest.mark.parametrize(
@@ -711,6 +838,108 @@ def test_parse_errors_do_not_leak_model_text_or_excerpt():
     assert secret not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
+
+
+def test_parse_errors_redact_sensitive_extra_field_names():
+    sentinel = "SENSITIVE_FIELD_NAME_SENTINEL"
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_type="string",
+                value_json="A",
+                evidences=(_evidence(1, excerpt="alpha"),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_type="string",
+                value_json="B",
+                evidences=(_evidence(2, excerpt="beta"),),
+            ),
+        ),
+    )
+    _, batch = _plan((candidate,))
+    content = json.dumps(
+        {
+            "assessments": [
+                {
+                    "candidate_id": str(batch.candidates[0].candidate_id),
+                    "verdict": "compatible",
+                    "severity": "none",
+                    "confidence": 0.5,
+                    "explanation": "ok",
+                    "cited_evidence_link_ids": [
+                        str(batch.candidates[0].members[0].evidences[0].evidence_link_id)
+                    ],
+                    "impact": [],
+                    "recommended_actions": [],
+                    sentinel: "forbidden",
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(cc.AgentConsistencyCheckResponseError) as exc_info:
+        cc.parse_consistency_check_completion(
+            make_stub_completion(content, provider="mock"),
+            batch=batch,
+        )
+
+    assert sentinel not in str(exc_info.value)
+    assert "<extra>" in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_parse_errors_keep_bounded_safe_field_paths_for_known_fields():
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_type="string",
+                value_json="A",
+                evidences=(_evidence(1, excerpt="alpha"),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_type="string",
+                value_json="B",
+                evidences=(_evidence(2, excerpt="beta"),),
+            ),
+        ),
+    )
+    _, batch = _plan((candidate,))
+
+    with pytest.raises(cc.AgentConsistencyCheckResponseError) as exc_info:
+        cc.parse_consistency_check_response_object(
+            {
+                "assessments": [
+                    {
+                        "candidate_id": str(batch.candidates[0].candidate_id),
+                        "verdict": "compatible",
+                        "severity": "none",
+                        "confidence": "not-a-number",
+                        "explanation": "ok",
+                        "cited_evidence_link_ids": [
+                            str(batch.candidates[0].members[0].evidences[0].evidence_link_id)
+                        ],
+                        "impact": [],
+                        "recommended_actions": [],
+                    }
+                ]
+            },
+            batch=batch,
+        )
+
+    message = str(exc_info.value)
+    assert "assessments.0.confidence" in message
+    assert "float_type" in message or "value_error" in message
 
 
 def test_contract_reuses_same_schema_for_different_domains():

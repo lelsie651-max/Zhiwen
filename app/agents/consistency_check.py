@@ -30,6 +30,20 @@ if TYPE_CHECKING:
 _CONSISTENCY_CHECK_TASK_TYPE = "consistency_check"
 _MAX_ERROR_ITEMS = 20
 _MAX_ERROR_SUMMARY_CHARS = 1000
+_SAFE_CONTRACT_LOC_SEGMENTS = frozenset(
+    {
+        "assessments",
+        "candidate_id",
+        "verdict",
+        "severity",
+        "confidence",
+        "explanation",
+        "cited_evidence_link_ids",
+        "impact",
+        "recommended_actions",
+    }
+)
+_EXTRA_LOC_PLACEHOLDER = "<extra>"
 
 
 def _canonical_json(value: Any) -> str:
@@ -72,8 +86,8 @@ def _build_plan_manifest_hash(plan: ConsistencyCheckPlan) -> str:
         {
             "consistency_application_id": str(plan.consistency_application_id),
             "source_result_manifest_hash": plan.source_result_manifest_hash,
-            "planner_name": CONSISTENCY_CHECK_PLANNER_NAME,
-            "planner_version": CONSISTENCY_CHECK_PLANNER_VERSION,
+            "planner_name": plan.planner_name,
+            "planner_version": plan.planner_version,
             "config": asdict(plan.config),
             "batches": [
                 {
@@ -89,6 +103,21 @@ def _build_plan_manifest_hash(plan: ConsistencyCheckPlan) -> str:
     )
 
 
+def _summarize_validation_errors(error: ValidationError) -> str:
+    parts: list[str] = []
+    for item in error.errors(include_url=False)[:_MAX_ERROR_ITEMS]:
+        safe_segments: list[str] = []
+        for segment in item["loc"]:
+            if isinstance(segment, int) and not isinstance(segment, bool):
+                safe_segments.append(str(segment))
+            elif isinstance(segment, str) and segment in _SAFE_CONTRACT_LOC_SEGMENTS:
+                safe_segments.append(segment)
+            else:
+                safe_segments.append(_EXTRA_LOC_PLACEHOLDER)
+        parts.append(f"{'.'.join(safe_segments)}:{item['type']}")
+    return "; ".join(parts)[:_MAX_ERROR_SUMMARY_CHARS]
+
+
 def validate_consistency_check_batch_plan(
     *,
     plan: ConsistencyCheckPlan,
@@ -100,6 +129,10 @@ def validate_consistency_check_batch_plan(
         raise AgentConsistencyCheckContextError("batch must be a ConsistencyCheckBatchPlan")
     if not plan.batches:
         raise AgentConsistencyCheckContextError("plan must contain at least one batch")
+    if plan.planner_name != CONSISTENCY_CHECK_PLANNER_NAME:
+        raise AgentConsistencyCheckContextError("plan planner_name mismatch")
+    if plan.planner_version != CONSISTENCY_CHECK_PLANNER_VERSION:
+        raise AgentConsistencyCheckContextError("plan planner_version mismatch")
     if isinstance(batch.batch_index, bool) or not isinstance(batch.batch_index, int):
         raise AgentConsistencyCheckContextError("batch_index must be an integer")
     if batch.batch_index < 0 or batch.batch_index >= len(plan.batches):
@@ -287,11 +320,7 @@ def parse_consistency_check_response_object(
     try:
         response = ConsistencyCheckResponse.model_validate(response_json)
     except ValidationError as error:
-        parts = []
-        for item in error.errors(include_url=False)[:_MAX_ERROR_ITEMS]:
-            location = ".".join(str(part) for part in item["loc"])
-            parts.append(f"{location}:{item['type']}")
-        summary = "; ".join(parts)[:_MAX_ERROR_SUMMARY_CHARS]
+        summary = _summarize_validation_errors(error)
     else:
         return _validate_response_against_batch(response, batch=batch)
     raise AgentConsistencyCheckResponseError(
