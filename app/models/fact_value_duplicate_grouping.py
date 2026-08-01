@@ -33,6 +33,17 @@ if TYPE_CHECKING:
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
+def normalize_duplicate_grouping_algorithm_version(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("algorithm_version must be a string")
+    normalized = normalize_text(value)
+    if not normalized:
+        raise ValueError("algorithm_version must not be empty")
+    if len(normalized) > 64:
+        raise ValueError("algorithm_version must be at most 64 characters")
+    return normalized
+
+
 class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "fact_value_duplicate_grouping_applications"
     __table_args__ = (
@@ -122,10 +133,7 @@ class FactValueDuplicateGroupingApplication(UUIDPrimaryKeyMixin, Base):
 
     @validates("algorithm_version")
     def validate_algorithm_version(self, _key: str, value: str) -> str:
-        normalized = normalize_text(value)
-        if not normalized:
-            raise ValueError("algorithm_version must not be empty")
-        return normalized
+        return normalize_duplicate_grouping_algorithm_version(value)
 
     @validates("input_manifest_hash", "result_manifest_hash")
     def validate_hash(self, _key: str, value: str) -> str:

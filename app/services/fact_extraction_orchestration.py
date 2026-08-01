@@ -1855,7 +1855,9 @@ async def _maybe_ensure_cross_batch_duplicate_grouping(
             session_factory,
             orchestration_id=orchestration_result.orchestration_id,
         )
-    except BaseException as error:
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
         logger.warning(
             "Cross-batch duplicate grouping did not complete after orchestration finalization",
             extra={

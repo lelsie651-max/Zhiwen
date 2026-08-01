@@ -2169,9 +2169,11 @@ def test_execute_orchestration_duplicate_grouping_failure_keeps_terminal_result(
     async def fake_read_completed(*_args, **_kwargs):
         return expected_result
 
+    sentinel = "SENSITIVE_DUPLICATE_GROUPING_SENTINEL"
+
     async def fake_ensure(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
         raise duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError(
-            "cross_batch_duplicate_grouping_immutable_ledger_mismatch"
+            sentinel
         )
 
     monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
@@ -2198,6 +2200,56 @@ def test_execute_orchestration_duplicate_grouping_failure_keeps_terminal_result(
 
     assert result == expected_result
     assert "Cross-batch duplicate grouping did not complete after orchestration finalization" in caplog.text
+    assert sentinel not in caplog.text
+
+
+def test_execute_orchestration_duplicate_grouping_cancelled_error_propagates(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_factory = SessionFactory()
+    extraction_run_id, plan = _planned_fixture()
+    expected_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
+
+    async def fake_prepare(*_args, **_kwargs):
+        return orchestration_service.PreparedFactExtractionOrchestration(
+            orchestration_id=expected_result.orchestration_id,
+            attempt_no=1,
+            request_hash=expected_result.request_hash,
+            plan_hash=expected_result.plan_hash,
+            reused_completed=True,
+        )
+
+    async def fake_read_completed(*_args, **_kwargs):
+        return expected_result
+
+    async def fake_ensure(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(orchestration_service, "prepare_fact_extraction_orchestration", fake_prepare)
+    monkeypatch.setattr(orchestration_service, "_read_completed_orchestration_result", fake_read_completed)
+    monkeypatch.setattr(
+        orchestration_service.duplicate_grouping_service,
+        "ensure_cross_batch_duplicate_grouping",
+        fake_ensure,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(
+            orchestration_service.execute_fact_extraction_orchestration(
+                session_factory,
+                project_id=uuid.uuid4(),
+                extraction_run_id=extraction_run_id,
+                plan=plan,
+                prompt=PROMPT,
+                llm_client=SimpleNamespace(),
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+                worker_token=uuid.uuid4(),
+            )
+        )
+
+    assert "Cross-batch duplicate grouping did not complete after orchestration finalization" not in caplog.text
 
 
 def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:

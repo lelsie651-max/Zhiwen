@@ -1,4 +1,5 @@
 from pathlib import Path
+import uuid
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +16,7 @@ from app.models.fact_value_duplicate_grouping import (
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
     FactValueDuplicateGroupingApplication,
+    normalize_duplicate_grouping_algorithm_version,
 )
 from app.schemas.fact import FactIdentityInput, FactRead, FactValueInput, FactValueRead
 
@@ -29,6 +31,29 @@ def test_duplicate_grouping_tables_are_registered() -> None:
         "fact_value_duplicate_groups",
         "fact_value_duplicate_group_members",
     } <= set(Base.metadata.tables)
+
+
+def test_duplicate_grouping_algorithm_version_validator_uses_shared_normalization() -> None:
+    assert normalize_duplicate_grouping_algorithm_version("  cross_batch_exact_v2  ") == "cross_batch_exact_v2"
+
+    application = FactValueDuplicateGroupingApplication(
+        extraction_run_id=uuid.uuid4(),
+        orchestration_id=uuid.uuid4(),
+        algorithm_version="  cross_batch_exact_v2  ",
+        input_manifest_hash="a" * 64,
+        result_manifest_hash="b" * 64,
+        input_fact_value_count=0,
+        duplicate_group_count=0,
+        duplicate_member_count=0,
+    )
+
+    assert application.algorithm_version == "cross_batch_exact_v2"
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        normalize_duplicate_grouping_algorithm_version("   ")
+
+    with pytest.raises(ValueError, match="at most 64 characters"):
+        normalize_duplicate_grouping_algorithm_version("x" * 65)
 
 
 def test_fact_identity_unique_constraint_exists() -> None:

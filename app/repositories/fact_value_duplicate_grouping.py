@@ -30,6 +30,10 @@ from app.schemas.fact_value_duplicate_grouping import (
 )
 
 
+class DuplicateGroupingRepositoryInvariantError(Exception):
+    """Raised when duplicate grouping repository rows violate runtime invariants."""
+
+
 @dataclass(frozen=True, slots=True)
 class DuplicateGroupingOrchestrationState:
     orchestration_id: uuid.UUID
@@ -162,7 +166,7 @@ async def list_duplicate_candidates(
 
     candidates: list[DuplicateCandidate] = []
     current_fact_value_id: uuid.UUID | None = None
-    current_evidence_link_ids: list[uuid.UUID] = []
+    current_evidence_link_ids: set[uuid.UUID] = set()
     current_candidate_fields: dict[str, object] | None = None
 
     def flush_current() -> None:
@@ -179,11 +183,11 @@ async def list_duplicate_candidates(
                 value_type=current_candidate_fields["value_type"],
                 value_json=copy.deepcopy(current_candidate_fields["value_json"]),
                 referenced_entity_id=current_candidate_fields["referenced_entity_id"],
-                evidence_link_ids=tuple(current_evidence_link_ids),
+                evidence_link_ids=tuple(sorted(current_evidence_link_ids, key=str)),
             )
         )
         current_fact_value_id = None
-        current_evidence_link_ids = []
+        current_evidence_link_ids = set()
         current_candidate_fields = None
 
     for row in rows:
@@ -200,8 +204,25 @@ async def list_duplicate_candidates(
                 "value_json": row.value_json,
                 "referenced_entity_id": row.referenced_entity_id,
             }
+        elif current_candidate_fields is not None:
+            stable_row_fields = {
+                "fact_id": row.fact_id,
+                "orchestration_id": row.orchestration_id,
+                "extraction_run_id": row.extraction_run_id,
+                "source_batch_id": row.source_batch_id,
+                "value_type": row.value_type,
+                "value_json": row.value_json,
+                "referenced_entity_id": row.referenced_entity_id,
+            }
+            if any(
+                current_candidate_fields[field_name] != stable_row_fields[field_name]
+                for field_name in stable_row_fields
+            ):
+                raise DuplicateGroupingRepositoryInvariantError(
+                    "cross_batch_duplicate_grouping_candidate_row_mismatch"
+                )
         if row.evidence_link_id is not None:
-            current_evidence_link_ids.append(row.evidence_link_id)
+            current_evidence_link_ids.add(row.evidence_link_id)
     flush_current()
     return tuple(candidates)
 
@@ -366,8 +387,8 @@ async def list_duplicate_group_evidence_projections(
 
     projections: list[DuplicateGroupEvidenceProjection] = []
     current_fact_value_id: uuid.UUID | None = None
-    current_link_ids: list[uuid.UUID] = []
-    current_evidence_ids: list[uuid.UUID] = []
+    current_link_ids: set[uuid.UUID] = set()
+    current_evidence_ids: set[uuid.UUID] = set()
     current_fields: dict[str, object] | None = None
 
     def flush_current() -> None:
@@ -380,13 +401,13 @@ async def list_duplicate_group_evidence_projections(
                 duplicate_key_hash=current_fields["duplicate_key_hash"],
                 fact_value_id=current_fields["fact_value_id"],
                 source_batch_id=current_fields["source_batch_id"],
-                evidence_link_ids=tuple(current_link_ids),
-                evidence_ids=tuple(current_evidence_ids),
+                evidence_link_ids=tuple(sorted(current_link_ids, key=str)),
+                evidence_ids=tuple(sorted(current_evidence_ids, key=str)),
             )
         )
         current_fact_value_id = None
-        current_link_ids = []
-        current_evidence_ids = []
+        current_link_ids = set()
+        current_evidence_ids = set()
         current_fields = None
 
     for row in rows:
@@ -400,9 +421,9 @@ async def list_duplicate_group_evidence_projections(
                 "source_batch_id": row.source_batch_id,
             }
         if row.evidence_link_id is not None:
-            current_link_ids.append(row.evidence_link_id)
+            current_link_ids.add(row.evidence_link_id)
         if row.evidence_id is not None:
-            current_evidence_ids.append(row.evidence_id)
+            current_evidence_ids.add(row.evidence_id)
     flush_current()
     return tuple(projections)
 

@@ -15,6 +15,7 @@ from app.models.fact_value_duplicate_grouping import (
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
     FactValueDuplicateGroupingApplication,
+    normalize_duplicate_grouping_algorithm_version as normalize_model_algorithm_version,
 )
 from app.repositories import fact_value_duplicate_grouping as duplicate_grouping_repository
 from app.schemas.fact_value_duplicate_grouping import (
@@ -188,6 +189,56 @@ def test_duplicate_fingerprint_v2_changes_when_orchestration_changes() -> None:
         duplicate_grouping_service.build_duplicate_fingerprint(left).sha256_hex
         != duplicate_grouping_service.build_duplicate_fingerprint(right).sha256_hex
     )
+
+
+def test_duplicate_fingerprint_normalizes_algorithm_version_before_hashing() -> None:
+    base = candidate()
+    same = candidate(
+        orchestration_id=base.orchestration_id,
+        extraction_run_id=base.extraction_run_id,
+        fact_id=base.fact_id,
+        source_batch_id=uuid.uuid4(),
+        value_json=base.value_json,
+        value_type=base.value_type,
+        referenced_entity_id=base.referenced_entity_id,
+    )
+
+    spaced = duplicate_grouping_service.build_duplicate_fingerprint(
+        base,
+        algorithm_version="  cross_batch_exact_v2  ",
+    )
+    normalized = duplicate_grouping_service.build_duplicate_fingerprint(
+        same,
+        algorithm_version="cross_batch_exact_v2",
+    )
+
+    assert spaced.sha256_hex == normalized.sha256_hex
+
+
+def test_duplicate_grouping_algorithm_version_normalizes_and_rejects_invalid_values() -> None:
+    assert duplicate_grouping_service.normalize_duplicate_grouping_algorithm_version(
+        "  cross_batch_exact_v2  "
+    ) == "cross_batch_exact_v2"
+    assert normalize_model_algorithm_version("  cross_batch_exact_v2  ") == "cross_batch_exact_v2"
+
+    with pytest.raises(duplicate_grouping_service.CrossBatchDuplicateGroupingError, match="invalid_algorithm_version"):
+        duplicate_grouping_service.normalize_duplicate_grouping_algorithm_version("   ")
+
+    with pytest.raises(duplicate_grouping_service.CrossBatchDuplicateGroupingError, match="invalid_algorithm_version"):
+        duplicate_grouping_service.normalize_duplicate_grouping_algorithm_version("x" * 65)
+
+
+def test_canonical_json_rejects_nfc_key_collision() -> None:
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="cross_batch_duplicate_grouping_nfc_key_collision",
+    ):
+        duplicate_grouping_service._canonical_json_bytes(
+            {
+                "e\u0301": "left",
+                "é": "right",
+            }
+        )
 
 
 def test_duplicate_fingerprint_supports_decimal_uuid_date_time_and_enum() -> None:
@@ -375,6 +426,49 @@ def test_build_duplicate_grouping_write_plan_rejects_cross_orchestration_candida
             [
                 candidate(orchestration_id=uuid.uuid4(), extraction_run_id=run_id, value_json="A", value_type="string"),
                 candidate(orchestration_id=uuid.uuid4(), extraction_run_id=run_id, value_json="A", value_type="string"),
+            ]
+        )
+
+
+def test_build_duplicate_grouping_write_plan_rejects_duplicate_fact_value_id() -> None:
+    duplicate_fact_value_id = uuid.uuid4()
+    orchestration_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="cross_batch_duplicate_grouping_duplicate_fact_value_id",
+    ):
+        duplicate_grouping_service.build_duplicate_grouping_write_plan(
+            [
+                candidate(
+                    orchestration_id=orchestration_id,
+                    extraction_run_id=extraction_run_id,
+                    fact_value_id=duplicate_fact_value_id,
+                    value_json="A",
+                    value_type="string",
+                ),
+                candidate(
+                    orchestration_id=orchestration_id,
+                    extraction_run_id=extraction_run_id,
+                    fact_value_id=duplicate_fact_value_id,
+                    value_json="B",
+                    value_type="string",
+                ),
+            ]
+        )
+
+
+def test_build_duplicate_grouping_write_plan_rejects_duplicate_evidence_link_id() -> None:
+    duplicate_evidence_link_id = uuid.uuid4()
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="cross_batch_duplicate_grouping_duplicate_evidence_link_id",
+    ):
+        duplicate_grouping_service.build_duplicate_grouping_write_plan(
+            [
+                candidate(
+                    evidence_link_ids=(duplicate_evidence_link_id, duplicate_evidence_link_id),
+                ),
             ]
         )
 
@@ -784,6 +878,75 @@ def test_ensure_cross_batch_duplicate_grouping_does_not_swallow_unknown_integrit
         )
 
 
+def test_ensure_cross_batch_duplicate_grouping_normalizes_algorithm_version_for_query_and_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    extraction_run_id = uuid.uuid4()
+    first_candidate = candidate(
+        orchestration_id=orchestration_id,
+        extraction_run_id=extraction_run_id,
+        source_batch_id=uuid.uuid4(),
+    )
+    second_candidate = candidate(
+        orchestration_id=orchestration_id,
+        extraction_run_id=extraction_run_id,
+        fact_id=first_candidate.fact_id,
+        source_batch_id=uuid.uuid4(),
+        value_json=first_candidate.value_json,
+        value_type=first_candidate.value_type,
+        referenced_entity_id=first_candidate.referenced_entity_id,
+    )
+    session_factory = SessionFactory([FakeSession(), FakeSession()])
+    seen_algorithm_versions: list[str] = []
+    created_application_versions: list[str] = []
+
+    async def fake_state(_session, *, orchestration_id):
+        return make_orchestration_state(
+            orchestration_id,
+            extraction_run_id=extraction_run_id,
+            orchestration_status="completed",
+        )
+
+    async def fake_invalid_bindings(_session, *, orchestration_id):
+        return False
+
+    async def fake_count(_session, *, orchestration_id):
+        return 2
+
+    async def fake_candidates(_session, *, orchestration_id):
+        return (first_candidate, second_candidate)
+
+    async def fake_existing_for_update(_session, *, orchestration_id, algorithm_version):
+        seen_algorithm_versions.append(algorithm_version)
+        return None
+
+    async def fake_create_application(_session, application):
+        created_application_versions.append(application.algorithm_version)
+        return application
+
+    monkeypatch.setattr(duplicate_grouping_repository, "get_duplicate_grouping_orchestration_state", fake_state)
+    monkeypatch.setattr(duplicate_grouping_repository, "has_invalid_completed_batch_bindings", fake_invalid_bindings)
+    monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
+    monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
+    monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_for_update", fake_existing_for_update)
+    monkeypatch.setattr(duplicate_grouping_repository, "create_grouping_application", fake_create_application)
+    monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_groups", return_second_arg)
+    monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_group_members", return_second_arg)
+
+    result = run_async(
+        duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
+            session_factory,
+            orchestration_id=orchestration_id,
+            algorithm_version="  cross_batch_exact_v2  ",
+        )
+    )
+
+    assert result.algorithm_version == "cross_batch_exact_v2"
+    assert seen_algorithm_versions == ["cross_batch_exact_v2"]
+    assert created_application_versions == ["cross_batch_exact_v2"]
+
+
 def test_ensure_cross_batch_duplicate_grouping_rolls_back_on_partial_write_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1045,6 +1208,7 @@ def test_duplicate_candidate_query_compiles_and_reads_evidence_order() -> None:
     orchestration_id = uuid.uuid4()
     extraction_run_id = uuid.uuid4()
     fact_value_id = uuid.uuid4()
+    fact_id = uuid.uuid4()
     source_batch_id = uuid.uuid4()
     rows = [
         type(
@@ -1052,7 +1216,7 @@ def test_duplicate_candidate_query_compiles_and_reads_evidence_order() -> None:
             (),
             {
                 "fact_value_id": fact_value_id,
-                "fact_id": uuid.uuid4(),
+                "fact_id": fact_id,
                 "orchestration_id": orchestration_id,
                 "extraction_run_id": extraction_run_id,
                 "source_batch_id": source_batch_id,
@@ -1067,7 +1231,22 @@ def test_duplicate_candidate_query_compiles_and_reads_evidence_order() -> None:
             (),
             {
                 "fact_value_id": fact_value_id,
-                "fact_id": uuid.uuid4(),
+                "fact_id": fact_id,
+                "orchestration_id": orchestration_id,
+                "extraction_run_id": extraction_run_id,
+                "source_batch_id": source_batch_id,
+                "value_type": "string",
+                "value_json": "A",
+                "referenced_entity_id": None,
+                "evidence_link_id": uuid.UUID("00000000-0000-0000-0000-000000000003"),
+            },
+        )(),
+        type(
+            "Row",
+            (),
+            {
+                "fact_value_id": fact_value_id,
+                "fact_id": fact_id,
                 "orchestration_id": orchestration_id,
                 "extraction_run_id": extraction_run_id,
                 "source_batch_id": source_batch_id,
@@ -1098,6 +1277,69 @@ def test_duplicate_candidate_query_compiles_and_reads_evidence_order() -> None:
     assert "fact_extraction_orch_batches.orchestration_id" in sql
     assert "fact_extraction_batch_applications" in sql
     assert "ORDER BY fact_values.id ASC" in sql
+
+
+@pytest.mark.parametrize(
+    ("field_name", "left_value", "right_value"),
+    [
+        ("fact_id", uuid.uuid4(), uuid.uuid4()),
+        ("orchestration_id", uuid.uuid4(), uuid.uuid4()),
+        ("extraction_run_id", uuid.uuid4(), uuid.uuid4()),
+        ("source_batch_id", uuid.uuid4(), uuid.uuid4()),
+        ("value_type", "string", "number"),
+        ("value_json", {"value": "A"}, {"value": "B"}),
+        ("referenced_entity_id", uuid.uuid4(), uuid.uuid4()),
+    ],
+)
+def test_duplicate_candidate_query_fails_closed_when_stable_fields_diverge(
+    field_name: str,
+    left_value,
+    right_value,
+) -> None:
+    class _FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows):
+            self.rows = rows
+
+        async def execute(self, _statement):
+            return _FakeResult(self.rows)
+
+    fact_value_id = uuid.uuid4()
+    base = {
+        "fact_value_id": fact_value_id,
+        "fact_id": uuid.uuid4(),
+        "orchestration_id": uuid.uuid4(),
+        "extraction_run_id": uuid.uuid4(),
+        "source_batch_id": uuid.uuid4(),
+        "value_type": "string",
+        "value_json": {"value": "A"},
+        "referenced_entity_id": None,
+        "evidence_link_id": uuid.uuid4(),
+    }
+    first_row = type("Row", (), dict(base))()
+    second_payload = dict(base)
+    second_payload[field_name] = right_value
+    second_payload["evidence_link_id"] = uuid.uuid4()
+    if field_name != "referenced_entity_id":
+        first_row = type("Row", (), {**base, field_name: left_value})()
+    second_row = type("Row", (), second_payload)()
+
+    with pytest.raises(
+        duplicate_grouping_repository.DuplicateGroupingRepositoryInvariantError,
+        match="cross_batch_duplicate_grouping_candidate_row_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_repository.list_duplicate_candidates(
+                _Session([first_row, second_row]),
+                orchestration_id=uuid.uuid4(),
+            )
+        )
 
 
 def test_duplicate_group_evidence_projection_reads_member_evidence_order() -> None:

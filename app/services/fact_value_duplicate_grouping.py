@@ -21,6 +21,7 @@ from app.models.fact_value_duplicate_grouping import (
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
     FactValueDuplicateGroupingApplication,
+    normalize_duplicate_grouping_algorithm_version as normalize_model_algorithm_version,
 )
 from app.repositories import fact_value_duplicate_grouping as duplicate_grouping_repository
 from app.schemas.fact_value_duplicate_grouping import (
@@ -66,6 +67,15 @@ def _normalize_string(value: str) -> str:
     return unicodedata.normalize("NFC", value)
 
 
+def normalize_duplicate_grouping_algorithm_version(value: str) -> str:
+    try:
+        return normalize_model_algorithm_version(value)
+    except ValueError:
+        raise CrossBatchDuplicateGroupingError(
+            "cross_batch_duplicate_grouping_invalid_algorithm_version"
+        ) from None
+
+
 def _canonicalize_value(value: Any) -> Any:
     if value is _MISSING:
         return _MISSING
@@ -99,7 +109,12 @@ def _canonicalize_value(value: Any) -> Any:
             normalized_item = _canonicalize_value(item)
             if normalized_item is _MISSING:
                 continue
-            normalized_items[_normalize_string(key)] = normalized_item
+            normalized_key = _normalize_string(key)
+            if normalized_key in normalized_items:
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_nfc_key_collision"
+                )
+            normalized_items[normalized_key] = normalized_item
         return normalized_items
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_canonicalize_value(item) for item in value]
@@ -144,6 +159,7 @@ def build_duplicate_fingerprint(
     algorithm_version: str = CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
     digest_bytes_by_hash: dict[str, bytes] | None = None,
 ) -> DuplicateFingerprint:
+    algorithm_version = normalize_duplicate_grouping_algorithm_version(algorithm_version)
     digest_map = digest_bytes_by_hash if digest_bytes_by_hash is not None else {}
     canonical_bytes = _canonical_json_bytes(
         {
@@ -180,13 +196,26 @@ def _validate_candidate(candidate: DuplicateCandidate) -> None:
         _require_uuid(evidence_link_id, field_name="candidate.evidence_link_id")
 
 
+def _normalize_candidate_evidence_link_ids(
+    evidence_link_ids: Sequence[uuid.UUID],
+) -> tuple[uuid.UUID, ...]:
+    normalized_ids = tuple(sorted(set(evidence_link_ids), key=str))
+    if len(normalized_ids) != len(evidence_link_ids):
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_duplicate_evidence_link_id"
+        )
+    return normalized_ids
+
+
 def build_duplicate_grouping_write_plan(
     candidates: Sequence[DuplicateCandidate],
     *,
     algorithm_version: str = CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
 ) -> DuplicateGroupingWritePlan:
+    algorithm_version = normalize_duplicate_grouping_algorithm_version(algorithm_version)
     digest_bytes_by_hash: dict[str, bytes] = {}
     fingerprint_by_fact_value_id: dict[uuid.UUID, DuplicateFingerprint] = {}
+    normalized_evidence_link_ids_by_fact_value_id: dict[uuid.UUID, tuple[uuid.UUID, ...]] = {}
     distinct_orchestration_ids = {candidate.orchestration_id for candidate in candidates}
     distinct_extraction_run_ids = {candidate.extraction_run_id for candidate in candidates}
     if len(distinct_orchestration_ids) > 1:
@@ -200,6 +229,13 @@ def build_duplicate_grouping_write_plan(
 
     for candidate in candidates:
         _validate_candidate(candidate)
+        if candidate.fact_value_id in fingerprint_by_fact_value_id:
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_duplicate_fact_value_id"
+            )
+        normalized_evidence_link_ids_by_fact_value_id[candidate.fact_value_id] = (
+            _normalize_candidate_evidence_link_ids(candidate.evidence_link_ids)
+        )
         fingerprint_by_fact_value_id[candidate.fact_value_id] = build_duplicate_fingerprint(
             candidate,
             algorithm_version=algorithm_version,
@@ -209,7 +245,10 @@ def build_duplicate_grouping_write_plan(
     input_manifest_entries = [
         {
             "duplicate_key_hash": fingerprint_by_fact_value_id[candidate.fact_value_id].sha256_hex,
-            "evidence_link_ids": [str(evidence_link_id) for evidence_link_id in candidate.evidence_link_ids],
+            "evidence_link_ids": [
+                str(evidence_link_id)
+                for evidence_link_id in normalized_evidence_link_ids_by_fact_value_id[candidate.fact_value_id]
+            ],
             "fact_value_id": str(candidate.fact_value_id),
             "source_batch_id": str(candidate.source_batch_id),
         }
@@ -430,8 +469,7 @@ async def ensure_cross_batch_duplicate_grouping(
     algorithm_version: str = CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
 ) -> DuplicateGroupingResult:
     orchestration_id = _require_uuid(orchestration_id, field_name="orchestration_id")
-    if not isinstance(algorithm_version, str) or not algorithm_version:
-        raise CrossBatchDuplicateGroupingError("algorithm_version must be a non-empty string")
+    algorithm_version = normalize_duplicate_grouping_algorithm_version(algorithm_version)
 
     async with session_factory() as read_session:
         try:
@@ -459,6 +497,9 @@ async def ensure_cross_batch_duplicate_grouping(
                 raise CrossBatchDuplicateGroupingInvariantError(
                     "cross_batch_duplicate_grouping_candidate_source_mismatch"
                 )
+        except duplicate_grouping_repository.DuplicateGroupingRepositoryInvariantError as error:
+            await read_session.rollback()
+            raise CrossBatchDuplicateGroupingInvariantError(str(error)) from None
         except BaseException:
             await read_session.rollback()
             raise
