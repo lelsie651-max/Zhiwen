@@ -14,6 +14,11 @@ from app.schemas.document_revision_diff import (
     DocumentRevisionBlockDiffItem,
     DocumentRevisionDiffBlockSnapshot,
 )
+from app.schemas.fact import FactIdentityInput, FactValueInput
+from app.schemas.fact_extraction_persistence import (
+    AuthenticatedCompletedFactExtractionApplicationSnapshot,
+    AuthenticatedPersistedFactProposalItem,
+)
 from app.schemas.fact_value_duplicate_grouping import (
     CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
     DuplicateCandidate,
@@ -65,6 +70,42 @@ def _uuid(seed: str) -> uuid.UUID:
 
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _fact_identity_hash(
+    *,
+    subject_kind: str,
+    subject_key: str,
+    predicate_key: str,
+    scope_key: str | None = None,
+    subject_entity_id: uuid.UUID | None = None,
+) -> str:
+    return fact_diff_service.fact_service.build_fact_identity_hash(
+        FactIdentityInput(
+            subject_kind=subject_kind,
+            subject_key=subject_key,
+            subject_entity_id=subject_entity_id,
+            predicate_key=predicate_key,
+            scope_key=scope_key,
+        )
+    )
+
+
+def _normalized_fact_value(
+    *,
+    value_type: str,
+    value_json: object | None,
+    referenced_entity_id: uuid.UUID | None = None,
+):
+    return fact_diff_service.fact_service.normalize_fact_value_input(
+        FactValueInput(
+            value_type=value_type,
+            value_json=value_json,
+            referenced_entity_id=referenced_entity_id,
+            language_code=None,
+            confidence=None,
+        )
+    )
 
 
 def _block_snapshot(*, seed: str, source_order: int) -> DocumentRevisionDiffBlockSnapshot:
@@ -204,6 +245,7 @@ def _candidate(
     evidence_link_ids: tuple[uuid.UUID, ...],
     value_type: str = "string",
     referenced_entity_id: uuid.UUID | None = None,
+    evidence_ids: tuple[uuid.UUID, ...] = (),
 ) -> DuplicateCandidate:
     return DuplicateCandidate(
         fact_value_id=fact_value_id,
@@ -215,6 +257,7 @@ def _candidate(
         value_json=value_json,
         referenced_entity_id=referenced_entity_id,
         evidence_link_ids=evidence_link_ids,
+        evidence_ids=evidence_ids,
     )
 
 
@@ -222,11 +265,15 @@ def _source_snapshot(
     *,
     state: DuplicateGroupingOrchestrationState,
     candidates: tuple[DuplicateCandidate, ...],
+    application_snapshots: tuple[
+        AuthenticatedCompletedFactExtractionApplicationSnapshot, ...
+    ] = (),
 ) -> AuthenticatedDuplicateGroupingSourceSnapshot:
     return AuthenticatedDuplicateGroupingSourceSnapshot(
         state=state,
         candidate_count=len(candidates),
         candidates=candidates,
+        application_snapshots=application_snapshots,
     )
 
 
@@ -234,7 +281,7 @@ def _row(
     *,
     project_id: uuid.UUID,
     fact_id: uuid.UUID,
-    fact_identity_hash: str,
+    fact_identity_hash: str | None,
     fact_value_id: uuid.UUID,
     extraction_run_id: uuid.UUID,
     inference_run_id: uuid.UUID,
@@ -251,16 +298,39 @@ def _row(
     orchestration_project_id: uuid.UUID | None = None,
     orchestration_extraction_run_id: uuid.UUID | None = None,
     batch_current_inference_run_id: uuid.UUID | None = None,
+    subject_kind: str = "subject",
+    subject_key: str | None = None,
+    predicate_key: str | None = None,
+    scope_key: str | None = None,
+    subject_entity_id: uuid.UUID | None = None,
+    value_type: str = "string",
+    referenced_entity_id: uuid.UUID | None = None,
 ) -> fact_diff_service.document_revision_fact_diff_repository.DocumentRevisionFactDiffSourceRow:
+    actual_subject_key = subject_key or f"subject-{fact_id}"
+    actual_predicate_key = predicate_key or f"predicate-{fact_id}"
+    normalized_value = _normalized_fact_value(
+        value_type=value_type,
+        value_json=value_json,
+        referenced_entity_id=referenced_entity_id,
+    )
     return fact_diff_service.document_revision_fact_diff_repository.DocumentRevisionFactDiffSourceRow(
         fact_project_id=project_id,
         fact_id=fact_id,
-        fact_identity_hash=fact_identity_hash,
-        subject_kind="subject",
-        subject_key=f"subject-{fact_identity_hash[:6]}",
-        predicate_key=f"predicate-{fact_identity_hash[:6]}",
-        scope_key=None,
-        subject_entity_id=None,
+        fact_identity_hash=(
+            fact_identity_hash
+            or _fact_identity_hash(
+                subject_kind=subject_kind,
+                subject_key=actual_subject_key,
+                predicate_key=actual_predicate_key,
+                scope_key=scope_key,
+                subject_entity_id=subject_entity_id,
+            )
+        ),
+        subject_kind=subject_kind,
+        subject_key=actual_subject_key,
+        predicate_key=actual_predicate_key,
+        scope_key=scope_key,
+        subject_entity_id=subject_entity_id,
         fact_value_id=fact_value_id,
         extraction_run_id=extraction_run_id,
         inference_run_id=inference_run_id,
@@ -271,9 +341,11 @@ def _row(
         orchestration_project_id=orchestration_project_id or project_id,
         orchestration_extraction_run_id=orchestration_extraction_run_id or extraction_run_id,
         batch_current_inference_run_id=batch_current_inference_run_id or inference_run_id,
-        value_type="string",
-        value_json=value_json,
-        referenced_entity_id=None,
+        value_type=normalized_value.value_type,
+        value_json=normalized_value.value_json,
+        normalized_value_text=normalized_value.normalized_value_text,
+        fact_value_hash=normalized_value.value_hash,
+        referenced_entity_id=normalized_value.referenced_entity_id,
         evidence_link_id=evidence_link_id,
         evidence_link_source_order=0,
         evidence_id=evidence_id,
@@ -291,6 +363,40 @@ def _row(
         block_table_index=None,
         block_row_index=None,
         block_raw_text=excerpt,
+    )
+
+
+def _application_snapshot(
+    *,
+    project_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+    inference_run_id: uuid.UUID,
+    fact_id: uuid.UUID,
+    fact_value_id: uuid.UUID,
+    evidence_ids: tuple[uuid.UUID, ...],
+    subject_entity_id: uuid.UUID | None = None,
+    referenced_entity_id: uuid.UUID | None = None,
+) -> AuthenticatedCompletedFactExtractionApplicationSnapshot:
+    return AuthenticatedCompletedFactExtractionApplicationSnapshot(
+        application_id=uuid.uuid4(),
+        project_id=project_id,
+        extraction_run_id=extraction_run_id,
+        inference_run_id=inference_run_id,
+        input_batch_id=uuid.uuid4(),
+        persistence_name="persistence",
+        persistence_version="1.3.0",
+        entity_resolution_policy_name="entity-policy",
+        entity_resolution_policy_version="1.4.0",
+        items=(
+            AuthenticatedPersistedFactProposalItem(
+                proposal_index=0,
+                fact_id=fact_id,
+                fact_value_id=fact_value_id,
+                subject_entity_id=subject_entity_id,
+                referenced_entity_id=referenced_entity_id,
+                evidence_ids=evidence_ids,
+            ),
+        ),
     )
 
 
@@ -323,12 +429,35 @@ def _fixture() -> dict[str, object]:
     fact_modified = _uuid("fact-modified")
     fact_added = _uuid("fact-added")
     fact_removed = _uuid("fact-removed")
+    fact_identity_hashes = {
+        "unchanged": _fact_identity_hash(
+            subject_kind="subject",
+            subject_key="subject-unchanged",
+            predicate_key="predicate-unchanged",
+        ),
+        "modified": _fact_identity_hash(
+            subject_kind="subject",
+            subject_key="subject-modified",
+            predicate_key="predicate-modified",
+        ),
+        "added": _fact_identity_hash(
+            subject_kind="subject",
+            subject_key="subject-added",
+            predicate_key="predicate-added",
+        ),
+        "removed": _fact_identity_hash(
+            subject_kind="subject",
+            subject_key="subject-removed",
+            predicate_key="predicate-removed",
+        ),
+    }
     fixture["fact_ids"] = {
         "unchanged": fact_unchanged,
         "modified": fact_modified,
         "added": fact_added,
         "removed": fact_removed,
     }
+    fixture["fact_identity_hashes"] = fact_identity_hashes
 
     base_candidates = (
         _candidate(
@@ -339,6 +468,7 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("base-batch-a1"),
             value_json="same",
             evidence_link_ids=(_uuid("el-base-a1"),),
+            evidence_ids=(_uuid("e-base-a1"),),
         ),
         _candidate(
             fact_value_id=_uuid("fv-base-a2"),
@@ -348,6 +478,7 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("base-batch-a2"),
             value_json="same",
             evidence_link_ids=(_uuid("el-base-a2"),),
+            evidence_ids=(_uuid("e-base-a2"),),
         ),
         _candidate(
             fact_value_id=_uuid("fv-base-b1"),
@@ -357,6 +488,7 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("base-batch-b1"),
             value_json="alpha",
             evidence_link_ids=(_uuid("el-base-b1"),),
+            evidence_ids=(_uuid("e-base-b1"),),
         ),
         _candidate(
             fact_value_id=_uuid("fv-base-b2"),
@@ -366,6 +498,7 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("base-batch-b2"),
             value_json="beta",
             evidence_link_ids=(_uuid("el-base-b2"),),
+            evidence_ids=(_uuid("e-base-b2"),),
         ),
         _candidate(
             fact_value_id=_uuid("fv-base-d1"),
@@ -375,6 +508,7 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("base-batch-d1"),
             value_json="removed",
             evidence_link_ids=(_uuid("el-base-d1"),),
+            evidence_ids=(_uuid("e-base-d1"),),
         ),
     )
     target_candidates = (
@@ -386,6 +520,7 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("target-batch-a1"),
             value_json="same",
             evidence_link_ids=(_uuid("el-target-a1"),),
+            evidence_ids=(_uuid("e-target-a1"),),
         ),
         _candidate(
             fact_value_id=_uuid("fv-target-b1"),
@@ -395,6 +530,7 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("target-batch-b1"),
             value_json="alpha",
             evidence_link_ids=(_uuid("el-target-b1"),),
+            evidence_ids=(_uuid("e-target-b1"),),
         ),
         _candidate(
             fact_value_id=_uuid("fv-target-c1"),
@@ -404,19 +540,15 @@ def _fixture() -> dict[str, object]:
             source_batch_id=_uuid("target-batch-c1"),
             value_json="added",
             evidence_link_ids=(_uuid("el-target-c1"),),
+            evidence_ids=(_uuid("e-target-c1"),),
         ),
-    )
-    fixture["base_snapshot"] = _source_snapshot(state=base_state, candidates=base_candidates)
-    fixture["target_snapshot"] = _source_snapshot(
-        state=target_state,
-        candidates=target_candidates,
     )
     block_ids = fixture["block_ids"]
     fixture["base_rows"] = (
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_unchanged,
-            fact_identity_hash="1" * 64,
+            fact_identity_hash=fact_identity_hashes["unchanged"],
             fact_value_id=_uuid("fv-base-a1"),
             extraction_run_id=fixture["base_run_id"],
             inference_run_id=_uuid("ir-base-a1"),
@@ -427,11 +559,13 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["base_unchanged"],
             block_source_order=0,
             excerpt="same excerpt 1",
+            subject_key="subject-unchanged",
+            predicate_key="predicate-unchanged",
         ),
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_unchanged,
-            fact_identity_hash="1" * 64,
+            fact_identity_hash=fact_identity_hashes["unchanged"],
             fact_value_id=_uuid("fv-base-a2"),
             extraction_run_id=fixture["base_run_id"],
             inference_run_id=_uuid("ir-base-a2"),
@@ -442,11 +576,13 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["base_moved"],
             block_source_order=2,
             excerpt="same excerpt 2",
+            subject_key="subject-unchanged",
+            predicate_key="predicate-unchanged",
         ),
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_modified,
-            fact_identity_hash="2" * 64,
+            fact_identity_hash=fact_identity_hashes["modified"],
             fact_value_id=_uuid("fv-base-b1"),
             extraction_run_id=fixture["base_run_id"],
             inference_run_id=_uuid("ir-base-b1"),
@@ -457,11 +593,13 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["base_modified"],
             block_source_order=1,
             excerpt="alpha excerpt",
+            subject_key="subject-modified",
+            predicate_key="predicate-modified",
         ),
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_modified,
-            fact_identity_hash="2" * 64,
+            fact_identity_hash=fact_identity_hashes["modified"],
             fact_value_id=_uuid("fv-base-b2"),
             extraction_run_id=fixture["base_run_id"],
             inference_run_id=_uuid("ir-base-b2"),
@@ -472,11 +610,13 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["base_moved"],
             block_source_order=2,
             excerpt="beta excerpt",
+            subject_key="subject-modified",
+            predicate_key="predicate-modified",
         ),
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_removed,
-            fact_identity_hash="4" * 64,
+            fact_identity_hash=fact_identity_hashes["removed"],
             fact_value_id=_uuid("fv-base-d1"),
             extraction_run_id=fixture["base_run_id"],
             inference_run_id=_uuid("ir-base-d1"),
@@ -487,13 +627,15 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["base_removed"],
             block_source_order=4,
             excerpt="removed excerpt",
+            subject_key="subject-removed",
+            predicate_key="predicate-removed",
         ),
     )
     fixture["target_rows"] = (
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_unchanged,
-            fact_identity_hash="1" * 64,
+            fact_identity_hash=fact_identity_hashes["unchanged"],
             fact_value_id=_uuid("fv-target-a1"),
             extraction_run_id=fixture["target_run_id"],
             inference_run_id=_uuid("ir-target-a1"),
@@ -504,11 +646,13 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["target_unchanged"],
             block_source_order=0,
             excerpt="same excerpt target",
+            subject_key="subject-unchanged",
+            predicate_key="predicate-unchanged",
         ),
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_modified,
-            fact_identity_hash="2" * 64,
+            fact_identity_hash=fact_identity_hashes["modified"],
             fact_value_id=_uuid("fv-target-b1"),
             extraction_run_id=fixture["target_run_id"],
             inference_run_id=_uuid("ir-target-b1"),
@@ -519,11 +663,13 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["target_modified"],
             block_source_order=2,
             excerpt="alpha excerpt target",
+            subject_key="subject-modified",
+            predicate_key="predicate-modified",
         ),
         _row(
             project_id=fixture["project_id"],
             fact_id=fact_added,
-            fact_identity_hash="3" * 64,
+            fact_identity_hash=fact_identity_hashes["added"],
             fact_value_id=_uuid("fv-target-c1"),
             extraction_run_id=fixture["target_run_id"],
             inference_run_id=_uuid("ir-target-c1"),
@@ -534,6 +680,58 @@ def _fixture() -> dict[str, object]:
             document_block_id=block_ids["target_added"],
             block_source_order=3,
             excerpt="added excerpt",
+            subject_key="subject-added",
+            predicate_key="predicate-added",
+        ),
+    )
+    base_rows_by_fact_value = {
+        row.fact_value_id: tuple(
+            candidate_row
+            for candidate_row in fixture["base_rows"]
+            if candidate_row.fact_value_id == row.fact_value_id
+        )
+        for row in fixture["base_rows"]
+    }
+    target_rows_by_fact_value = {
+        row.fact_value_id: tuple(
+            candidate_row
+            for candidate_row in fixture["target_rows"]
+            if candidate_row.fact_value_id == row.fact_value_id
+        )
+        for row in fixture["target_rows"]
+    }
+    fixture["base_snapshot"] = _source_snapshot(
+        state=base_state,
+        candidates=base_candidates,
+        application_snapshots=tuple(
+            _application_snapshot(
+                project_id=fixture["project_id"],
+                extraction_run_id=fixture["base_run_id"],
+                inference_run_id=base_rows_by_fact_value[candidate.fact_value_id][0].inference_run_id,
+                fact_id=candidate.fact_id,
+                fact_value_id=candidate.fact_value_id,
+                evidence_ids=tuple(
+                    row.evidence_id for row in base_rows_by_fact_value[candidate.fact_value_id]
+                ),
+            )
+            for candidate in base_candidates
+        ),
+    )
+    fixture["target_snapshot"] = _source_snapshot(
+        state=target_state,
+        candidates=target_candidates,
+        application_snapshots=tuple(
+            _application_snapshot(
+                project_id=fixture["project_id"],
+                extraction_run_id=fixture["target_run_id"],
+                inference_run_id=target_rows_by_fact_value[candidate.fact_value_id][0].inference_run_id,
+                fact_id=candidate.fact_id,
+                fact_value_id=candidate.fact_value_id,
+                evidence_ids=tuple(
+                    row.evidence_id for row in target_rows_by_fact_value[candidate.fact_value_id]
+                ),
+            )
+            for candidate in target_candidates
         ),
     )
     return fixture
@@ -918,6 +1116,10 @@ def test_get_document_revision_fact_diff_manifest_changes_when_inputs_change(
             state=mutated["target_state"],
         )
     elif mutation == "value":
+        normalized_value = _normalized_fact_value(
+            value_type="string",
+            value_json="alpha-2",
+        )
         mutated["target_snapshot"] = replace(
             mutated["target_snapshot"],
             candidates=tuple(
@@ -929,7 +1131,12 @@ def test_get_document_revision_fact_diff_manifest_changes_when_inputs_change(
             candidate_count=len(mutated["target_snapshot"].candidates),
         )
         mutated["target_rows"] = tuple(
-            replace(row, value_json="alpha-2")
+            replace(
+                row,
+                value_json=normalized_value.value_json,
+                normalized_value_text=normalized_value.normalized_value_text,
+                fact_value_hash=normalized_value.value_hash,
+            )
             if row.fact_value_id == _uuid("fv-target-b1")
             else row
             for row in mutated["target_rows"]
@@ -1001,6 +1208,79 @@ def test_get_document_revision_fact_diff_does_not_write_and_does_not_leak_sensit
     assert sentinel not in str(exc_info.value)
     assert all(session.commit_count == 0 for session in session_factory.sessions)
     assert all(session.rollback_count == 1 for session in session_factory.sessions)
+
+
+def test_get_document_revision_fact_diff_rejects_fact_identity_hash_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture()
+    fixture["base_rows"] = (
+        replace(fixture["base_rows"][0], fact_identity_hash="f" * 64),
+        *fixture["base_rows"][1:],
+    )
+    _install_dependencies(monkeypatch, fixture)
+
+    with pytest.raises(
+        fact_diff_service.DocumentRevisionFactDiffInvariantError,
+        match="document_revision_fact_diff_fact_identity_mismatch",
+    ):
+        run_async(
+            fact_diff_service.get_document_revision_fact_diff(
+                SessionFactory(),
+                project_id=fixture["project_id"],
+                document_id=fixture["document_id"],
+                base_revision_id=fixture["base_revision_id"],
+                target_revision_id=fixture["target_revision_id"],
+                base_extraction_run_id=fixture["base_run_id"],
+                target_extraction_run_id=fixture["target_run_id"],
+                base_orchestration_id=fixture["base_orchestration_id"],
+                target_orchestration_id=fixture["target_orchestration_id"],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value", "expected_code"),
+    [
+        ("fact_value_hash", "f" * 64, "document_revision_fact_diff_fact_value_mismatch"),
+        ("normalized_value_text", "tampered", "document_revision_fact_diff_fact_value_mismatch"),
+        ("value_json", {"unexpected": "shape"}, "document_revision_fact_diff_fact_value_invalid"),
+    ],
+)
+def test_get_document_revision_fact_diff_rejects_fact_value_certification_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    field_value: object,
+    expected_code: str,
+) -> None:
+    fixture = _fixture()
+    sentinel = "SENSITIVE_VALUE_JSON_SENTINEL"
+    value = sentinel if field_name == "normalized_value_text" else field_value
+    fixture["base_rows"] = (
+        replace(fixture["base_rows"][0], **{field_name: value}),
+        *fixture["base_rows"][1:],
+    )
+    _install_dependencies(monkeypatch, fixture)
+
+    with pytest.raises(
+        fact_diff_service.DocumentRevisionFactDiffInvariantError,
+        match=expected_code,
+    ) as exc_info:
+        run_async(
+            fact_diff_service.get_document_revision_fact_diff(
+                SessionFactory(),
+                project_id=fixture["project_id"],
+                document_id=fixture["document_id"],
+                base_revision_id=fixture["base_revision_id"],
+                target_revision_id=fixture["target_revision_id"],
+                base_extraction_run_id=fixture["base_run_id"],
+                target_extraction_run_id=fixture["target_run_id"],
+                base_orchestration_id=fixture["base_orchestration_id"],
+                target_orchestration_id=fixture["target_orchestration_id"],
+            )
+        )
+
+    assert sentinel not in str(exc_info.value)
 
 
 def test_service_source_uses_block_diff_and_duplicate_grouping_snapshot_helpers() -> None:

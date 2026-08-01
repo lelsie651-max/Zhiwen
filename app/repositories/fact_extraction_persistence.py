@@ -183,6 +183,19 @@ async def get_batch_application_for_update(
     return result.scalar_one_or_none()
 
 
+async def get_batch_application_by_id(
+    session: AsyncSession,
+    *,
+    application_id: uuid.UUID,
+) -> FactExtractionBatchApplication | None:
+    result = await session.execute(
+        select(FactExtractionBatchApplication).where(
+            FactExtractionBatchApplication.id == application_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_batch_application(
     session: AsyncSession,
     application: FactExtractionBatchApplication,

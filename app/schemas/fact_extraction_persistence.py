@@ -139,3 +139,27 @@ class FactExtractionBatchPersistenceResult(BaseModel):
         frozen=True,
         extra="forbid",
     )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedPersistedFactProposalItem:
+    proposal_index: int
+    fact_id: uuid.UUID
+    fact_value_id: uuid.UUID
+    subject_entity_id: uuid.UUID | None
+    referenced_entity_id: uuid.UUID | None
+    evidence_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedCompletedFactExtractionApplicationSnapshot:
+    application_id: uuid.UUID
+    project_id: uuid.UUID
+    extraction_run_id: uuid.UUID
+    inference_run_id: uuid.UUID
+    input_batch_id: uuid.UUID
+    persistence_name: str
+    persistence_version: str
+    entity_resolution_policy_name: str
+    entity_resolution_policy_version: str
+    items: tuple[AuthenticatedPersistedFactProposalItem, ...]

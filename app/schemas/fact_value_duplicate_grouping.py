@@ -26,6 +26,7 @@ class DuplicateCandidate:
     value_json: Any | None
     referenced_entity_id: uuid.UUID | None
     evidence_link_ids: tuple[uuid.UUID, ...]
+    evidence_ids: tuple[uuid.UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

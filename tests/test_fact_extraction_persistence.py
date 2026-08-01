@@ -1674,6 +1674,183 @@ def test_replay_completed_application_rejects_tampering(
         )
 
 
+def test_authenticate_completed_fact_extraction_application_rejects_result_hash_corruption(
+    monkeypatch,
+) -> None:
+    context, _response, application, _fact_value = _build_replay_fixture()
+    application.result_hash = "b" * 64
+
+    monkeypatch.setattr(
+        persistence_service.persistence_repository,
+        "get_batch_application_by_id",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=application),
+    )
+
+    with pytest.raises(
+        persistence_service.FactExtractionApplicationReplayConflictError,
+        match="result_hash",
+    ):
+        run_async(
+            persistence_service.authenticate_completed_fact_extraction_application(
+                FakeSession(),
+                application_id=application.id,
+            )
+        )
+
+
+def test_authenticate_completed_fact_extraction_application_excludes_withheld_items(
+    monkeypatch,
+) -> None:
+    response_json = {
+        "facts": [
+            valid_response_json()["facts"][0],
+            {
+                "subject_kind": "person",
+                "subject_key": "李四",
+                "predicate_key": "title",
+                "scope_key": None,
+                "value_type": "string",
+                "value_json": "大臣",
+                "language_code": "zh-CN",
+                "confidence": 0.8,
+                "evidence": [
+                    {
+                        "block_ref": "B0001",
+                        "start_offset": 0,
+                        "end_offset": 2,
+                        "role": "supporting",
+                    }
+                ],
+            },
+        ],
+        "batch_summary": "ok",
+        "uncertainties": [],
+    }
+    context = build_context(response_json=response_json)
+    response = parse_fact_extraction_response_object(context.response_json)
+    persisted_fact_id = uuid.uuid4()
+    persisted_fact_value_id = uuid.uuid4()
+    evidence_ids = [uuid.uuid4(), uuid.uuid4()]
+    application = FactExtractionBatchApplication(
+        id=uuid.uuid4(),
+        inference_run_id=context.inference_run_id,
+        project_id=context.project_id,
+        extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+        input_batch_id=context.input_batch_id,
+        response_hash=context.response_hash,
+        response_json_hash=context.response_json_hash,
+        status="completed",
+        persistence_name=persistence_service.FACT_EXTRACTION_PERSISTENCE_NAME,
+        persistence_version=persistence_service.FACT_EXTRACTION_PERSISTENCE_VERSION,
+        entity_resolution_policy_name=persistence_service.ENTITY_RESOLUTION_POLICY_NAME,
+        entity_resolution_policy_version=persistence_service.ENTITY_RESOLUTION_POLICY_VERSION,
+        result_json={
+            "application_id": "",
+            "replayed_application": False,
+            "project_id": str(context.project_id),
+            "extraction_run_id": str(context.blocks[0].extraction_run_id_snapshot),
+            "inference_run_id": str(context.inference_run_id),
+            "input_batch_id": str(context.input_batch_id),
+            "response_hash": context.response_hash,
+            "persistence_name": persistence_service.FACT_EXTRACTION_PERSISTENCE_NAME,
+            "persistence_version": persistence_service.FACT_EXTRACTION_PERSISTENCE_VERSION,
+            "entity_resolution_policy_name": persistence_service.ENTITY_RESOLUTION_POLICY_NAME,
+            "entity_resolution_policy_version": persistence_service.ENTITY_RESOLUTION_POLICY_VERSION,
+            "proposal_count": 2,
+            "created_count": 1,
+            "reused_count": 0,
+            "withheld_count": 1,
+            "items": [
+                {
+                    "proposal_index": 0,
+                    "proposal_hash": sha256(response.facts[0].dedupe_signature),
+                    "outcome": FactProposalPersistenceOutcome.CREATED.value,
+                    "withheld_reason": None,
+                    "subject_resolution_status": EntityMentionResolutionStatus.UNRESOLVED.value,
+                    "referenced_resolution_status": None,
+                    "fact_id": str(persisted_fact_id),
+                    "fact_value_id": str(persisted_fact_value_id),
+                    "subject_entity_id": None,
+                    "referenced_entity_id": None,
+                    "evidence_ids": [str(item) for item in evidence_ids],
+                },
+                {
+                    "proposal_index": 1,
+                    "proposal_hash": sha256(response.facts[1].dedupe_signature),
+                    "outcome": FactProposalPersistenceOutcome.WITHHELD.value,
+                    "withheld_reason": FactProposalWithheldReason.SUBJECT_AMBIGUOUS.value,
+                    "subject_resolution_status": EntityMentionResolutionStatus.AMBIGUOUS.value,
+                    "referenced_resolution_status": None,
+                    "fact_id": None,
+                    "fact_value_id": None,
+                    "subject_entity_id": None,
+                    "referenced_entity_id": None,
+                    "evidence_ids": [],
+                },
+            ],
+        },
+        result_hash="a" * 64,
+        completed_at=object(),
+    )
+    application.result_json["application_id"] = str(application.id)
+    application.result_hash = persistence_service.build_fact_extraction_application_result_hash(
+        application.result_json
+    )
+    fact_value = SimpleNamespace(
+        id=persisted_fact_value_id,
+        fact_id=persisted_fact_id,
+        source_kind="ai",
+        extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+        inference_run_id=context.inference_run_id,
+        referenced_entity_id=None,
+        fact=SimpleNamespace(project_id=context.project_id, subject_entity_id=None),
+        evidence_links=[
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                evidence_id=evidence_ids[0],
+                source_order=0,
+                role="supporting",
+                is_primary=True,
+            ),
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                evidence_id=evidence_ids[1],
+                source_order=1,
+                role="context",
+                is_primary=False,
+            ),
+        ],
+    )
+
+    monkeypatch.setattr(
+        persistence_service.persistence_repository,
+        "get_batch_application_by_id",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=application),
+    )
+    monkeypatch.setattr(
+        persistence_service.persistence_repository,
+        "get_completed_fact_extraction_persistence_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=context),
+    )
+    monkeypatch.setattr(
+        persistence_service.fact_repository,
+        "get_fact_value_with_links",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=fact_value),
+    )
+
+    snapshot = run_async(
+        persistence_service.authenticate_completed_fact_extraction_application(
+            FakeSession(),
+            application_id=application.id,
+        )
+    )
+
+    assert len(snapshot.items) == 1
+    assert snapshot.items[0].fact_id == persisted_fact_id
+    assert snapshot.items[0].fact_value_id == persisted_fact_value_id
+    assert snapshot.items[0].evidence_ids == tuple(evidence_ids)
+
+
 def test_fact_value_replay_unique_constraint_exists_and_compiles() -> None:
     table = Base.metadata.tables["fact_values"]
     constraint = next(

@@ -8,7 +8,7 @@ from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
-from app.models.document_content import ExtractionRun as DocumentExtractionRun
+from app.models.document_content import ExtractionRun as DocumentExtractionRun, SourceEvidence
 from app.models.document_revision import DocumentRevision
 from app.models.fact import Fact, FactEvidenceLink, FactValue, FactValueSourceKind
 from app.models.fact_extraction_application import FactExtractionBatchApplication
@@ -61,6 +61,13 @@ class DuplicateGroupingOrchestrationState:
     persistence_version: str = ""
     entity_resolution_policy_name: str = ""
     entity_resolution_policy_version: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedOrchestrationBatchApplication:
+    source_batch_id: uuid.UUID
+    application_id: uuid.UUID | None
+    current_inference_run_id: uuid.UUID
 
 
 async def get_duplicate_grouping_orchestration_state(
@@ -168,6 +175,36 @@ async def has_invalid_completed_batch_bindings(
     return result.first() is not None
 
 
+async def list_completed_orchestration_batch_applications(
+    session: AsyncSession,
+    *,
+    orchestration_id: uuid.UUID,
+) -> tuple[CompletedOrchestrationBatchApplication, ...]:
+    result = await session.execute(
+        select(
+            FactExtractionOrchestrationBatch.id.label("source_batch_id"),
+            FactExtractionOrchestrationBatch.application_id.label("application_id"),
+            FactExtractionOrchestrationBatch.current_inference_run_id.label(
+                "current_inference_run_id"
+            ),
+        )
+        .where(
+            FactExtractionOrchestrationBatch.orchestration_id == orchestration_id,
+            FactExtractionOrchestrationBatch.status == "completed",
+        )
+        .order_by(FactExtractionOrchestrationBatch.id.asc())
+    )
+    rows = result.all()
+    return tuple(
+        CompletedOrchestrationBatchApplication(
+            source_batch_id=row.source_batch_id,
+            application_id=row.application_id,
+            current_inference_run_id=row.current_inference_run_id,
+        )
+        for row in rows
+    )
+
+
 async def list_duplicate_candidates(
     session: AsyncSession,
     *,
@@ -184,6 +221,7 @@ async def list_duplicate_candidates(
             FactValue.value_json.label("value_json"),
             FactValue.referenced_entity_id.label("referenced_entity_id"),
             FactEvidenceLink.id.label("evidence_link_id"),
+            SourceEvidence.id.label("evidence_id"),
         )
         .select_from(FactExtractionOrchestrationBatch)
         .join(FactExtractionOrchestration, FactExtractionOrchestrationBatch.orchestration_id == FactExtractionOrchestration.id)
@@ -194,6 +232,7 @@ async def list_duplicate_candidates(
         .join(FactValue, FactValue.inference_run_id == FactExtractionBatchApplication.inference_run_id)
         .join(Fact, FactValue.fact_id == Fact.id)
         .outerjoin(FactEvidenceLink, FactEvidenceLink.fact_value_id == FactValue.id)
+        .outerjoin(SourceEvidence, FactEvidenceLink.evidence_id == SourceEvidence.id)
         .where(
             FactExtractionOrchestrationBatch.orchestration_id == orchestration_id,
             FactExtractionOrchestrationBatch.status == "completed",
@@ -216,10 +255,13 @@ async def list_duplicate_candidates(
     candidates: list[DuplicateCandidate] = []
     current_fact_value_id: uuid.UUID | None = None
     current_evidence_link_ids: set[uuid.UUID] = set()
+    current_evidence_ids: list[uuid.UUID] = []
+    current_evidence_ids_seen: set[uuid.UUID] = set()
     current_candidate_fields: dict[str, object] | None = None
 
     def flush_current() -> None:
         nonlocal current_fact_value_id, current_evidence_link_ids, current_candidate_fields
+        nonlocal current_evidence_ids, current_evidence_ids_seen
         if current_candidate_fields is None:
             return
         candidates.append(
@@ -233,10 +275,13 @@ async def list_duplicate_candidates(
                 value_json=copy.deepcopy(current_candidate_fields["value_json"]),
                 referenced_entity_id=current_candidate_fields["referenced_entity_id"],
                 evidence_link_ids=tuple(sorted(current_evidence_link_ids, key=str)),
+                evidence_ids=tuple(current_evidence_ids),
             )
         )
         current_fact_value_id = None
         current_evidence_link_ids = set()
+        current_evidence_ids = []
+        current_evidence_ids_seen = set()
         current_candidate_fields = None
 
     for row in rows:
@@ -270,8 +315,13 @@ async def list_duplicate_candidates(
                 raise DuplicateGroupingRepositoryInvariantError(
                     "cross_batch_duplicate_grouping_candidate_row_mismatch"
                 )
-        if row.evidence_link_id is not None:
-            current_evidence_link_ids.add(row.evidence_link_id)
+        evidence_link_id = getattr(row, "evidence_link_id", None)
+        if evidence_link_id is not None:
+            current_evidence_link_ids.add(evidence_link_id)
+        evidence_id = getattr(row, "evidence_id", None)
+        if evidence_id is not None and evidence_id not in current_evidence_ids_seen:
+            current_evidence_ids_seen.add(evidence_id)
+            current_evidence_ids.append(evidence_id)
     flush_current()
     return tuple(candidates)
 

@@ -5,12 +5,11 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.fact_extraction import parse_fact_extraction_response_object
 from app.models.base import utc_now
 from app.models.entity import EntityStatus, normalize_entity_alias
 from app.models.fact import FactValueSourceKind, FactValueType
@@ -19,11 +18,11 @@ from app.models.inference import InferenceRunStatus, InferenceTaskType
 from app.repositories import entity as entity_repository
 from app.repositories import fact as fact_repository
 from app.repositories import fact_extraction_persistence as persistence_repository
-from app.schemas.agent_fact_extraction import FactExtractionResponse, FactProposal
 from app.schemas.fact import FactIdentityInput, FactValueInput
 from app.schemas.fact_commands import AIProposalInput, FactEvidenceInput
-from app.schemas.fact_extraction_execution import InferenceInputBlockSnapshot
 from app.schemas.fact_extraction_persistence import (
+    AuthenticatedCompletedFactExtractionApplicationSnapshot,
+    AuthenticatedPersistedFactProposalItem,
     CompletedFactExtractionPersistenceContext,
     EntityMentionResolution,
     EntityMentionResolutionStatus,
@@ -36,11 +35,13 @@ from app.schemas.fact_extraction_persistence import (
 from app.services.document_content import get_or_create_source_evidence_in_transaction
 from app.services.entity import normalize_entity_type
 from app.services.fact import FactSubjectEntityConflictError, RetiredFactError, propose_ai_fact_value_in_transaction
-from app.services.fact_extraction_execution import validate_fact_extraction_response_against_batch
 from app.services.inference import (
     build_inference_input_batch_snapshot_hash,
     build_inference_response_json_hash,
 )
+
+if TYPE_CHECKING:
+    from app.schemas.agent_fact_extraction import FactExtractionResponse, FactProposal
 
 
 FACT_EXTRACTION_PERSISTENCE_NAME = "agent1_fact_persistence"
@@ -107,6 +108,8 @@ def _build_block_snapshots(
     input_batch_id: uuid.UUID,
     blocks: Sequence[FactExtractionPersistenceBlock],
 ) -> tuple[InferenceInputBlockSnapshot, ...]:
+    from app.schemas.fact_extraction_execution import InferenceInputBlockSnapshot
+
     return tuple(
         InferenceInputBlockSnapshot(
             id=block.input_block_id,
@@ -327,6 +330,8 @@ def _validate_persistence_context(
         field_name="batch_snapshot_hash",
     )
 
+    from app.agents.fact_extraction import parse_fact_extraction_response_object
+
     try:
         response = parse_fact_extraction_response_object(context.response_json)
     except Exception:
@@ -378,6 +383,10 @@ def _validate_persistence_context(
     if recomputed_response_json_hash != response_json_hash:
         raise FactExtractionPersistenceContextError("stored response_json_hash mismatch")
     _require_sha256(response_hash, field_name="response_hash")
+
+    from app.services.fact_extraction_execution import (
+        validate_fact_extraction_response_against_batch,
+    )
 
     try:
         validate_fact_extraction_response_against_batch(
@@ -798,6 +807,74 @@ def _build_result(
         reused_count=reused_count,
         withheld_count=withheld_count,
         items=items_tuple,
+    )
+
+
+def _build_authenticated_application_snapshot(
+    *,
+    application: FactExtractionBatchApplication,
+    result: FactExtractionBatchPersistenceResult,
+) -> AuthenticatedCompletedFactExtractionApplicationSnapshot:
+    persisted_items = tuple(
+        AuthenticatedPersistedFactProposalItem(
+            proposal_index=item.proposal_index,
+            fact_id=item.fact_id,
+            fact_value_id=item.fact_value_id,
+            subject_entity_id=item.subject_entity_id,
+            referenced_entity_id=item.referenced_entity_id,
+            evidence_ids=item.evidence_ids,
+        )
+        for item in sorted(result.items, key=lambda current: current.proposal_index)
+        if item.outcome != FactProposalPersistenceOutcome.WITHHELD
+    )
+    return AuthenticatedCompletedFactExtractionApplicationSnapshot(
+        application_id=application.id,
+        project_id=application.project_id,
+        extraction_run_id=application.extraction_run_id,
+        inference_run_id=application.inference_run_id,
+        input_batch_id=application.input_batch_id,
+        persistence_name=application.persistence_name,
+        persistence_version=application.persistence_version,
+        entity_resolution_policy_name=application.entity_resolution_policy_name,
+        entity_resolution_policy_version=application.entity_resolution_policy_version,
+        items=persisted_items,
+    )
+
+
+async def authenticate_completed_fact_extraction_application(
+    session: AsyncSession,
+    *,
+    application_id: uuid.UUID,
+) -> AuthenticatedCompletedFactExtractionApplicationSnapshot:
+    _require_uuid_instance(application_id, field_name="application_id")
+    application = await persistence_repository.get_batch_application_by_id(
+        session,
+        application_id=application_id,
+    )
+    if application is None:
+        raise FactExtractionApplicationReplayConflictError("application not found")
+    validate_fact_extraction_application_result_envelope(application=application)
+    context = await persistence_repository.get_completed_fact_extraction_persistence_context(
+        session,
+        inference_run_id=application.inference_run_id,
+    )
+    context, response = _validate_persistence_context(
+        project_id=application.project_id,
+        extraction_run_id=application.extraction_run_id,
+        inference_run_id=application.inference_run_id,
+        context=context,
+    )
+    replay_result = await _replay_completed_application(
+        session,
+        application=application,
+        context=context,
+        project_id=application.project_id,
+        extraction_run_id=application.extraction_run_id,
+        response=response,
+    )
+    return _build_authenticated_application_snapshot(
+        application=application,
+        result=replay_result,
     )
 
 

@@ -37,6 +37,8 @@ class DocumentRevisionFactDiffSourceRow:
     batch_current_inference_run_id: uuid.UUID
     value_type: str
     value_json: object | None
+    normalized_value_text: str | None
+    fact_value_hash: str
     referenced_entity_id: uuid.UUID | None
     evidence_link_id: uuid.UUID | None
     evidence_link_source_order: int | None
@@ -92,6 +94,8 @@ async def list_document_revision_fact_diff_source_rows(
             ),
             FactValue.value_type.label("value_type"),
             FactValue.value_json.label("value_json"),
+            FactValue.normalized_value_text.label("normalized_value_text"),
+            FactValue.value_hash.label("fact_value_hash"),
             FactValue.referenced_entity_id.label("referenced_entity_id"),
             FactEvidenceLink.id.label("evidence_link_id"),
             FactEvidenceLink.source_order.label("evidence_link_source_order"),
@@ -171,6 +175,8 @@ async def list_document_revision_fact_diff_source_rows(
             batch_current_inference_run_id=row.batch_current_inference_run_id,
             value_type=row.value_type,
             value_json=row.value_json,
+            normalized_value_text=row.normalized_value_text,
+            fact_value_hash=row.fact_value_hash,
             referenced_entity_id=row.referenced_entity_id,
             evidence_link_id=row.evidence_link_id,
             evidence_link_source_order=row.evidence_link_source_order,

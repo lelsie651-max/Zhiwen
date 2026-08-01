@@ -6,12 +6,14 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories import document_revision_fact_diff as document_revision_fact_diff_repository
 from app.repositories.document_revision_fact_diff import (
     DocumentRevisionFactDiffSourceRow,
 )
+from app.schemas.fact import FactIdentityInput, FactValueInput
 from app.schemas.document_revision_fact_diff import (
     DocumentRevisionFactDiff,
     DocumentRevisionFactDiffChangeKind,
@@ -26,6 +28,7 @@ from app.schemas.fact_value_duplicate_grouping import (
     DuplicateCandidate,
 )
 from app.services import document_revision_diff as document_revision_diff_service
+from app.services import fact as fact_service
 from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
 
 DOCUMENT_REVISION_FACT_DIFF_ALGORITHM_NAME = "document_revision_fact_diff"
@@ -68,6 +71,15 @@ class _FactSideSnapshot:
     earliest_block_source_order: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CertifiedFactValue:
+    value_type: str
+    value_json: Any | None
+    normalized_value_text: str
+    value_hash: str
+    referenced_entity_id: uuid.UUID | None
+
+
 def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
     if not isinstance(value, uuid.UUID):
         raise DocumentRevisionFactDiffStateError(
@@ -101,6 +113,102 @@ def _build_semantic_key_hash(
         ),
         algorithm_version=CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
     ).sha256_hex
+
+
+def _build_authoritative_application_item_map(
+    source_snapshot: duplicate_grouping_service.AuthenticatedDuplicateGroupingSourceSnapshot,
+) -> dict[
+    uuid.UUID,
+    duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedPersistedFactProposalItem,
+]:
+    item_by_fact_value_id: dict[
+        uuid.UUID,
+        duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedPersistedFactProposalItem,
+    ] = {}
+    for application_snapshot in source_snapshot.application_snapshots:
+        for item in application_snapshot.items:
+            if item.fact_value_id in item_by_fact_value_id:
+                raise DocumentRevisionFactDiffInvariantError(
+                    "document_revision_fact_diff_fact_value_source_mismatch"
+                )
+            item_by_fact_value_id[item.fact_value_id] = item
+    return item_by_fact_value_id
+
+
+def _certify_fact_identity(
+    row: DocumentRevisionFactDiffSourceRow,
+) -> DocumentRevisionFactDiffFactSnapshot:
+    try:
+        identity_input = FactIdentityInput(
+            subject_kind=row.subject_kind,
+            subject_key=row.subject_key,
+            subject_entity_id=row.subject_entity_id,
+            predicate_key=row.predicate_key,
+            scope_key=row.scope_key,
+        )
+    except ValidationError:
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_identity_invalid"
+        ) from None
+    identity_hash = fact_service.build_fact_identity_hash(identity_input)
+    if identity_hash != row.fact_identity_hash:
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_identity_mismatch"
+        ) from None
+    return DocumentRevisionFactDiffFactSnapshot(
+        fact_id=row.fact_id,
+        identity_hash=row.fact_identity_hash,
+        subject_kind=row.subject_kind,
+        subject_key=row.subject_key,
+        predicate_key=row.predicate_key,
+        scope_key=row.scope_key,
+        subject_entity_id=row.subject_entity_id,
+    )
+
+
+def _certify_fact_value(
+    row: DocumentRevisionFactDiffSourceRow,
+) -> _CertifiedFactValue:
+    try:
+        value_input = FactValueInput(
+            value_type=row.value_type,
+            value_json=row.value_json,
+            referenced_entity_id=row.referenced_entity_id,
+            language_code=None,
+            confidence=None,
+        )
+        normalized = fact_service.normalize_fact_value_input(value_input)
+    except (ValidationError, fact_service.InvalidFactProposalError, ValueError, TypeError):
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_value_invalid"
+        ) from None
+    if normalized.value_type != row.value_type:
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_value_mismatch"
+        ) from None
+    if normalized.value_json != row.value_json:
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_value_mismatch"
+        ) from None
+    if normalized.referenced_entity_id != row.referenced_entity_id:
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_value_mismatch"
+        ) from None
+    if normalized.normalized_value_text != row.normalized_value_text:
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_value_mismatch"
+        ) from None
+    if normalized.value_hash != row.fact_value_hash:
+        raise DocumentRevisionFactDiffInvariantError(
+            "document_revision_fact_diff_fact_value_mismatch"
+        ) from None
+    return _CertifiedFactValue(
+        value_type=normalized.value_type,
+        value_json=normalized.value_json,
+        normalized_value_text=normalized.normalized_value_text,
+        value_hash=normalized.value_hash,
+        referenced_entity_id=normalized.referenced_entity_id,
+    )
 
 
 def _serialize_fact_snapshot(
@@ -293,6 +401,9 @@ def _build_fact_side_snapshots(
     candidate_by_fact_value_id = {
         candidate.fact_value_id: candidate for candidate in source_snapshot.candidates
     }
+    authoritative_item_by_fact_value_id = _build_authoritative_application_item_map(
+        source_snapshot
+    )
     row_groups = _rows_by_fact_value_id(rows)
     if (
         source_snapshot.candidate_count != len(row_groups)
@@ -349,6 +460,11 @@ def _build_fact_side_snapshots(
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_value_source_mismatch"
             )
+        authoritative_item = authoritative_item_by_fact_value_id.get(fact_value_id)
+        if authoritative_item is None:
+            raise DocumentRevisionFactDiffInvariantError(
+                "document_revision_fact_diff_fact_value_source_mismatch"
+            )
         if stable_row.fact_project_id != source_snapshot.state.project_id:
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_project_mismatch"
@@ -389,28 +505,32 @@ def _build_fact_side_snapshots(
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_value_source_mismatch"
             )
-        if stable_row.value_type != candidate.value_type:
+        if stable_row.fact_id != authoritative_item.fact_id:
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_value_source_mismatch"
             )
-        if stable_row.value_json != candidate.value_json:
+        if stable_row.subject_entity_id != authoritative_item.subject_entity_id:
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_value_source_mismatch"
             )
-        if stable_row.referenced_entity_id != candidate.referenced_entity_id:
+        if stable_row.referenced_entity_id != authoritative_item.referenced_entity_id:
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_value_source_mismatch"
             )
-
-        fact_snapshot = DocumentRevisionFactDiffFactSnapshot(
-            fact_id=stable_row.fact_id,
-            identity_hash=stable_row.fact_identity_hash,
-            subject_kind=stable_row.subject_kind,
-            subject_key=stable_row.subject_key,
-            predicate_key=stable_row.predicate_key,
-            scope_key=stable_row.scope_key,
-            subject_entity_id=stable_row.subject_entity_id,
-        )
+        certified_value = _certify_fact_value(stable_row)
+        if certified_value.value_type != candidate.value_type:
+            raise DocumentRevisionFactDiffInvariantError(
+                "document_revision_fact_diff_fact_value_source_mismatch"
+            )
+        if certified_value.value_json != candidate.value_json:
+            raise DocumentRevisionFactDiffInvariantError(
+                "document_revision_fact_diff_fact_value_source_mismatch"
+            )
+        if certified_value.referenced_entity_id != candidate.referenced_entity_id:
+            raise DocumentRevisionFactDiffInvariantError(
+                "document_revision_fact_diff_fact_value_source_mismatch"
+            )
+        fact_snapshot = _certify_fact_identity(stable_row)
         existing_fact_snapshot = fact_snapshot_by_id.get(stable_row.fact_id)
         if existing_fact_snapshot is None:
             fact_snapshot_by_id[stable_row.fact_id] = fact_snapshot
@@ -490,28 +610,32 @@ def _build_fact_side_snapshots(
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_evidence_link_set_mismatch"
             )
+        if tuple(item.snapshot.evidence_id for item in evidence_envelopes) != authoritative_item.evidence_ids:
+            raise DocumentRevisionFactDiffInvariantError(
+                "document_revision_fact_diff_evidence_link_set_mismatch"
+            )
 
         semantic_key_hash = _build_semantic_key_hash(
             fact_id=stable_row.fact_id,
-            value_type=stable_row.value_type,
-            value_json=stable_row.value_json,
-            referenced_entity_id=stable_row.referenced_entity_id,
+            value_type=certified_value.value_type,
+            value_json=certified_value.value_json,
+            referenced_entity_id=certified_value.referenced_entity_id,
         )
         groups_for_fact = value_group_items_by_fact_id.setdefault(stable_row.fact_id, {})
         group_entry = groups_for_fact.get(semantic_key_hash)
         if group_entry is None:
             group_entry = {
-                "value_type": stable_row.value_type,
-                "value_json": stable_row.value_json,
-                "referenced_entity_id": stable_row.referenced_entity_id,
+                "value_type": certified_value.value_type,
+                "value_json": certified_value.value_json,
+                "referenced_entity_id": certified_value.referenced_entity_id,
                 "fact_value_ids": [],
                 "evidences": [],
             }
             groups_for_fact[semantic_key_hash] = group_entry
         elif (
-            group_entry["value_type"] != stable_row.value_type
-            or group_entry["value_json"] != stable_row.value_json
-            or group_entry["referenced_entity_id"] != stable_row.referenced_entity_id
+            group_entry["value_type"] != certified_value.value_type
+            or group_entry["value_json"] != certified_value.value_json
+            or group_entry["referenced_entity_id"] != certified_value.referenced_entity_id
         ):
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_semantic_group_mismatch"
