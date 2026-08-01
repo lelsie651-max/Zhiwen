@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -156,7 +156,24 @@ def make_orchestration_state(
     *,
     extraction_run_id: uuid.UUID | None = None,
     orchestration_status: str = "completed",
+    batch_count: int | None = None,
+    completed_batch_count: int | None = None,
+    failed_batch_count: int | None = None,
 ) -> duplicate_grouping_repository.DuplicateGroupingOrchestrationState:
+    if orchestration_status == "completed":
+        resolved_batch_count = 1 if batch_count is None else batch_count
+        resolved_completed_batch_count = (
+            resolved_batch_count if completed_batch_count is None else completed_batch_count
+        )
+        resolved_failed_batch_count = 0 if failed_batch_count is None else failed_batch_count
+    elif orchestration_status == "partial":
+        resolved_batch_count = 2 if batch_count is None else batch_count
+        resolved_completed_batch_count = 1 if completed_batch_count is None else completed_batch_count
+        resolved_failed_batch_count = 1 if failed_batch_count is None else failed_batch_count
+    else:
+        resolved_batch_count = 1 if batch_count is None else batch_count
+        resolved_completed_batch_count = 0 if completed_batch_count is None else completed_batch_count
+        resolved_failed_batch_count = 0 if failed_batch_count is None else failed_batch_count
     return duplicate_grouping_repository.DuplicateGroupingOrchestrationState(
         orchestration_id=orchestration_id,
         extraction_run_id=extraction_run_id or uuid.uuid4(),
@@ -164,6 +181,22 @@ def make_orchestration_state(
         extraction_run_status="completed",
         extraction_run_outcome="success",
         orchestration_status=orchestration_status,
+        batch_count=resolved_batch_count,
+        completed_batch_count=resolved_completed_batch_count,
+        failed_batch_count=resolved_failed_batch_count,
+        planner_name="planner",
+        planner_version="1.0.0",
+        agent_name="agent",
+        agent_version="1.0.0",
+        prompt_contract_hash="a" * 64,
+        provider="provider",
+        requested_model="model",
+        executor_name="executor",
+        executor_version="1.0.0",
+        persistence_name="persistence",
+        persistence_version="1.0.0",
+        entity_resolution_policy_name="entity-policy",
+        entity_resolution_policy_version="1.0.0",
     )
 
 
@@ -172,6 +205,7 @@ def make_application_snapshot(
     project_id: uuid.UUID,
     extraction_run_id: uuid.UUID,
     inference_run_id: uuid.UUID,
+    input_batch_id: uuid.UUID | None = None,
     items: tuple[AuthenticatedPersistedFactProposalItem, ...],
     persistence_name: str = "persistence",
     persistence_version: str = "1.0.0",
@@ -183,12 +217,108 @@ def make_application_snapshot(
         project_id=project_id,
         extraction_run_id=extraction_run_id,
         inference_run_id=inference_run_id,
-        input_batch_id=uuid.uuid4(),
+        input_batch_id=input_batch_id or uuid.uuid4(),
         persistence_name=persistence_name,
         persistence_version=persistence_version,
         entity_resolution_policy_name=entity_resolution_policy_name,
         entity_resolution_policy_version=entity_resolution_policy_version,
         items=items,
+    )
+
+
+def make_completed_batch_application(
+    *,
+    source_batch_id: uuid.UUID | None = None,
+    batch_index: int = 0,
+    application_id: uuid.UUID | None,
+    current_input_batch_id: uuid.UUID | None,
+    current_inference_run_id: uuid.UUID | None,
+) -> duplicate_grouping_repository.CompletedOrchestrationBatchApplication:
+    return duplicate_grouping_repository.CompletedOrchestrationBatchApplication(
+        source_batch_id=source_batch_id or uuid.uuid4(),
+        batch_index=batch_index,
+        application_id=application_id,
+        current_input_batch_id=current_input_batch_id,
+        current_inference_run_id=current_inference_run_id,
+    )
+
+
+def install_authoritative_application_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    candidates_by_orchestration: dict[uuid.UUID, tuple[DuplicateCandidate, ...]],
+    state_by_orchestration: dict[
+        uuid.UUID,
+        duplicate_grouping_repository.DuplicateGroupingOrchestrationState,
+    ],
+) -> None:
+    completed_batches_by_orchestration: dict[
+        uuid.UUID,
+        tuple[duplicate_grouping_repository.CompletedOrchestrationBatchApplication, ...],
+    ] = {}
+    snapshots_by_application_id: dict[
+        uuid.UUID,
+        AuthenticatedCompletedFactExtractionApplicationSnapshot,
+    ] = {}
+
+    for orchestration_id, candidates in candidates_by_orchestration.items():
+        state = state_by_orchestration[orchestration_id]
+        grouped_candidates: dict[uuid.UUID, list[DuplicateCandidate]] = {}
+        for item in candidates:
+            grouped_candidates.setdefault(item.source_batch_id, []).append(item)
+        completed_batches: list[duplicate_grouping_repository.CompletedOrchestrationBatchApplication] = []
+        for batch_index, source_batch_id in enumerate(sorted(grouped_candidates, key=str)):
+            inference_run_id = uuid.uuid4()
+            input_batch_id = uuid.uuid4()
+            items = tuple(
+                AuthenticatedPersistedFactProposalItem(
+                    proposal_index=proposal_index,
+                    fact_id=current.fact_id,
+                    fact_value_id=current.fact_value_id,
+                    subject_entity_id=None,
+                    referenced_entity_id=current.referenced_entity_id,
+                    evidence_ids=current.evidence_ids,
+                )
+                for proposal_index, current in enumerate(grouped_candidates[source_batch_id])
+            )
+            application_snapshot = make_application_snapshot(
+                project_id=state.project_id,
+                extraction_run_id=state.extraction_run_id,
+                inference_run_id=inference_run_id,
+                input_batch_id=input_batch_id,
+                items=items,
+                persistence_name=state.persistence_name,
+                persistence_version=state.persistence_version,
+                entity_resolution_policy_name=state.entity_resolution_policy_name,
+                entity_resolution_policy_version=state.entity_resolution_policy_version,
+            )
+            snapshots_by_application_id[application_snapshot.application_id] = application_snapshot
+            completed_batches.append(
+                make_completed_batch_application(
+                    source_batch_id=source_batch_id,
+                    batch_index=batch_index,
+                    application_id=application_snapshot.application_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                )
+            )
+        completed_batches_by_orchestration[orchestration_id] = tuple(completed_batches)
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_completed_orchestration_batch_applications",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=completed_batches_by_orchestration[_kwargs["orchestration_id"]],
+        ),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_service.fact_extraction_persistence_service,
+        "authenticate_completed_fact_extraction_application",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=snapshots_by_application_id[_kwargs["application_id"]],
+        ),
     )
 
 
@@ -700,11 +830,27 @@ def test_same_extraction_run_different_orchestrations_create_independent_v2_ledg
         value_json="new-value",
         value_type="string",
     )
+    state_a = make_orchestration_state(
+        orchestration_a,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="partial",
+        batch_count=3,
+        completed_batch_count=2,
+        failed_batch_count=1,
+    )
+    state_b = make_orchestration_state(
+        orchestration_b,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=3,
+        completed_batch_count=3,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
         if orchestration_id == orchestration_a:
-            return make_orchestration_state(orchestration_a, extraction_run_id=extraction_run_id, orchestration_status="partial")
-        return make_orchestration_state(orchestration_b, extraction_run_id=extraction_run_id, orchestration_status="completed")
+            return state_a
+        return state_b
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -733,6 +879,17 @@ def test_same_extraction_run_different_orchestrations_create_independent_v2_ledg
     monkeypatch.setattr(duplicate_grouping_repository, "create_grouping_application", fake_create_application)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_groups", return_second_arg)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_group_members", return_second_arg)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={
+            orchestration_a: (candidate_a1, candidate_a2),
+            orchestration_b: (candidate_b1, candidate_b2, candidate_b3),
+        },
+        state_by_orchestration={
+            orchestration_a: state_a,
+            orchestration_b: state_b,
+        },
+    )
 
     result_a = run_async(
         duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
@@ -787,9 +944,17 @@ def test_ensure_cross_batch_duplicate_grouping_returns_existing_immutable_ledger
         created_at=datetime.now(timezone.utc),
     )
     session_factory = SessionFactory([FakeSession(), FakeSession()])
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=2,
+        completed_batch_count=2,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id, orchestration_status="completed")
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -823,6 +988,11 @@ def test_ensure_cross_batch_duplicate_grouping_returns_existing_immutable_ledger
     monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
     monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
     monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_for_update", fake_existing_for_update)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (first_candidate, second_candidate)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     result = run_async(
         duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
@@ -856,9 +1026,17 @@ def test_ensure_cross_batch_duplicate_grouping_fails_closed_on_manifest_mismatch
         referenced_entity_id=first_candidate.referenced_entity_id,
     )
     session_factory = SessionFactory([FakeSession(), FakeSession()])
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=2,
+        completed_batch_count=2,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id, orchestration_status="completed")
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -892,6 +1070,11 @@ def test_ensure_cross_batch_duplicate_grouping_fails_closed_on_manifest_mismatch
     monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
     monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
     monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_for_update", fake_existing_for_update)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (first_candidate, second_candidate)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     with pytest.raises(duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError):
         run_async(
@@ -935,9 +1118,17 @@ def test_ensure_cross_batch_duplicate_grouping_handles_target_constraint_concurr
         created_at=datetime.now(timezone.utc),
     )
     session_factory = SessionFactory([FakeSession(), FakeSession(), FakeSession()])
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=2,
+        completed_batch_count=2,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id, orchestration_status="completed")
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -964,6 +1155,11 @@ def test_ensure_cross_batch_duplicate_grouping_handles_target_constraint_concurr
     monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_for_update", fake_existing_for_update)
     monkeypatch.setattr(duplicate_grouping_repository, "create_grouping_application", fake_create_application)
     monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_ledger", fake_get_existing)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (first_candidate, second_candidate)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     result = run_async(
         duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
@@ -997,9 +1193,17 @@ def test_ensure_cross_batch_duplicate_grouping_does_not_swallow_unknown_integrit
         referenced_entity_id=first_candidate.referenced_entity_id,
     )
     session_factory = SessionFactory([FakeSession(), FakeSession()])
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=2,
+        completed_batch_count=2,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id, orchestration_status="completed")
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -1022,6 +1226,11 @@ def test_ensure_cross_batch_duplicate_grouping_does_not_swallow_unknown_integrit
     monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
     monkeypatch.setattr(duplicate_grouping_repository, "get_grouping_application_for_update", fake_existing_for_update)
     monkeypatch.setattr(duplicate_grouping_repository, "create_grouping_application", fake_create_application)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (first_candidate, second_candidate)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     with pytest.raises(IntegrityError):
         run_async(
@@ -1054,13 +1263,17 @@ def test_ensure_cross_batch_duplicate_grouping_normalizes_algorithm_version_for_
     session_factory = SessionFactory([FakeSession(), FakeSession()])
     seen_algorithm_versions: list[str] = []
     created_application_versions: list[str] = []
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=2,
+        completed_batch_count=2,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(
-            orchestration_id,
-            extraction_run_id=extraction_run_id,
-            orchestration_status="completed",
-        )
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -1087,6 +1300,11 @@ def test_ensure_cross_batch_duplicate_grouping_normalizes_algorithm_version_for_
     monkeypatch.setattr(duplicate_grouping_repository, "create_grouping_application", fake_create_application)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_groups", return_second_arg)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_group_members", return_second_arg)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (first_candidate, second_candidate)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     result = run_async(
         duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
@@ -1121,9 +1339,17 @@ def test_ensure_cross_batch_duplicate_grouping_rolls_back_on_partial_write_failu
         referenced_entity_id=first_candidate.referenced_entity_id,
     )
     session_factory = SessionFactory([FakeSession(), FakeSession()])
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=2,
+        completed_batch_count=2,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id, orchestration_status="completed")
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -1154,6 +1380,11 @@ def test_ensure_cross_batch_duplicate_grouping_rolls_back_on_partial_write_failu
     monkeypatch.setattr(duplicate_grouping_repository, "create_grouping_application", fake_create_application)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_groups", fake_create_groups)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_group_members", fake_create_members)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (first_candidate, second_candidate)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     with pytest.raises(RuntimeError):
         run_async(
@@ -1211,9 +1442,17 @@ def test_ensure_cross_batch_duplicate_grouping_allows_completed_and_partial_orch
         referenced_entity_id=first_candidate.referenced_entity_id,
     )
     session_factory = SessionFactory([FakeSession(), FakeSession()])
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status=orchestration_status,
+        batch_count=2 if orchestration_status == "completed" else 3,
+        completed_batch_count=2,
+        failed_batch_count=0 if orchestration_status == "completed" else 1,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id, orchestration_status=orchestration_status)
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -1235,6 +1474,11 @@ def test_ensure_cross_batch_duplicate_grouping_allows_completed_and_partial_orch
     monkeypatch.setattr(duplicate_grouping_repository, "create_grouping_application", return_second_arg)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_groups", return_second_arg)
     monkeypatch.setattr(duplicate_grouping_repository, "create_duplicate_group_members", return_second_arg)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (first_candidate, second_candidate)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     result = run_async(
         duplicate_grouping_service.ensure_cross_batch_duplicate_grouping(
@@ -1277,9 +1521,23 @@ def test_ensure_cross_batch_duplicate_grouping_fails_closed_on_candidate_source_
     orchestration_id = uuid.uuid4()
     extraction_run_id = uuid.uuid4()
     session_factory = SessionFactory([FakeSession()])
+    matching_candidate = candidate(
+        orchestration_id=orchestration_id,
+        extraction_run_id=extraction_run_id,
+        source_batch_id=uuid.uuid4(),
+        evidence_ids=(uuid.uuid4(),),
+    )
+    state = make_orchestration_state(
+        orchestration_id,
+        extraction_run_id=extraction_run_id,
+        orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+    )
 
     async def fake_state(_session, *, orchestration_id):
-        return make_orchestration_state(orchestration_id, extraction_run_id=extraction_run_id, orchestration_status="completed")
+        return state
 
     async def fake_invalid_bindings(_session, *, orchestration_id):
         return False
@@ -1288,18 +1546,17 @@ def test_ensure_cross_batch_duplicate_grouping_fails_closed_on_candidate_source_
         return 2
 
     async def fake_candidates(_session, *, orchestration_id):
-        return (
-            candidate(
-                orchestration_id=orchestration_id,
-                extraction_run_id=extraction_run_id,
-                source_batch_id=uuid.uuid4(),
-            ),
-        )
+        return (matching_candidate,)
 
     monkeypatch.setattr(duplicate_grouping_repository, "get_duplicate_grouping_orchestration_state", fake_state)
     monkeypatch.setattr(duplicate_grouping_repository, "has_invalid_completed_batch_bindings", fake_invalid_bindings)
     monkeypatch.setattr(duplicate_grouping_repository, "count_duplicate_candidate_fact_values", fake_count)
     monkeypatch.setattr(duplicate_grouping_repository, "list_duplicate_candidates", fake_candidates)
+    install_authoritative_application_auth(
+        monkeypatch,
+        candidates_by_orchestration={orchestration_id: (matching_candidate,)},
+        state_by_orchestration={orchestration_id: state},
+    )
 
     with pytest.raises(duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError, match="candidate_source_mismatch"):
         run_async(
@@ -1326,6 +1583,9 @@ def test_ensure_cross_batch_duplicate_grouping_rejects_not_ready_without_leaking
             extraction_run_status="completed",
             extraction_run_outcome="success",
             orchestration_status="running",
+            batch_count=1,
+            completed_batch_count=0,
+            failed_batch_count=0,
         )
 
     monkeypatch.setattr(duplicate_grouping_repository, "get_duplicate_grouping_orchestration_state", fake_state)
@@ -1508,6 +1768,7 @@ def test_authenticate_duplicate_grouping_source_snapshot_accepts_matching_author
     fact_id = uuid.uuid4()
     evidence_id = uuid.uuid4()
     evidence_link_id = uuid.uuid4()
+    input_batch_id = uuid.uuid4()
     state = duplicate_grouping_repository.DuplicateGroupingOrchestrationState(
         orchestration_id=orchestration_id,
         extraction_run_id=extraction_run_id,
@@ -1515,6 +1776,18 @@ def test_authenticate_duplicate_grouping_source_snapshot_accepts_matching_author
         extraction_run_status="completed",
         extraction_run_outcome="success",
         orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+        planner_name="planner",
+        planner_version="1.0.0",
+        agent_name="agent",
+        agent_version="1.0.0",
+        prompt_contract_hash="a" * 64,
+        provider="provider",
+        requested_model="model",
+        executor_name="executor",
+        executor_version="1.0.0",
         persistence_name="persistence",
         persistence_version="1.0.0",
         entity_resolution_policy_name="entity-policy",
@@ -1535,6 +1808,7 @@ def test_authenticate_duplicate_grouping_source_snapshot_accepts_matching_author
         project_id=project_id,
         extraction_run_id=extraction_run_id,
         inference_run_id=inference_run_id,
+        input_batch_id=input_batch_id,
         items=(
             AuthenticatedPersistedFactProposalItem(
                 proposal_index=0,
@@ -1563,9 +1837,11 @@ def test_authenticate_duplicate_grouping_source_snapshot_accepts_matching_author
         lambda *_args, **_kwargs: asyncio.sleep(
             0,
             result=(
-                duplicate_grouping_repository.CompletedOrchestrationBatchApplication(
+                make_completed_batch_application(
                     source_batch_id=source_batch_id,
+                    batch_index=0,
                     application_id=application_snapshot.application_id,
+                    current_input_batch_id=input_batch_id,
                     current_inference_run_id=inference_run_id,
                 ),
             ),
@@ -1614,6 +1890,7 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_extra_ai_fact_v
     extra_fact_value_id = uuid.uuid4()
     fact_id = uuid.uuid4()
     evidence_id = uuid.uuid4()
+    input_batch_id = uuid.uuid4()
     state = duplicate_grouping_repository.DuplicateGroupingOrchestrationState(
         orchestration_id=orchestration_id,
         extraction_run_id=extraction_run_id,
@@ -1621,6 +1898,18 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_extra_ai_fact_v
         extraction_run_status="completed",
         extraction_run_outcome="success",
         orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+        planner_name="planner",
+        planner_version="1.0.0",
+        agent_name="agent",
+        agent_version="1.0.0",
+        prompt_contract_hash="a" * 64,
+        provider="provider",
+        requested_model="model",
+        executor_name="executor",
+        executor_version="1.0.0",
         persistence_name="persistence",
         persistence_version="1.0.0",
         entity_resolution_policy_name="entity-policy",
@@ -1652,6 +1941,7 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_extra_ai_fact_v
         project_id=project_id,
         extraction_run_id=extraction_run_id,
         inference_run_id=inference_run_id,
+        input_batch_id=input_batch_id,
         items=(
             AuthenticatedPersistedFactProposalItem(
                 proposal_index=0,
@@ -1680,9 +1970,11 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_extra_ai_fact_v
         lambda *_args, **_kwargs: asyncio.sleep(
             0,
             result=(
-                duplicate_grouping_repository.CompletedOrchestrationBatchApplication(
+                make_completed_batch_application(
                     source_batch_id=source_batch_id,
+                    batch_index=0,
                     application_id=application_snapshot.application_id,
+                    current_input_batch_id=input_batch_id,
                     current_inference_run_id=inference_run_id,
                 ),
             ),
@@ -1738,6 +2030,7 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_authoritative_m
     source_batch_id = uuid.uuid4()
     fact_value_id = uuid.uuid4()
     fact_id = uuid.uuid4()
+    input_batch_id = uuid.uuid4()
     state = duplicate_grouping_repository.DuplicateGroupingOrchestrationState(
         orchestration_id=orchestration_id,
         extraction_run_id=extraction_run_id,
@@ -1745,6 +2038,18 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_authoritative_m
         extraction_run_status="completed",
         extraction_run_outcome="success",
         orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+        planner_name="planner",
+        planner_version="1.0.0",
+        agent_name="agent",
+        agent_version="1.0.0",
+        prompt_contract_hash="a" * 64,
+        provider="provider",
+        requested_model="model",
+        executor_name="executor",
+        executor_version="1.0.0",
         persistence_name="persistence",
         persistence_version="1.0.0",
         entity_resolution_policy_name="entity-policy",
@@ -1765,6 +2070,7 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_authoritative_m
         project_id=project_id,
         extraction_run_id=extraction_run_id,
         inference_run_id=inference_run_id,
+        input_batch_id=input_batch_id,
         items=(
             AuthenticatedPersistedFactProposalItem(
                 proposal_index=0,
@@ -1793,9 +2099,11 @@ def test_authenticate_duplicate_grouping_source_snapshot_rejects_authoritative_m
         lambda *_args, **_kwargs: asyncio.sleep(
             0,
             result=(
-                duplicate_grouping_repository.CompletedOrchestrationBatchApplication(
+                make_completed_batch_application(
                     source_batch_id=source_batch_id,
+                    batch_index=0,
                     application_id=application_snapshot.application_id,
+                    current_input_batch_id=input_batch_id,
                     current_inference_run_id=inference_run_id,
                 ),
             ),
@@ -1841,6 +2149,18 @@ def test_authenticate_duplicate_grouping_source_snapshot_maps_application_replay
         extraction_run_status="completed",
         extraction_run_outcome="success",
         orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+        planner_name="planner",
+        planner_version="1.0.0",
+        agent_name="agent",
+        agent_version="1.0.0",
+        prompt_contract_hash="a" * 64,
+        provider="provider",
+        requested_model="model",
+        executor_name="executor",
+        executor_version="1.0.0",
         persistence_name="persistence",
         persistence_version="1.0.0",
         entity_resolution_policy_name="entity-policy",
@@ -1863,9 +2183,10 @@ def test_authenticate_duplicate_grouping_source_snapshot_maps_application_replay
         lambda *_args, **_kwargs: asyncio.sleep(
             0,
             result=(
-                duplicate_grouping_repository.CompletedOrchestrationBatchApplication(
-                    source_batch_id=uuid.uuid4(),
+                make_completed_batch_application(
+                    batch_index=0,
                     application_id=uuid.uuid4(),
+                    current_input_batch_id=uuid.uuid4(),
                     current_inference_run_id=uuid.uuid4(),
                 ),
             ),
@@ -1895,6 +2216,594 @@ def test_authenticate_duplicate_grouping_source_snapshot_maps_application_replay
         )
 
     assert "detailed internal mismatch" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "planner_name",
+        "planner_version",
+        "agent_name",
+        "agent_version",
+        "prompt_contract_hash",
+        "provider",
+        "requested_model",
+        "executor_name",
+        "executor_version",
+        "persistence_name",
+        "persistence_version",
+        "entity_resolution_policy_name",
+        "entity_resolution_policy_version",
+    ],
+)
+def test_authenticate_duplicate_grouping_source_snapshot_rejects_empty_or_invalid_identity_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+    )
+    invalid_value = "" if field_name != "prompt_contract_hash" else "not-a-hash"
+    state = replace(state, **{field_name: invalid_value})
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="orchestration_identity_invalid",
+    ):
+        run_async(
+            duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+                SessionFactory(),
+                orchestration_id=orchestration_id,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("orchestration_status", "batch_count", "completed_batch_count", "failed_batch_count"),
+    [
+        ("completed", 2, 1, 0),
+        ("completed", 2, 2, 1),
+        ("partial", 2, 0, 2),
+        ("partial", 2, 1, 0),
+        ("partial", 3, 1, 1),
+    ],
+)
+def test_authenticate_duplicate_grouping_source_snapshot_rejects_invalid_batch_count_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    orchestration_status: str,
+    batch_count: int,
+    completed_batch_count: int,
+    failed_batch_count: int,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status=orchestration_status,
+        batch_count=batch_count,
+        completed_batch_count=completed_batch_count,
+        failed_batch_count=failed_batch_count,
+    )
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="batch_count_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+                SessionFactory(),
+                orchestration_id=orchestration_id,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("completed_batch_count", "rows", "expected_code"),
+    [
+        (
+            2,
+            lambda app_id, input_batch_id, inference_run_id: (
+                make_completed_batch_application(
+                    batch_index=0,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+            ),
+            "batch_count_mismatch",
+        ),
+        (
+            1,
+            lambda app_id, input_batch_id, inference_run_id: (
+                make_completed_batch_application(
+                    source_batch_id=uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                    batch_index=0,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+                make_completed_batch_application(
+                    source_batch_id=uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                    batch_index=1,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+            ),
+            "batch_count_mismatch",
+        ),
+        (
+            2,
+            lambda app_id, input_batch_id, inference_run_id: (
+                make_completed_batch_application(
+                    source_batch_id=uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+                    batch_index=0,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+                make_completed_batch_application(
+                    source_batch_id=uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+                    batch_index=1,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+            ),
+            "completed_batch_source_mismatch",
+        ),
+    ],
+)
+def test_authenticate_duplicate_grouping_source_snapshot_rejects_missing_extra_or_duplicate_completed_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    completed_batch_count: int,
+    rows,
+    expected_code: str,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status="completed",
+        batch_count=max(1, completed_batch_count),
+        completed_batch_count=completed_batch_count,
+        failed_batch_count=0,
+    )
+    application_snapshot = make_application_snapshot(
+        project_id=state.project_id,
+        extraction_run_id=state.extraction_run_id,
+        inference_run_id=uuid.uuid4(),
+        input_batch_id=uuid.uuid4(),
+        items=(),
+        persistence_name=state.persistence_name,
+        persistence_version=state.persistence_version,
+        entity_resolution_policy_name=state.entity_resolution_policy_name,
+        entity_resolution_policy_version=state.entity_resolution_policy_version,
+    )
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "has_invalid_completed_batch_bindings",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=False),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_completed_orchestration_batch_applications",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=rows(
+                application_snapshot.application_id,
+                application_snapshot.input_batch_id,
+                application_snapshot.inference_run_id,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match=expected_code,
+    ):
+        run_async(
+            duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+                SessionFactory(),
+                orchestration_id=orchestration_id,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("batch_count", "completed_batch_count", "rows"),
+    [
+        (
+            2,
+            2,
+            lambda app_id, input_batch_id, inference_run_id: (
+                make_completed_batch_application(
+                    batch_index=0,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+                make_completed_batch_application(
+                    batch_index=0,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+            ),
+        ),
+        (
+            1,
+            1,
+            lambda app_id, input_batch_id, inference_run_id: (
+                make_completed_batch_application(
+                    batch_index=2,
+                    application_id=app_id,
+                    current_input_batch_id=input_batch_id,
+                    current_inference_run_id=inference_run_id,
+                ),
+            ),
+        ),
+    ],
+)
+def test_authenticate_duplicate_grouping_source_snapshot_rejects_duplicate_or_out_of_range_batch_index(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_count: int,
+    completed_batch_count: int,
+    rows,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status="completed",
+        batch_count=batch_count,
+        completed_batch_count=completed_batch_count,
+        failed_batch_count=0,
+    )
+    application_snapshot = make_application_snapshot(
+        project_id=state.project_id,
+        extraction_run_id=state.extraction_run_id,
+        inference_run_id=uuid.uuid4(),
+        input_batch_id=uuid.uuid4(),
+        items=(),
+        persistence_name=state.persistence_name,
+        persistence_version=state.persistence_version,
+        entity_resolution_policy_name=state.entity_resolution_policy_name,
+        entity_resolution_policy_version=state.entity_resolution_policy_version,
+    )
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "has_invalid_completed_batch_bindings",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=False),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_completed_orchestration_batch_applications",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=rows(
+                application_snapshot.application_id,
+                application_snapshot.input_batch_id,
+                application_snapshot.inference_run_id,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="completed_batch_source_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+                SessionFactory(),
+                orchestration_id=orchestration_id,
+            )
+        )
+
+
+def test_authenticate_duplicate_grouping_source_snapshot_rejects_missing_or_mismatched_input_batch_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+    )
+    application_snapshot = make_application_snapshot(
+        project_id=state.project_id,
+        extraction_run_id=state.extraction_run_id,
+        inference_run_id=uuid.uuid4(),
+        input_batch_id=uuid.uuid4(),
+        items=(),
+        persistence_name=state.persistence_name,
+        persistence_version=state.persistence_version,
+        entity_resolution_policy_name=state.entity_resolution_policy_name,
+        entity_resolution_policy_version=state.entity_resolution_policy_version,
+    )
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "has_invalid_completed_batch_bindings",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=False),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_completed_orchestration_batch_applications",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=(
+                make_completed_batch_application(
+                    batch_index=0,
+                    application_id=application_snapshot.application_id,
+                    current_input_batch_id=uuid.uuid4(),
+                    current_inference_run_id=application_snapshot.inference_run_id,
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "count_duplicate_candidate_fact_values",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=0),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_duplicate_candidates",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=()),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_service.fact_extraction_persistence_service,
+        "authenticate_completed_fact_extraction_application",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=application_snapshot),
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="application_input_batch_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+                SessionFactory(),
+                orchestration_id=orchestration_id,
+            )
+        )
+
+
+def test_authenticate_duplicate_grouping_source_snapshot_rejects_missing_current_input_batch_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+    )
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "has_invalid_completed_batch_bindings",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=False),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_completed_orchestration_batch_applications",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=(
+                make_completed_batch_application(
+                    batch_index=0,
+                    application_id=uuid.uuid4(),
+                    current_input_batch_id=None,
+                    current_inference_run_id=uuid.uuid4(),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="completed_batch_source_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+                SessionFactory(),
+                orchestration_id=orchestration_id,
+            )
+        )
+
+
+def test_authenticate_duplicate_grouping_source_snapshot_rejects_current_inference_run_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+    )
+    application_snapshot = make_application_snapshot(
+        project_id=state.project_id,
+        extraction_run_id=state.extraction_run_id,
+        inference_run_id=uuid.uuid4(),
+        input_batch_id=uuid.uuid4(),
+        items=(),
+        persistence_name=state.persistence_name,
+        persistence_version=state.persistence_version,
+        entity_resolution_policy_name=state.entity_resolution_policy_name,
+        entity_resolution_policy_version=state.entity_resolution_policy_version,
+    )
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "has_invalid_completed_batch_bindings",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=False),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_completed_orchestration_batch_applications",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=(
+                make_completed_batch_application(
+                    batch_index=0,
+                    application_id=application_snapshot.application_id,
+                    current_input_batch_id=application_snapshot.input_batch_id,
+                    current_inference_run_id=uuid.uuid4(),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "count_duplicate_candidate_fact_values",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=0),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_duplicate_candidates",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=()),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_service.fact_extraction_persistence_service,
+        "authenticate_completed_fact_extraction_application",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=application_snapshot),
+    )
+
+    with pytest.raises(
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+        match="application_inference_run_mismatch",
+    ):
+        run_async(
+            duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+                SessionFactory(),
+                orchestration_id=orchestration_id,
+            )
+        )
+
+
+def test_authenticate_duplicate_grouping_source_snapshot_accepts_all_withheld_application_with_zero_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestration_id = uuid.uuid4()
+    state = make_orchestration_state(
+        orchestration_id,
+        orchestration_status="completed",
+        batch_count=1,
+        completed_batch_count=1,
+        failed_batch_count=0,
+    )
+    application_snapshot = make_application_snapshot(
+        project_id=state.project_id,
+        extraction_run_id=state.extraction_run_id,
+        inference_run_id=uuid.uuid4(),
+        input_batch_id=uuid.uuid4(),
+        items=(),
+        persistence_name=state.persistence_name,
+        persistence_version=state.persistence_version,
+        entity_resolution_policy_name=state.entity_resolution_policy_name,
+        entity_resolution_policy_version=state.entity_resolution_policy_version,
+    )
+
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "get_duplicate_grouping_orchestration_state",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=state),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "has_invalid_completed_batch_bindings",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=False),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_completed_orchestration_batch_applications",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=(
+                make_completed_batch_application(
+                    batch_index=0,
+                    source_batch_id=uuid.uuid4(),
+                    application_id=application_snapshot.application_id,
+                    current_input_batch_id=application_snapshot.input_batch_id,
+                    current_inference_run_id=application_snapshot.inference_run_id,
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "count_duplicate_candidate_fact_values",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=0),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_repository,
+        "list_duplicate_candidates",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=()),
+    )
+    monkeypatch.setattr(
+        duplicate_grouping_service.fact_extraction_persistence_service,
+        "authenticate_completed_fact_extraction_application",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=application_snapshot),
+    )
+
+    snapshot = run_async(
+        duplicate_grouping_service.authenticate_duplicate_grouping_source_snapshot(
+            SessionFactory(),
+            orchestration_id=orchestration_id,
+        )
+    )
+
+    assert snapshot.candidate_count == 0
+    assert snapshot.candidates == ()
+    assert snapshot.application_snapshots == (application_snapshot,)
 
 
 def test_duplicate_group_evidence_projection_reads_member_evidence_order() -> None:

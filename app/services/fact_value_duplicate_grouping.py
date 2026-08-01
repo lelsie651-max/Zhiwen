@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time
@@ -28,6 +29,7 @@ from app.models.fact_value_duplicate_grouping import (
 )
 from app.repositories import fact_value_duplicate_grouping as duplicate_grouping_repository
 from app.services import fact_extraction_persistence as fact_extraction_persistence_service
+from app.utils.validation import normalize_text
 from app.schemas.fact_value_duplicate_grouping import (
     CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
     CROSS_BATCH_MULTI_VALUE_CANDIDATE_ALGORITHM_VERSION,
@@ -56,6 +58,21 @@ logger = logging.getLogger(__name__)
 _APPLICATION_UNIQUE_CONSTRAINT = "uq_dupgrp_app_orch_alg"
 _CONSISTENCY_APPLICATION_UNIQUE_CONSTRAINT = "uq_fvcca_dupgrp_alg"
 _MISSING = object()
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_ORCHESTRATION_IDENTITY_STRING_LIMITS: tuple[tuple[str, int], ...] = (
+    ("planner_name", 64),
+    ("planner_version", 32),
+    ("agent_name", 100),
+    ("agent_version", 32),
+    ("provider", 64),
+    ("requested_model", 128),
+    ("executor_name", 64),
+    ("executor_version", 32),
+    ("persistence_name", 64),
+    ("persistence_version", 32),
+    ("entity_resolution_policy_name", 64),
+    ("entity_resolution_policy_version", 32),
+)
 
 
 class CrossBatchDuplicateGroupingError(Exception):
@@ -119,6 +136,137 @@ def _require_uuid(value: uuid.UUID, *, field_name: str) -> uuid.UUID:
 
 def _normalize_string(value: str) -> str:
     return unicodedata.normalize("NFC", value)
+
+
+def _require_orchestration_identity_string(
+    value: object,
+    *,
+    max_length: int,
+) -> str:
+    if not isinstance(value, str):
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_orchestration_identity_invalid"
+        )
+    normalized = normalize_text(value)
+    if not normalized or len(normalized) > max_length:
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_orchestration_identity_invalid"
+        )
+    return normalized
+
+
+def _require_orchestration_identity_hash(value: object) -> str:
+    if not isinstance(value, str):
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_orchestration_identity_invalid"
+        )
+    normalized = normalize_text(value).lower()
+    if not _SHA256_PATTERN.fullmatch(normalized):
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_orchestration_identity_invalid"
+        )
+    return normalized
+
+
+def _validate_completed_batch_counts(
+    state: duplicate_grouping_repository.DuplicateGroupingOrchestrationState,
+) -> None:
+    if (
+        not isinstance(state.batch_count, int)
+        or not isinstance(state.completed_batch_count, int)
+        or not isinstance(state.failed_batch_count, int)
+        or state.batch_count <= 0
+        or state.completed_batch_count < 0
+        or state.failed_batch_count < 0
+    ):
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_batch_count_mismatch"
+        )
+    if state.orchestration_status == "completed":
+        if (
+            state.completed_batch_count != state.batch_count
+            or state.failed_batch_count != 0
+        ):
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_batch_count_mismatch"
+            )
+        return
+    if state.orchestration_status == "partial":
+        if (
+            state.completed_batch_count <= 0
+            or state.failed_batch_count <= 0
+            or state.completed_batch_count + state.failed_batch_count != state.batch_count
+        ):
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_batch_count_mismatch"
+            )
+
+
+def _validate_orchestration_identity(
+    state: duplicate_grouping_repository.DuplicateGroupingOrchestrationState,
+) -> None:
+    for field_name, max_length in _ORCHESTRATION_IDENTITY_STRING_LIMITS:
+        value = getattr(state, field_name)
+        normalized = _require_orchestration_identity_string(
+            value,
+            max_length=max_length,
+        )
+        if value != normalized:
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_orchestration_identity_invalid"
+            )
+    if state.prompt_contract_hash != _require_orchestration_identity_hash(
+        state.prompt_contract_hash
+    ):
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_orchestration_identity_invalid"
+        )
+
+
+def _validate_completed_batch_applications(
+    completed_batch_applications: Sequence[
+        duplicate_grouping_repository.CompletedOrchestrationBatchApplication
+    ],
+    *,
+    state: duplicate_grouping_repository.DuplicateGroupingOrchestrationState,
+) -> None:
+    if len(completed_batch_applications) != state.completed_batch_count:
+        raise CrossBatchDuplicateGroupingInvariantError(
+            "cross_batch_duplicate_grouping_batch_count_mismatch"
+        )
+    seen_batch_ids: set[uuid.UUID] = set()
+    seen_batch_indexes: set[int] = set()
+    for completed_batch_application in completed_batch_applications:
+        if not isinstance(completed_batch_application.source_batch_id, uuid.UUID):
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        if completed_batch_application.source_batch_id in seen_batch_ids:
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        seen_batch_ids.add(completed_batch_application.source_batch_id)
+        if (
+            not isinstance(completed_batch_application.batch_index, int)
+            or completed_batch_application.batch_index < 0
+            or completed_batch_application.batch_index >= state.batch_count
+        ):
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        if completed_batch_application.batch_index in seen_batch_indexes:
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        seen_batch_indexes.add(completed_batch_application.batch_index)
+        if (
+            not isinstance(completed_batch_application.application_id, uuid.UUID)
+            or not isinstance(completed_batch_application.current_input_batch_id, uuid.UUID)
+            or not isinstance(completed_batch_application.current_inference_run_id, uuid.UUID)
+        ):
+            raise CrossBatchDuplicateGroupingInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
 
 
 def normalize_duplicate_grouping_algorithm_version(value: str) -> str:
@@ -928,6 +1076,8 @@ def _validate_run_state(
         "partial",
     }:
         raise CrossBatchDuplicateGroupingStateError("cross_batch_duplicate_grouping_orchestration_not_ready")
+    _validate_orchestration_identity(state)
+    _validate_completed_batch_counts(state)
     return state
 
 
@@ -1202,67 +1352,68 @@ async def authenticate_duplicate_grouping_source_snapshot(
                 fact_extraction_persistence_service.AuthenticatedPersistedFactProposalItem,
             ] = {}
             authoritative_source_batch_by_fact_value_id: dict[uuid.UUID, uuid.UUID] = {}
-            should_authenticate_application_results = bool(
-                state.persistence_name
-                and state.persistence_version
-                and state.entity_resolution_policy_name
-                and state.entity_resolution_policy_version
+            completed_batch_applications = (
+                await duplicate_grouping_repository.list_completed_orchestration_batch_applications(
+                    read_session,
+                    orchestration_id=orchestration_id,
+                    batch_count=state.batch_count,
+                )
             )
-            if should_authenticate_application_results:
-                completed_batch_applications = (
-                    await duplicate_grouping_repository.list_completed_orchestration_batch_applications(
+            _validate_completed_batch_applications(
+                completed_batch_applications,
+                state=state,
+            )
+            for completed_batch_application in completed_batch_applications:
+                application_snapshot = (
+                    await fact_extraction_persistence_service.authenticate_completed_fact_extraction_application(
                         read_session,
-                        orchestration_id=orchestration_id,
+                        application_id=completed_batch_application.application_id,
                     )
                 )
-                for completed_batch_application in completed_batch_applications:
-                    if completed_batch_application.application_id is None:
+                if application_snapshot.project_id != state.project_id:
+                    raise CrossBatchDuplicateGroupingInvariantError(
+                        "cross_batch_duplicate_grouping_application_project_mismatch"
+                    )
+                if application_snapshot.extraction_run_id != state.extraction_run_id:
+                    raise CrossBatchDuplicateGroupingInvariantError(
+                        "cross_batch_duplicate_grouping_application_extraction_run_mismatch"
+                    )
+                if (
+                    application_snapshot.input_batch_id
+                    != completed_batch_application.current_input_batch_id
+                ):
+                    raise CrossBatchDuplicateGroupingInvariantError(
+                        "cross_batch_duplicate_grouping_application_input_batch_mismatch"
+                    )
+                if (
+                    application_snapshot.inference_run_id
+                    != completed_batch_application.current_inference_run_id
+                ):
+                    raise CrossBatchDuplicateGroupingInvariantError(
+                        "cross_batch_duplicate_grouping_application_inference_run_mismatch"
+                    )
+                if (
+                    application_snapshot.persistence_name != state.persistence_name
+                    or application_snapshot.persistence_version != state.persistence_version
+                    or application_snapshot.entity_resolution_policy_name
+                    != state.entity_resolution_policy_name
+                    or application_snapshot.entity_resolution_policy_version
+                    != state.entity_resolution_policy_version
+                ):
+                    raise CrossBatchDuplicateGroupingInvariantError(
+                        "cross_batch_duplicate_grouping_application_identity_mismatch"
+                    )
+                application_snapshots.append(application_snapshot)
+                for item in application_snapshot.items:
+                    if item.fact_value_id in authoritative_fact_value_ids:
                         raise CrossBatchDuplicateGroupingInvariantError(
                             "cross_batch_duplicate_grouping_candidate_source_mismatch"
                         )
-                    application_snapshot = (
-                        await fact_extraction_persistence_service.authenticate_completed_fact_extraction_application(
-                            read_session,
-                            application_id=completed_batch_application.application_id,
-                        )
+                    authoritative_fact_value_ids.add(item.fact_value_id)
+                    authoritative_items_by_fact_value_id[item.fact_value_id] = item
+                    authoritative_source_batch_by_fact_value_id[item.fact_value_id] = (
+                        completed_batch_application.source_batch_id
                     )
-                    if application_snapshot.project_id != state.project_id:
-                        raise CrossBatchDuplicateGroupingInvariantError(
-                            "cross_batch_duplicate_grouping_application_project_mismatch"
-                        )
-                    if application_snapshot.extraction_run_id != state.extraction_run_id:
-                        raise CrossBatchDuplicateGroupingInvariantError(
-                            "cross_batch_duplicate_grouping_application_extraction_run_mismatch"
-                        )
-                    if (
-                        application_snapshot.inference_run_id
-                        != completed_batch_application.current_inference_run_id
-                    ):
-                        raise CrossBatchDuplicateGroupingInvariantError(
-                            "cross_batch_duplicate_grouping_application_inference_run_mismatch"
-                        )
-                    if (
-                        application_snapshot.persistence_name != state.persistence_name
-                        or application_snapshot.persistence_version != state.persistence_version
-                        or application_snapshot.entity_resolution_policy_name
-                        != state.entity_resolution_policy_name
-                        or application_snapshot.entity_resolution_policy_version
-                        != state.entity_resolution_policy_version
-                    ):
-                        raise CrossBatchDuplicateGroupingInvariantError(
-                            "cross_batch_duplicate_grouping_application_identity_mismatch"
-                        )
-                    application_snapshots.append(application_snapshot)
-                    for item in application_snapshot.items:
-                        if item.fact_value_id in authoritative_fact_value_ids:
-                            raise CrossBatchDuplicateGroupingInvariantError(
-                                "cross_batch_duplicate_grouping_candidate_source_mismatch"
-                            )
-                        authoritative_fact_value_ids.add(item.fact_value_id)
-                        authoritative_items_by_fact_value_id[item.fact_value_id] = item
-                        authoritative_source_batch_by_fact_value_id[item.fact_value_id] = (
-                            completed_batch_application.source_batch_id
-                        )
             candidate_count = await duplicate_grouping_repository.count_duplicate_candidate_fact_values(
                 read_session,
                 orchestration_id=orchestration_id,
@@ -1275,39 +1426,42 @@ async def authenticate_duplicate_grouping_source_snapshot(
                 raise CrossBatchDuplicateGroupingInvariantError(
                     "cross_batch_duplicate_grouping_candidate_source_mismatch"
                 )
-            if should_authenticate_application_results:
-                if len(authoritative_fact_value_ids) != candidate_count:
+            if len(application_snapshots) != state.completed_batch_count:
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_batch_count_mismatch"
+                )
+            if len(authoritative_fact_value_ids) != candidate_count:
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_candidate_source_mismatch"
+                )
+            candidate_by_fact_value_id = {
+                candidate.fact_value_id: candidate for candidate in candidates
+            }
+            if len(candidate_by_fact_value_id) != len(candidates):
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_candidate_source_mismatch"
+                )
+            if set(candidate_by_fact_value_id) != authoritative_fact_value_ids:
+                raise CrossBatchDuplicateGroupingInvariantError(
+                    "cross_batch_duplicate_grouping_candidate_source_mismatch"
+                )
+            for fact_value_id, candidate in candidate_by_fact_value_id.items():
+                authoritative_item = authoritative_items_by_fact_value_id[fact_value_id]
+                if candidate.fact_id != authoritative_item.fact_id:
                     raise CrossBatchDuplicateGroupingInvariantError(
                         "cross_batch_duplicate_grouping_candidate_source_mismatch"
                     )
-                candidate_by_fact_value_id = {
-                    candidate.fact_value_id: candidate for candidate in candidates
-                }
-                if len(candidate_by_fact_value_id) != len(candidates):
+                if (
+                    candidate.source_batch_id
+                    != authoritative_source_batch_by_fact_value_id[fact_value_id]
+                ):
                     raise CrossBatchDuplicateGroupingInvariantError(
                         "cross_batch_duplicate_grouping_candidate_source_mismatch"
                     )
-                if set(candidate_by_fact_value_id) != authoritative_fact_value_ids:
+                if candidate.evidence_ids != authoritative_item.evidence_ids:
                     raise CrossBatchDuplicateGroupingInvariantError(
                         "cross_batch_duplicate_grouping_candidate_source_mismatch"
                     )
-                for fact_value_id, candidate in candidate_by_fact_value_id.items():
-                    authoritative_item = authoritative_items_by_fact_value_id[fact_value_id]
-                    if candidate.fact_id != authoritative_item.fact_id:
-                        raise CrossBatchDuplicateGroupingInvariantError(
-                            "cross_batch_duplicate_grouping_candidate_source_mismatch"
-                        )
-                    if (
-                        candidate.source_batch_id
-                        != authoritative_source_batch_by_fact_value_id[fact_value_id]
-                    ):
-                        raise CrossBatchDuplicateGroupingInvariantError(
-                            "cross_batch_duplicate_grouping_candidate_source_mismatch"
-                        )
-                    if candidate.evidence_ids != authoritative_item.evidence_ids:
-                        raise CrossBatchDuplicateGroupingInvariantError(
-                            "cross_batch_duplicate_grouping_candidate_source_mismatch"
-                        )
         except duplicate_grouping_repository.DuplicateGroupingRepositoryInvariantError as error:
             await read_session.rollback()
             raise CrossBatchDuplicateGroupingInvariantError(str(error)) from None

@@ -48,6 +48,9 @@ class DuplicateGroupingOrchestrationState:
     extraction_run_status: str
     extraction_run_outcome: str | None
     orchestration_status: str
+    batch_count: int
+    completed_batch_count: int
+    failed_batch_count: int
     planner_name: str = ""
     planner_version: str = ""
     agent_name: str = ""
@@ -66,7 +69,9 @@ class DuplicateGroupingOrchestrationState:
 @dataclass(frozen=True, slots=True)
 class CompletedOrchestrationBatchApplication:
     source_batch_id: uuid.UUID
+    batch_index: int
     application_id: uuid.UUID | None
+    current_input_batch_id: uuid.UUID | None
     current_inference_run_id: uuid.UUID
 
 
@@ -81,6 +86,9 @@ async def get_duplicate_grouping_orchestration_state(
             FactExtractionOrchestration.extraction_run_id.label("extraction_run_id"),
             FactExtractionOrchestration.project_id.label("project_id"),
             FactExtractionOrchestration.status.label("orchestration_status"),
+            FactExtractionOrchestration.batch_count.label("batch_count"),
+            FactExtractionOrchestration.completed_batch_count.label("completed_batch_count"),
+            FactExtractionOrchestration.failed_batch_count.label("failed_batch_count"),
             DocumentExtractionRun.status.label("extraction_run_status"),
             DocumentExtractionRun.outcome.label("extraction_run_outcome"),
             FactExtractionOrchestration.planner_name.label("planner_name"),
@@ -117,6 +125,9 @@ async def get_duplicate_grouping_orchestration_state(
         extraction_run_status=row.extraction_run_status,
         extraction_run_outcome=row.extraction_run_outcome,
         orchestration_status=row.orchestration_status,
+        batch_count=row.batch_count,
+        completed_batch_count=row.completed_batch_count,
+        failed_batch_count=row.failed_batch_count,
         planner_name=row.planner_name,
         planner_version=row.planner_version,
         agent_name=row.agent_name,
@@ -167,6 +178,15 @@ async def has_invalid_completed_batch_bindings(
                     != FactExtractionBatchApplication.inference_run_id,
                     True,
                 ),
+                (
+                    FactExtractionOrchestrationBatch.current_input_batch_id.is_(None),
+                    True,
+                ),
+                (
+                    FactExtractionBatchApplication.input_batch_id
+                    != FactExtractionOrchestrationBatch.current_input_batch_id,
+                    True,
+                ),
                 else_=False,
             ),
         )
@@ -179,11 +199,16 @@ async def list_completed_orchestration_batch_applications(
     session: AsyncSession,
     *,
     orchestration_id: uuid.UUID,
+    batch_count: int,
 ) -> tuple[CompletedOrchestrationBatchApplication, ...]:
     result = await session.execute(
         select(
             FactExtractionOrchestrationBatch.id.label("source_batch_id"),
+            FactExtractionOrchestrationBatch.batch_index.label("batch_index"),
             FactExtractionOrchestrationBatch.application_id.label("application_id"),
+            FactExtractionOrchestrationBatch.current_input_batch_id.label(
+                "current_input_batch_id"
+            ),
             FactExtractionOrchestrationBatch.current_inference_run_id.label(
                 "current_inference_run_id"
             ),
@@ -192,17 +217,43 @@ async def list_completed_orchestration_batch_applications(
             FactExtractionOrchestrationBatch.orchestration_id == orchestration_id,
             FactExtractionOrchestrationBatch.status == "completed",
         )
-        .order_by(FactExtractionOrchestrationBatch.id.asc())
+        .order_by(FactExtractionOrchestrationBatch.batch_index.asc())
     )
     rows = result.all()
-    return tuple(
-        CompletedOrchestrationBatchApplication(
-            source_batch_id=row.source_batch_id,
-            application_id=row.application_id,
-            current_inference_run_id=row.current_inference_run_id,
+    seen_batch_indexes: set[int] = set()
+    applications: list[CompletedOrchestrationBatchApplication] = []
+    for row in rows:
+        if not isinstance(row.batch_index, int):
+            raise DuplicateGroupingRepositoryInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        if row.batch_index < 0 or row.batch_index >= batch_count:
+            raise DuplicateGroupingRepositoryInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        if row.batch_index in seen_batch_indexes:
+            raise DuplicateGroupingRepositoryInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        seen_batch_indexes.add(row.batch_index)
+        if (
+            row.application_id is None
+            or row.current_input_batch_id is None
+            or row.current_inference_run_id is None
+        ):
+            raise DuplicateGroupingRepositoryInvariantError(
+                "cross_batch_duplicate_grouping_completed_batch_source_mismatch"
+            )
+        applications.append(
+            CompletedOrchestrationBatchApplication(
+                source_batch_id=row.source_batch_id,
+                batch_index=row.batch_index,
+                application_id=row.application_id,
+                current_input_batch_id=row.current_input_batch_id,
+                current_inference_run_id=row.current_inference_run_id,
+            )
         )
-        for row in rows
-    )
+    return tuple(applications)
 
 
 async def list_duplicate_candidates(
