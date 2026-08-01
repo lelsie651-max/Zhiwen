@@ -8,6 +8,7 @@ import uuid
 
 
 CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION = "cross_batch_exact_v2"
+CROSS_BATCH_MULTI_VALUE_CANDIDATE_ALGORITHM_VERSION = "cross_batch_multi_value_v1"
 
 
 class DuplicateGroupingMemberSourceKind(StrEnum):
@@ -111,3 +112,79 @@ class DuplicateGroupEvidenceProjection:
     source_batch_id: uuid.UUID
     evidence_link_ids: tuple[uuid.UUID, ...]
     evidence_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FactValueConsistencyCandidateMemberPlan:
+    fact_value_id: uuid.UUID
+    source_batch_id: uuid.UUID
+    semantic_key_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class FactValueConsistencyCandidatePlan:
+    fact_id: uuid.UUID
+    candidate_kind: str
+    member_count: int
+    distinct_semantic_key_count: int
+    distinct_batch_count: int
+    members: tuple[FactValueConsistencyCandidateMemberPlan, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FactValueConsistencyCandidateWritePlan:
+    algorithm_version: str
+    source_duplicate_grouping_algorithm_version: str
+    input_manifest_hash: str
+    result_manifest_hash: str
+    candidate_count: int
+    member_count: int
+    candidates: tuple[FactValueConsistencyCandidatePlan, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FactValueConsistencyCandidateResult:
+    consistency_application_id: uuid.UUID
+    duplicate_grouping_application_id: uuid.UUID
+    algorithm_version: str
+    candidate_count: int
+    member_count: int
+    created_new: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FactValueConsistencyCandidateApplicationLedger:
+    id: uuid.UUID
+    duplicate_grouping_application_id: uuid.UUID
+    orchestration_id: uuid.UUID
+    extraction_run_id: uuid.UUID
+    algorithm_version: str
+    input_manifest_hash: str
+    result_manifest_hash: str
+    candidate_count: int
+    member_count: int
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FactValueConsistencyCandidateLedger:
+    id: uuid.UUID
+    consistency_application_id: uuid.UUID
+    fact_id: uuid.UUID
+    candidate_kind: str
+    member_count: int
+    distinct_semantic_key_count: int
+    distinct_batch_count: int
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FactValueConsistencyCandidateMemberLedger:
+    id: uuid.UUID
+    consistency_application_id: uuid.UUID
+    candidate_id: uuid.UUID
+    orchestration_id: uuid.UUID
+    fact_value_id: uuid.UUID
+    source_batch_id: uuid.UUID
+    semantic_key_hash: str
+    created_at: datetime

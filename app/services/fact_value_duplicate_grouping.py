@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
@@ -18,6 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document_content import ExtractionRunOutcome, ExtractionRunStatus
 from app.models.fact_value_duplicate_grouping import (
+    FactValueConsistencyCandidate,
+    FactValueConsistencyCandidateApplication,
+    FactValueConsistencyCandidateMember,
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
     FactValueDuplicateGroupingApplication,
@@ -26,6 +29,7 @@ from app.models.fact_value_duplicate_grouping import (
 from app.repositories import fact_value_duplicate_grouping as duplicate_grouping_repository
 from app.schemas.fact_value_duplicate_grouping import (
     CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
+    CROSS_BATCH_MULTI_VALUE_CANDIDATE_ALGORITHM_VERSION,
     DuplicateCandidate,
     DuplicateFingerprint,
     DuplicateGroupEvidenceProjection,
@@ -36,12 +40,20 @@ from app.schemas.fact_value_duplicate_grouping import (
     DuplicateGroupingApplicationLedger,
     DuplicateGroupingResult,
     DuplicateGroupingWritePlan,
+    FactValueConsistencyCandidateApplicationLedger,
+    FactValueConsistencyCandidateLedger,
+    FactValueConsistencyCandidateMemberLedger,
+    FactValueConsistencyCandidateMemberPlan,
+    FactValueConsistencyCandidatePlan,
+    FactValueConsistencyCandidateResult,
+    FactValueConsistencyCandidateWritePlan,
 )
 
 
 logger = logging.getLogger(__name__)
 
 _APPLICATION_UNIQUE_CONSTRAINT = "uq_dupgrp_app_orch_alg"
+_CONSISTENCY_APPLICATION_UNIQUE_CONSTRAINT = "uq_fvcca_dupgrp_alg"
 _MISSING = object()
 
 
@@ -55,6 +67,26 @@ class CrossBatchDuplicateGroupingStateError(CrossBatchDuplicateGroupingError):
 
 class CrossBatchDuplicateGroupingInvariantError(CrossBatchDuplicateGroupingError):
     """Raised when immutable duplicate-grouping invariants are violated."""
+
+
+class FactValueConsistencyCandidateError(Exception):
+    """Base class for consistency candidate failures."""
+
+
+class FactValueConsistencyCandidateStateError(FactValueConsistencyCandidateError):
+    """Raised when the source duplicate grouping application is not available."""
+
+
+class FactValueConsistencyCandidateInvariantError(FactValueConsistencyCandidateError):
+    """Raised when immutable consistency-candidate invariants are violated."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ConsistencyCandidateSourceItem:
+    fact_value_id: uuid.UUID
+    fact_id: uuid.UUID
+    source_batch_id: uuid.UUID
+    semantic_key_hash: str
 
 
 def _require_uuid(value: uuid.UUID, *, field_name: str) -> uuid.UUID:
@@ -73,6 +105,15 @@ def normalize_duplicate_grouping_algorithm_version(value: str) -> str:
     except ValueError:
         raise CrossBatchDuplicateGroupingError(
             "cross_batch_duplicate_grouping_invalid_algorithm_version"
+        ) from None
+
+
+def normalize_consistency_candidate_algorithm_version(value: str) -> str:
+    try:
+        return normalize_model_algorithm_version(value)
+    except ValueError:
+        raise FactValueConsistencyCandidateError(
+            "fact_value_consistency_candidate_invalid_algorithm_version"
         ) from None
 
 
@@ -373,6 +414,230 @@ def _build_result(
         input_fact_value_count=application.input_fact_value_count,
         duplicate_group_count=application.duplicate_group_count,
         duplicate_member_count=application.duplicate_member_count,
+        created_new=created_new,
+    )
+
+
+def _require_consistency_uuid(value: uuid.UUID, *, field_name: str) -> uuid.UUID:
+    if not isinstance(value, uuid.UUID):
+        raise FactValueConsistencyCandidateError(f"{field_name} must be a UUID")
+    return value
+
+
+def _assert_source_duplicate_grouping_application_matches_input(
+    application: DuplicateGroupingApplicationLedger,
+    *,
+    source_input_manifest_hash: str,
+    source_input_fact_value_count: int,
+    orchestration_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+) -> None:
+    if application.orchestration_id != orchestration_id:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_source_orchestration_mismatch"
+        )
+    if application.extraction_run_id != extraction_run_id:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_source_extraction_run_mismatch"
+        )
+    if application.input_manifest_hash != source_input_manifest_hash:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_source_input_manifest_mismatch"
+        )
+    if application.input_fact_value_count != source_input_fact_value_count:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_source_input_count_mismatch"
+        )
+
+
+def build_fact_value_consistency_candidate_write_plan(
+    candidates: Sequence[DuplicateCandidate],
+    *,
+    source_duplicate_grouping_application: DuplicateGroupingApplicationLedger,
+    algorithm_version: str = CROSS_BATCH_MULTI_VALUE_CANDIDATE_ALGORITHM_VERSION,
+) -> FactValueConsistencyCandidateWritePlan:
+    algorithm_version = normalize_consistency_candidate_algorithm_version(algorithm_version)
+    source_algorithm_version = normalize_duplicate_grouping_algorithm_version(
+        source_duplicate_grouping_application.algorithm_version
+    )
+    try:
+        source_duplicate_plan = build_duplicate_grouping_write_plan(
+            candidates,
+            algorithm_version=source_algorithm_version,
+        )
+    except CrossBatchDuplicateGroupingError as error:
+        raise FactValueConsistencyCandidateInvariantError(str(error)) from None
+
+    orchestration_ids = {candidate.orchestration_id for candidate in candidates}
+    extraction_run_ids = {candidate.extraction_run_id for candidate in candidates}
+    if len(orchestration_ids) > 1 or (
+        orchestration_ids and source_duplicate_grouping_application.orchestration_id not in orchestration_ids
+    ):
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_source_orchestration_mismatch"
+        )
+    if len(extraction_run_ids) > 1 or (
+        extraction_run_ids and source_duplicate_grouping_application.extraction_run_id not in extraction_run_ids
+    ):
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_source_extraction_run_mismatch"
+        )
+    _assert_source_duplicate_grouping_application_matches_input(
+        source_duplicate_grouping_application,
+        source_input_manifest_hash=source_duplicate_plan.input_manifest_hash,
+        source_input_fact_value_count=source_duplicate_plan.input_fact_value_count,
+        orchestration_id=source_duplicate_grouping_application.orchestration_id,
+        extraction_run_id=source_duplicate_grouping_application.extraction_run_id,
+    )
+
+    digest_bytes_by_hash: dict[str, bytes] = {}
+    grouped_by_fact_id: dict[uuid.UUID, list[_ConsistencyCandidateSourceItem]] = {}
+    seen_fact_value_ids: set[uuid.UUID] = set()
+    for candidate in candidates:
+        if candidate.fact_value_id in seen_fact_value_ids:
+            raise FactValueConsistencyCandidateInvariantError(
+                "fact_value_consistency_candidate_duplicate_fact_value_id"
+            )
+        seen_fact_value_ids.add(candidate.fact_value_id)
+        try:
+            semantic_key_hash = build_duplicate_fingerprint(
+                candidate,
+                algorithm_version=source_algorithm_version,
+                digest_bytes_by_hash=digest_bytes_by_hash,
+            ).sha256_hex
+        except CrossBatchDuplicateGroupingError as error:
+            raise FactValueConsistencyCandidateInvariantError(str(error)) from None
+        grouped_by_fact_id.setdefault(candidate.fact_id, []).append(
+            _ConsistencyCandidateSourceItem(
+                fact_value_id=candidate.fact_value_id,
+                fact_id=candidate.fact_id,
+                source_batch_id=candidate.source_batch_id,
+                semantic_key_hash=semantic_key_hash,
+            )
+        )
+
+    candidate_plans: list[FactValueConsistencyCandidatePlan] = []
+    for fact_id, fact_items in grouped_by_fact_id.items():
+        distinct_semantic_key_count = len({item.semantic_key_hash for item in fact_items})
+        if distinct_semantic_key_count < 2:
+            continue
+        if not any(
+            left.semantic_key_hash != right.semantic_key_hash and left.source_batch_id != right.source_batch_id
+            for left in fact_items
+            for right in fact_items
+        ):
+            continue
+        ordered_members = tuple(
+            FactValueConsistencyCandidateMemberPlan(
+                fact_value_id=item.fact_value_id,
+                source_batch_id=item.source_batch_id,
+                semantic_key_hash=item.semantic_key_hash,
+            )
+            for item in sorted(
+                fact_items,
+                key=lambda current: (
+                    str(current.fact_value_id),
+                    str(current.source_batch_id),
+                    current.semantic_key_hash,
+                ),
+            )
+        )
+        candidate_plans.append(
+            FactValueConsistencyCandidatePlan(
+                fact_id=fact_id,
+                candidate_kind="multi_value",
+                member_count=len(ordered_members),
+                distinct_semantic_key_count=distinct_semantic_key_count,
+                distinct_batch_count=len({item.source_batch_id for item in fact_items}),
+                members=ordered_members,
+            )
+        )
+
+    candidate_plans = sorted(candidate_plans, key=lambda item: (str(item.fact_id), item.candidate_kind))
+    result_manifest_hash = _hash_canonical_bytes(
+        _canonical_json_bytes(
+            [
+                {
+                    "candidate_kind": candidate_plan.candidate_kind,
+                    "fact_id": str(candidate_plan.fact_id),
+                    "members": [
+                        {
+                            "fact_value_id": str(member.fact_value_id),
+                            "semantic_key_hash": member.semantic_key_hash,
+                            "source_batch_id": str(member.source_batch_id),
+                        }
+                        for member in candidate_plan.members
+                    ],
+                }
+                for candidate_plan in candidate_plans
+            ]
+        ),
+        digest_bytes_by_hash=digest_bytes_by_hash,
+    )
+    return FactValueConsistencyCandidateWritePlan(
+        algorithm_version=algorithm_version,
+        source_duplicate_grouping_algorithm_version=source_algorithm_version,
+        input_manifest_hash=source_duplicate_grouping_application.input_manifest_hash,
+        result_manifest_hash=result_manifest_hash,
+        candidate_count=len(candidate_plans),
+        member_count=sum(candidate.member_count for candidate in candidate_plans),
+        candidates=tuple(candidate_plans),
+    )
+
+
+def _assert_consistency_application_matches_plan(
+    application: FactValueConsistencyCandidateApplicationLedger,
+    *,
+    duplicate_grouping_application_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+    plan: FactValueConsistencyCandidateWritePlan,
+) -> None:
+    if application.duplicate_grouping_application_id != duplicate_grouping_application_id:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+    if application.orchestration_id != orchestration_id:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+    if application.extraction_run_id != extraction_run_id:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+    if application.algorithm_version != plan.algorithm_version:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+    if application.input_manifest_hash != plan.input_manifest_hash:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+    if application.result_manifest_hash != plan.result_manifest_hash:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+    if application.candidate_count != plan.candidate_count:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+    if application.member_count != plan.member_count:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_immutable_ledger_mismatch"
+        )
+
+
+def _build_consistency_candidate_result(
+    application: FactValueConsistencyCandidateApplicationLedger,
+    *,
+    created_new: bool,
+) -> FactValueConsistencyCandidateResult:
+    return FactValueConsistencyCandidateResult(
+        consistency_application_id=application.id,
+        duplicate_grouping_application_id=application.duplicate_grouping_application_id,
+        algorithm_version=application.algorithm_version,
+        candidate_count=application.candidate_count,
+        member_count=application.member_count,
         created_new=created_new,
     )
 
@@ -679,5 +944,281 @@ async def ensure_cross_batch_duplicate_grouping(
     if existing_result is None:
         raise CrossBatchDuplicateGroupingInvariantError(
             "cross_batch_duplicate_grouping_concurrent_ledger_missing"
+        )
+    return existing_result
+
+
+async def _read_existing_consistency_candidate_result(
+    session: AsyncSession,
+    *,
+    duplicate_grouping_application_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+    algorithm_version: str,
+    plan: FactValueConsistencyCandidateWritePlan,
+) -> FactValueConsistencyCandidateResult | None:
+    existing_application = await duplicate_grouping_repository.get_consistency_candidate_application_ledger(
+        session,
+        duplicate_grouping_application_id=duplicate_grouping_application_id,
+        algorithm_version=algorithm_version,
+    )
+    if existing_application is None:
+        return None
+    _assert_consistency_application_matches_plan(
+        existing_application,
+        duplicate_grouping_application_id=duplicate_grouping_application_id,
+        orchestration_id=orchestration_id,
+        extraction_run_id=extraction_run_id,
+        plan=plan,
+    )
+    return _build_consistency_candidate_result(existing_application, created_new=False)
+
+
+async def list_fact_value_consistency_candidate_ledgers(
+    session: AsyncSession,
+    *,
+    consistency_application_id: uuid.UUID,
+) -> tuple[FactValueConsistencyCandidateLedger, ...]:
+    return await duplicate_grouping_repository.list_consistency_candidate_ledgers(
+        session,
+        consistency_application_id=consistency_application_id,
+    )
+
+
+async def list_fact_value_consistency_candidate_member_ledgers(
+    session: AsyncSession,
+    *,
+    consistency_application_id: uuid.UUID,
+) -> tuple[FactValueConsistencyCandidateMemberLedger, ...]:
+    return await duplicate_grouping_repository.list_consistency_candidate_member_ledgers(
+        session,
+        consistency_application_id=consistency_application_id,
+    )
+
+
+async def ensure_cross_batch_multi_value_consistency_candidates(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    duplicate_grouping_application_id: uuid.UUID,
+    algorithm_version: str = CROSS_BATCH_MULTI_VALUE_CANDIDATE_ALGORITHM_VERSION,
+) -> FactValueConsistencyCandidateResult:
+    duplicate_grouping_application_id = _require_consistency_uuid(
+        duplicate_grouping_application_id,
+        field_name="duplicate_grouping_application_id",
+    )
+    algorithm_version = normalize_consistency_candidate_algorithm_version(algorithm_version)
+
+    async with session_factory() as read_session:
+        try:
+            source_application = await duplicate_grouping_repository.get_grouping_application_ledger_by_id(
+                read_session,
+                grouping_application_id=duplicate_grouping_application_id,
+            )
+            if source_application is None:
+                raise FactValueConsistencyCandidateStateError(
+                    "fact_value_consistency_candidate_source_duplicate_grouping_not_found"
+                )
+            state = await duplicate_grouping_repository.get_duplicate_grouping_orchestration_state(
+                read_session,
+                orchestration_id=source_application.orchestration_id,
+            )
+            _validate_run_state(state, orchestration_id=source_application.orchestration_id)
+            if await duplicate_grouping_repository.has_invalid_completed_batch_bindings(
+                read_session,
+                orchestration_id=source_application.orchestration_id,
+            ):
+                raise FactValueConsistencyCandidateInvariantError(
+                    "fact_value_consistency_candidate_completed_batch_binding_mismatch"
+                )
+            candidate_count = await duplicate_grouping_repository.count_duplicate_candidate_fact_values(
+                read_session,
+                orchestration_id=source_application.orchestration_id,
+            )
+            candidates = await duplicate_grouping_repository.list_duplicate_candidates(
+                read_session,
+                orchestration_id=source_application.orchestration_id,
+            )
+            if candidate_count != len(candidates):
+                raise FactValueConsistencyCandidateInvariantError(
+                    "fact_value_consistency_candidate_source_candidate_mismatch"
+                )
+        except duplicate_grouping_repository.DuplicateGroupingRepositoryInvariantError as error:
+            await read_session.rollback()
+            raise FactValueConsistencyCandidateInvariantError(str(error)) from None
+        except CrossBatchDuplicateGroupingError as error:
+            await read_session.rollback()
+            raise FactValueConsistencyCandidateStateError(str(error)) from None
+        except BaseException:
+            await read_session.rollback()
+            raise
+        else:
+            await read_session.rollback()
+
+    write_plan = build_fact_value_consistency_candidate_write_plan(
+        candidates,
+        source_duplicate_grouping_application=source_application,
+        algorithm_version=algorithm_version,
+    )
+
+    async with session_factory() as write_session:
+        try:
+            source_application = await duplicate_grouping_repository.get_grouping_application_ledger_by_id(
+                write_session,
+                grouping_application_id=duplicate_grouping_application_id,
+            )
+            if source_application is None:
+                raise FactValueConsistencyCandidateStateError(
+                    "fact_value_consistency_candidate_source_duplicate_grouping_not_found"
+                )
+            state = await duplicate_grouping_repository.get_duplicate_grouping_orchestration_state(
+                write_session,
+                orchestration_id=source_application.orchestration_id,
+            )
+            _validate_run_state(state, orchestration_id=source_application.orchestration_id)
+            if await duplicate_grouping_repository.has_invalid_completed_batch_bindings(
+                write_session,
+                orchestration_id=source_application.orchestration_id,
+            ):
+                raise FactValueConsistencyCandidateInvariantError(
+                    "fact_value_consistency_candidate_completed_batch_binding_mismatch"
+                )
+
+            existing_application = await duplicate_grouping_repository.get_consistency_candidate_application_for_update(
+                write_session,
+                duplicate_grouping_application_id=duplicate_grouping_application_id,
+                algorithm_version=algorithm_version,
+            )
+            if existing_application is not None:
+                existing_ledger = FactValueConsistencyCandidateApplicationLedger(
+                    id=existing_application.id,
+                    duplicate_grouping_application_id=existing_application.duplicate_grouping_application_id,
+                    orchestration_id=existing_application.orchestration_id,
+                    extraction_run_id=existing_application.extraction_run_id,
+                    algorithm_version=existing_application.algorithm_version,
+                    input_manifest_hash=existing_application.input_manifest_hash,
+                    result_manifest_hash=existing_application.result_manifest_hash,
+                    candidate_count=existing_application.candidate_count,
+                    member_count=existing_application.member_count,
+                    created_at=existing_application.created_at,
+                )
+                _assert_consistency_application_matches_plan(
+                    existing_ledger,
+                    duplicate_grouping_application_id=duplicate_grouping_application_id,
+                    orchestration_id=source_application.orchestration_id,
+                    extraction_run_id=source_application.extraction_run_id,
+                    plan=write_plan,
+                )
+                await write_session.commit()
+                return _build_consistency_candidate_result(existing_ledger, created_new=False)
+
+            application = FactValueConsistencyCandidateApplication(
+                id=uuid.uuid4(),
+                duplicate_grouping_application_id=duplicate_grouping_application_id,
+                orchestration_id=source_application.orchestration_id,
+                extraction_run_id=source_application.extraction_run_id,
+                algorithm_version=algorithm_version,
+                input_manifest_hash=write_plan.input_manifest_hash,
+                result_manifest_hash=write_plan.result_manifest_hash,
+                candidate_count=write_plan.candidate_count,
+                member_count=write_plan.member_count,
+            )
+            await duplicate_grouping_repository.create_consistency_candidate_application(
+                write_session,
+                application,
+            )
+
+            candidate_rows: list[FactValueConsistencyCandidate] = []
+            candidate_id_by_fact_id: dict[uuid.UUID, uuid.UUID] = {}
+            for candidate_plan in write_plan.candidates:
+                candidate_id = uuid.uuid4()
+                candidate_id_by_fact_id[candidate_plan.fact_id] = candidate_id
+                candidate_rows.append(
+                    FactValueConsistencyCandidate(
+                        id=candidate_id,
+                        consistency_application_id=application.id,
+                        fact_id=candidate_plan.fact_id,
+                        candidate_kind=candidate_plan.candidate_kind,
+                        member_count=candidate_plan.member_count,
+                        distinct_semantic_key_count=candidate_plan.distinct_semantic_key_count,
+                        distinct_batch_count=candidate_plan.distinct_batch_count,
+                    )
+                )
+            if candidate_rows:
+                await duplicate_grouping_repository.create_consistency_candidates(
+                    write_session,
+                    candidate_rows,
+                )
+
+            member_rows: list[FactValueConsistencyCandidateMember] = []
+            for candidate_plan in write_plan.candidates:
+                candidate_id = candidate_id_by_fact_id[candidate_plan.fact_id]
+                for member_plan in candidate_plan.members:
+                    member_rows.append(
+                        FactValueConsistencyCandidateMember(
+                            id=uuid.uuid4(),
+                            consistency_application_id=application.id,
+                            candidate_id=candidate_id,
+                            orchestration_id=application.orchestration_id,
+                            fact_value_id=member_plan.fact_value_id,
+                            source_batch_id=member_plan.source_batch_id,
+                            semantic_key_hash=member_plan.semantic_key_hash,
+                        )
+                    )
+            if member_rows:
+                await duplicate_grouping_repository.create_consistency_candidate_members(
+                    write_session,
+                    member_rows,
+                )
+
+            if len(candidate_rows) != write_plan.candidate_count:
+                raise FactValueConsistencyCandidateInvariantError(
+                    "fact_value_consistency_candidate_write_count_mismatch"
+                )
+            if len(member_rows) != write_plan.member_count:
+                raise FactValueConsistencyCandidateInvariantError(
+                    "fact_value_consistency_candidate_write_count_mismatch"
+                )
+
+            await write_session.commit()
+            application_ledger = FactValueConsistencyCandidateApplicationLedger(
+                id=application.id,
+                duplicate_grouping_application_id=application.duplicate_grouping_application_id,
+                orchestration_id=application.orchestration_id,
+                extraction_run_id=application.extraction_run_id,
+                algorithm_version=application.algorithm_version,
+                input_manifest_hash=application.input_manifest_hash,
+                result_manifest_hash=application.result_manifest_hash,
+                candidate_count=application.candidate_count,
+                member_count=application.member_count,
+                created_at=application.created_at,
+            )
+            return _build_consistency_candidate_result(application_ledger, created_new=True)
+        except IntegrityError as error:
+            constraint_name = _get_integrity_constraint_name(error)
+            await write_session.rollback()
+            if constraint_name != _CONSISTENCY_APPLICATION_UNIQUE_CONSTRAINT:
+                raise
+        except BaseException:
+            await write_session.rollback()
+            raise
+
+    async with session_factory() as read_session:
+        try:
+            existing_result = await _read_existing_consistency_candidate_result(
+                read_session,
+                duplicate_grouping_application_id=duplicate_grouping_application_id,
+                orchestration_id=source_application.orchestration_id,
+                extraction_run_id=source_application.extraction_run_id,
+                algorithm_version=algorithm_version,
+                plan=write_plan,
+            )
+        except BaseException:
+            await read_session.rollback()
+            raise
+        else:
+            await read_session.rollback()
+    if existing_result is None:
+        raise FactValueConsistencyCandidateInvariantError(
+            "fact_value_consistency_candidate_concurrent_ledger_missing"
         )
     return existing_result

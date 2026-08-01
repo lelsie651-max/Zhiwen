@@ -23,7 +23,7 @@ def test_single_migration_head_includes_entity_models() -> None:
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
 
-    assert list(script.get_heads()) == ["202608010200"]
+    assert list(script.get_heads()) == ["202608010300"]
 
 
 def test_entity_status_columns_use_string_and_check_not_native_enum() -> None:

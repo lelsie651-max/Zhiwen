@@ -14,6 +14,9 @@ from app.models.entity import Entity
 from app.models.fact import Fact, FactEvidenceLink, FactValue
 from app.models.fact_extraction_orchestration import FactExtractionOrchestration
 from app.models.fact_value_duplicate_grouping import (
+    FactValueConsistencyCandidate,
+    FactValueConsistencyCandidateApplication,
+    FactValueConsistencyCandidateMember,
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
     FactValueDuplicateGroupingApplication,
@@ -31,6 +34,9 @@ def test_duplicate_grouping_tables_are_registered() -> None:
         "fact_value_duplicate_grouping_applications",
         "fact_value_duplicate_groups",
         "fact_value_duplicate_group_members",
+        "fact_value_consistency_candidate_applications",
+        "fact_value_consistency_candidates",
+        "fact_value_consistency_candidate_members",
     } <= set(Base.metadata.tables)
 
 
@@ -518,6 +524,7 @@ def test_fact_migrations_include_inference_provenance_followup() -> None:
         "202607312230_orchestration_recovery_hardening.py",
         "202608010100_fact_value_duplicate_grouping.py",
         "202608010200_duplicate_grouping_orchestration_scope.py",
+        "202608010300_fact_value_consistency_candidates.py",
     ]
     fact_migrations = sorted(
         path.name
@@ -540,7 +547,7 @@ def test_full_alembic_upgrade_head_sql_generates_to_current_head() -> None:
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert "-- Running upgrade 202607310330 -> 202607311030" in result.stdout
-    assert "-- Running upgrade 202608010100 -> 202608010200" in result.stdout
+    assert "-- Running upgrade 202608010200 -> 202608010300" in result.stdout
     assert "INSERT INTO alembic_version" in result.stdout
 
 
@@ -553,6 +560,9 @@ def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
     dupgrp_app_sql = str(CreateTable(FactValueDuplicateGroupingApplication.__table__).compile(dialect=dialect))
     dupgrp_group_sql = str(CreateTable(FactValueDuplicateGroup.__table__).compile(dialect=dialect))
     dupgrp_member_sql = str(CreateTable(FactValueDuplicateGroupMember.__table__).compile(dialect=dialect))
+    consistency_app_sql = str(CreateTable(FactValueConsistencyCandidateApplication.__table__).compile(dialect=dialect))
+    consistency_candidate_sql = str(CreateTable(FactValueConsistencyCandidate.__table__).compile(dialect=dialect))
+    consistency_member_sql = str(CreateTable(FactValueConsistencyCandidateMember.__table__).compile(dialect=dialect))
 
     assert "uq_feo_id_extraction_run" in orchestration_sql
     assert "subject_entity_id" in facts_sql
@@ -567,6 +577,13 @@ def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:
     assert "fk_dupgrp_member_group_id_grouping_application_id_dupgrp_group" in dupgrp_member_sql
     assert "fk_dupgrp_member_app_orch_dupgrp_app" in dupgrp_member_sql
     assert "fk_dupgrp_member_batch_orch_feob" in dupgrp_member_sql
+    assert "uq_fvcca_dupgrp_alg" in consistency_app_sql
+    assert "fk_fvcca_dupgrp_app_orch" in consistency_app_sql
+    assert "fk_fvcca_orch_run_feo" in consistency_app_sql
+    assert "uq_fvcc_app_fact_kind" in consistency_candidate_sql
+    assert "fk_fvccm_cand_app_fvcc" in consistency_member_sql
+    assert "fk_fvccm_app_orch_fvcca" in consistency_member_sql
+    assert "fk_fvccm_batch_orch_feob" in consistency_member_sql
 
 
 def test_duplicate_grouping_application_metadata_uses_composite_orchestration_fk() -> None:
@@ -595,6 +612,61 @@ def test_duplicate_grouping_application_metadata_uses_composite_orchestration_fk
         "RESTRICT",
     )
     assert ("orchestration_id",) not in app_foreign_keys
+
+
+def test_consistency_candidate_metadata_uses_application_and_batch_composite_foreign_keys() -> None:
+    app_table = Base.metadata.tables["fact_value_consistency_candidate_applications"]
+    candidate_table = Base.metadata.tables["fact_value_consistency_candidates"]
+    member_table = Base.metadata.tables["fact_value_consistency_candidate_members"]
+
+    app_foreign_keys = {
+        tuple(constraint.column_keys): (
+            constraint.name,
+            tuple(element.column.name for element in constraint.elements),
+            constraint.ondelete,
+        )
+        for constraint in app_table.foreign_key_constraints
+    }
+    candidate_uniques = {
+        tuple(constraint.columns.keys()): constraint.name
+        for constraint in candidate_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    member_foreign_keys = {
+        tuple(constraint.column_keys): (
+            constraint.name,
+            tuple(element.column.name for element in constraint.elements),
+            constraint.ondelete,
+        )
+        for constraint in member_table.foreign_key_constraints
+    }
+
+    assert app_foreign_keys[("duplicate_grouping_application_id", "orchestration_id")] == (
+        "fk_fvcca_dupgrp_app_orch",
+        ("id", "orchestration_id"),
+        "RESTRICT",
+    )
+    assert app_foreign_keys[("orchestration_id", "extraction_run_id")] == (
+        "fk_fvcca_orch_run_feo",
+        ("id", "extraction_run_id"),
+        "RESTRICT",
+    )
+    assert candidate_uniques[("consistency_application_id", "fact_id", "candidate_kind")] == "uq_fvcc_app_fact_kind"
+    assert member_foreign_keys[("candidate_id", "consistency_application_id")] == (
+        "fk_fvccm_cand_app_fvcc",
+        ("id", "consistency_application_id"),
+        "RESTRICT",
+    )
+    assert member_foreign_keys[("consistency_application_id", "orchestration_id")] == (
+        "fk_fvccm_app_orch_fvcca",
+        ("id", "orchestration_id"),
+        "RESTRICT",
+    )
+    assert member_foreign_keys[("source_batch_id", "orchestration_id")] == (
+        "fk_fvccm_batch_orch_feob",
+        ("id", "orchestration_id"),
+        "RESTRICT",
+    )
 
 
 def test_duplicate_grouping_v1_migration_adds_tables_constraints_and_indexes() -> None:
@@ -683,3 +755,45 @@ def test_duplicate_grouping_v2_scope_migration_downgrade_fails_closed_when_run_s
     )
     assert 'op.drop_column("fact_value_duplicate_group_members", "orchestration_id")' in content
     assert 'op.drop_column("fact_value_duplicate_grouping_applications", "orchestration_id")' in content
+
+
+def test_consistency_candidate_migration_adds_tables_constraints_and_indexes() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202608010300_fact_value_consistency_candidates.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert 'down_revision: str | None = "202608010200"' in content
+    assert '"fact_value_consistency_candidate_applications"' in content
+    assert '"fact_value_consistency_candidates"' in content
+    assert '"fact_value_consistency_candidate_members"' in content
+    assert '"uq_fvcca_dupgrp_alg"' in content
+    assert '"uq_fvcc_app_fact_kind"' in content
+    assert '"uq_fvccm_app_fv"' in content
+    assert '"fk_fvcca_dupgrp_app_orch"' in content
+    assert '"fk_fvcca_orch_run_feo"' in content
+    assert '"fk_fvccm_cand_app_fvcc"' in content
+    assert '"fk_fvccm_app_orch_fvcca"' in content
+    assert '"fk_fvccm_batch_orch_feob"' in content
+    assert '"ix_fvcca_orchestration_id"' in content
+    assert '"ix_fvccm_orchestration_id"' in content
+
+
+def test_consistency_candidate_migration_downgrade_drops_tables_in_dependency_order() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "202608010300_fact_value_consistency_candidates.py"
+    )
+    content = migration_path.read_text(encoding="utf-8")
+
+    assert content.index('op.drop_table("fact_value_consistency_candidate_members")') < content.index(
+        'op.drop_table("fact_value_consistency_candidates")'
+    )
+    assert content.index('op.drop_table("fact_value_consistency_candidates")') < content.index(
+        'op.drop_table("fact_value_consistency_candidate_applications")'
+    )

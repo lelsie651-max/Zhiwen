@@ -62,6 +62,7 @@ from app.schemas.fact_extraction_orchestration import (
 )
 from app.schemas.fact_value_duplicate_grouping import (
     CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION,
+    CROSS_BATCH_MULTI_VALUE_CANDIDATE_ALGORITHM_VERSION,
     DuplicateCandidate,
     DuplicateFingerprint,
     DuplicateGroupEvidenceProjection,
@@ -72,6 +73,13 @@ from app.schemas.fact_value_duplicate_grouping import (
     DuplicateGroupingApplicationLedger,
     DuplicateGroupingResult,
     DuplicateGroupingWritePlan,
+    FactValueConsistencyCandidateApplicationLedger,
+    FactValueConsistencyCandidateLedger,
+    FactValueConsistencyCandidateMemberLedger,
+    FactValueConsistencyCandidateMemberPlan,
+    FactValueConsistencyCandidatePlan,
+    FactValueConsistencyCandidateResult,
+    FactValueConsistencyCandidateWritePlan,
 )
 from app.schemas.fact_commands import (
     AIProposalInput,
@@ -173,6 +181,7 @@ __all__ = [
     "StaleInferenceRecoveryStatus",
     "StaleInferenceRecoveryResult",
     "CROSS_BATCH_DUPLICATE_ALGORITHM_VERSION",
+    "CROSS_BATCH_MULTI_VALUE_CANDIDATE_ALGORITHM_VERSION",
     "DuplicateCandidate",
     "DuplicateFingerprint",
     "DuplicateGroupMemberPlan",
@@ -183,6 +192,13 @@ __all__ = [
     "DuplicateGroupMemberLedger",
     "DuplicateGroupEvidenceProjection",
     "DuplicateGroupingResult",
+    "FactValueConsistencyCandidateMemberPlan",
+    "FactValueConsistencyCandidatePlan",
+    "FactValueConsistencyCandidateWritePlan",
+    "FactValueConsistencyCandidateApplicationLedger",
+    "FactValueConsistencyCandidateLedger",
+    "FactValueConsistencyCandidateMemberLedger",
+    "FactValueConsistencyCandidateResult",
     "ExtractionOutcome",
     "ExtractedBlockType",
     "ExtractedBlock",

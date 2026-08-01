@@ -37,6 +37,9 @@ from app.models.fact import (
 )
 from app.models.fact_extraction_application import FactExtractionBatchApplication
 from app.models.fact_value_duplicate_grouping import (
+    FactValueConsistencyCandidate,
+    FactValueConsistencyCandidateApplication,
+    FactValueConsistencyCandidateMember,
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
     FactValueDuplicateGroupingApplication,
@@ -121,6 +124,9 @@ __all__ = [
     "FactValueDuplicateGroupingApplication",
     "FactValueDuplicateGroup",
     "FactValueDuplicateGroupMember",
+    "FactValueConsistencyCandidateApplication",
+    "FactValueConsistencyCandidate",
+    "FactValueConsistencyCandidateMember",
     "FactExtractionOrchestration",
     "FactExtractionOrchestrationBatch",
     "Document",

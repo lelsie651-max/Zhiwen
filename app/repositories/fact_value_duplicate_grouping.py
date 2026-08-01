@@ -17,6 +17,9 @@ from app.models.fact_extraction_orchestration import (
     FactExtractionOrchestrationBatch,
 )
 from app.models.fact_value_duplicate_grouping import (
+    FactValueConsistencyCandidate,
+    FactValueConsistencyCandidateApplication,
+    FactValueConsistencyCandidateMember,
     FactValueDuplicateGroup,
     FactValueDuplicateGroupMember,
     FactValueDuplicateGroupingApplication,
@@ -27,6 +30,9 @@ from app.schemas.fact_value_duplicate_grouping import (
     DuplicateGroupLedger,
     DuplicateGroupMemberLedger,
     DuplicateGroupingApplicationLedger,
+    FactValueConsistencyCandidateApplicationLedger,
+    FactValueConsistencyCandidateLedger,
+    FactValueConsistencyCandidateMemberLedger,
 )
 
 
@@ -302,6 +308,33 @@ async def get_grouping_application_ledger(
     )
 
 
+async def get_grouping_application_ledger_by_id(
+    session: AsyncSession,
+    *,
+    grouping_application_id: uuid.UUID,
+) -> DuplicateGroupingApplicationLedger | None:
+    result = await session.execute(
+        select(FactValueDuplicateGroupingApplication).where(
+            FactValueDuplicateGroupingApplication.id == grouping_application_id,
+        )
+    )
+    application = result.scalar_one_or_none()
+    if application is None:
+        return None
+    return DuplicateGroupingApplicationLedger(
+        id=application.id,
+        orchestration_id=application.orchestration_id,
+        extraction_run_id=application.extraction_run_id,
+        algorithm_version=application.algorithm_version,
+        input_manifest_hash=application.input_manifest_hash,
+        result_manifest_hash=application.result_manifest_hash,
+        input_fact_value_count=application.input_fact_value_count,
+        duplicate_group_count=application.duplicate_group_count,
+        duplicate_member_count=application.duplicate_member_count,
+        created_at=application.created_at,
+    )
+
+
 async def list_group_ledgers(
     session: AsyncSession,
     *,
@@ -461,6 +494,140 @@ async def create_duplicate_group_members(
     session: AsyncSession,
     members: list[FactValueDuplicateGroupMember],
 ) -> list[FactValueDuplicateGroupMember]:
+    session.add_all(members)
+    await session.flush()
+    return members
+
+
+async def get_consistency_candidate_application_for_update(
+    session: AsyncSession,
+    *,
+    duplicate_grouping_application_id: uuid.UUID,
+    algorithm_version: str,
+) -> FactValueConsistencyCandidateApplication | None:
+    result = await session.execute(
+        select(FactValueConsistencyCandidateApplication)
+        .where(
+            FactValueConsistencyCandidateApplication.duplicate_grouping_application_id
+            == duplicate_grouping_application_id,
+            FactValueConsistencyCandidateApplication.algorithm_version == algorithm_version,
+        )
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_consistency_candidate_application_ledger(
+    session: AsyncSession,
+    *,
+    duplicate_grouping_application_id: uuid.UUID,
+    algorithm_version: str,
+) -> FactValueConsistencyCandidateApplicationLedger | None:
+    result = await session.execute(
+        select(FactValueConsistencyCandidateApplication).where(
+            FactValueConsistencyCandidateApplication.duplicate_grouping_application_id
+            == duplicate_grouping_application_id,
+            FactValueConsistencyCandidateApplication.algorithm_version == algorithm_version,
+        )
+    )
+    application = result.scalar_one_or_none()
+    if application is None:
+        return None
+    return FactValueConsistencyCandidateApplicationLedger(
+        id=application.id,
+        duplicate_grouping_application_id=application.duplicate_grouping_application_id,
+        orchestration_id=application.orchestration_id,
+        extraction_run_id=application.extraction_run_id,
+        algorithm_version=application.algorithm_version,
+        input_manifest_hash=application.input_manifest_hash,
+        result_manifest_hash=application.result_manifest_hash,
+        candidate_count=application.candidate_count,
+        member_count=application.member_count,
+        created_at=application.created_at,
+    )
+
+
+async def list_consistency_candidate_ledgers(
+    session: AsyncSession,
+    *,
+    consistency_application_id: uuid.UUID,
+) -> tuple[FactValueConsistencyCandidateLedger, ...]:
+    result = await session.execute(
+        select(FactValueConsistencyCandidate)
+        .where(FactValueConsistencyCandidate.consistency_application_id == consistency_application_id)
+        .order_by(
+            FactValueConsistencyCandidate.fact_id.asc(),
+            FactValueConsistencyCandidate.candidate_kind.asc(),
+            FactValueConsistencyCandidate.id.asc(),
+        )
+    )
+    candidates = list(result.scalars().all())
+    return tuple(
+        FactValueConsistencyCandidateLedger(
+            id=item.id,
+            consistency_application_id=item.consistency_application_id,
+            fact_id=item.fact_id,
+            candidate_kind=item.candidate_kind,
+            member_count=item.member_count,
+            distinct_semantic_key_count=item.distinct_semantic_key_count,
+            distinct_batch_count=item.distinct_batch_count,
+            created_at=item.created_at,
+        )
+        for item in candidates
+    )
+
+
+async def list_consistency_candidate_member_ledgers(
+    session: AsyncSession,
+    *,
+    consistency_application_id: uuid.UUID,
+) -> tuple[FactValueConsistencyCandidateMemberLedger, ...]:
+    result = await session.execute(
+        select(FactValueConsistencyCandidateMember)
+        .where(FactValueConsistencyCandidateMember.consistency_application_id == consistency_application_id)
+        .order_by(
+            FactValueConsistencyCandidateMember.candidate_id.asc(),
+            FactValueConsistencyCandidateMember.fact_value_id.asc(),
+        )
+    )
+    members = list(result.scalars().all())
+    return tuple(
+        FactValueConsistencyCandidateMemberLedger(
+            id=item.id,
+            consistency_application_id=item.consistency_application_id,
+            candidate_id=item.candidate_id,
+            orchestration_id=item.orchestration_id,
+            fact_value_id=item.fact_value_id,
+            source_batch_id=item.source_batch_id,
+            semantic_key_hash=item.semantic_key_hash,
+            created_at=item.created_at,
+        )
+        for item in members
+    )
+
+
+async def create_consistency_candidate_application(
+    session: AsyncSession,
+    application: FactValueConsistencyCandidateApplication,
+) -> FactValueConsistencyCandidateApplication:
+    session.add(application)
+    await session.flush()
+    return application
+
+
+async def create_consistency_candidates(
+    session: AsyncSession,
+    candidates: list[FactValueConsistencyCandidate],
+) -> list[FactValueConsistencyCandidate]:
+    session.add_all(candidates)
+    await session.flush()
+    return candidates
+
+
+async def create_consistency_candidate_members(
+    session: AsyncSession,
+    members: list[FactValueConsistencyCandidateMember],
+) -> list[FactValueConsistencyCandidateMember]:
     session.add_all(members)
     await session.flush()
     return members
