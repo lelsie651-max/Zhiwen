@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import replace
-
 import pytest
 
 from app.agents.prompt_registry import get_prompt
@@ -167,8 +165,8 @@ def test_run_consistency_check_workflow_calls_build_execute_persist_in_order(
         requested_model,
     ):
         assert _session_factory is session_factory
-        assert project_id == plan.project_id
-        assert plan == plan
+        assert project_id == expected_plan.project_id
+        assert plan == expected_plan
         assert prompt == PROMPT
         assert provider == "openai"
         assert requested_model == "gpt-4.1"
@@ -185,14 +183,16 @@ def test_run_consistency_check_workflow_calls_build_execute_persist_in_order(
         requested_model,
     ):
         assert _session_factory is session_factory
-        assert plan == plan
-        assert execution_result == execution_result
+        assert plan == expected_plan
+        assert execution_result == expected_execution_result
         assert prompt == PROMPT
         assert provider == "openai"
         assert requested_model == "gpt-4.1"
         call_order.append("persist")
         return persistence_result
 
+    expected_plan = plan
+    expected_execution_result = execution_result
     monkeypatch.setattr(workflow_service.consistency_check_service, "build_consistency_check_plan", fake_build)
     monkeypatch.setattr(workflow_service.execution_service, "execute_consistency_check_plan", fake_execute)
     monkeypatch.setattr(
