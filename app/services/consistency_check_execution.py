@@ -23,13 +23,17 @@ from app.agents.consistency_check import (
 from app.agents.prompt_registry import PromptDefinition
 from app.models.inference import InferenceRun, InferenceRunStatus, InferenceTaskType
 from app.repositories import inference as inference_repository
-from app.schemas.agent_consistency_check import ConsistencyCheckResponse
+from app.schemas.agent_consistency_check import (
+    ConsistencyCheckAssessment,
+    ConsistencyCheckResponse,
+)
 from app.schemas.consistency_check import (
     ConsistencyCheckBatchPlan,
     ConsistencyCheckPlan,
 )
 from app.schemas.consistency_check_execution import (
     ConsistencyCheckBatchExecutionResult,
+    ConsistencyCheckPlanExecutionResult,
     InferenceInputBlockSnapshot,
     MaterializedConsistencyCheckBatch,
 )
@@ -37,6 +41,7 @@ from app.services.consistency_check import (
     ConsistencyCheckPlanError,
     build_consistency_check_plan,
 )
+from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
 from app.services.inference import (
     claim_inference_run_for_execution,
     complete_inference_run,
@@ -298,6 +303,24 @@ def _build_message_content_hash(messages: Sequence[Any]) -> str:
     )
 
 
+def _assessment_manifest_payload(
+    assessment: ConsistencyCheckAssessment,
+) -> dict[str, Any]:
+    return {
+        "candidate_id": str(assessment.candidate_id),
+        "verdict": assessment.verdict,
+        "severity": assessment.severity,
+        "confidence": assessment.confidence,
+        "explanation": assessment.explanation,
+        "cited_evidence_link_ids": [
+            str(evidence_link_id)
+            for evidence_link_id in assessment.cited_evidence_link_ids
+        ],
+        "impact": list(assessment.impact),
+        "recommended_actions": list(assessment.recommended_actions),
+    }
+
+
 def _build_request_metadata(
     *,
     plan: ConsistencyCheckPlan,
@@ -321,6 +344,14 @@ def _build_request_metadata(
     }
 
 
+def _raise_batch_result_validation_error() -> None:
+    raise ConsistencyCheckExecutionError("consistency_check_plan_batch_result_invalid")
+
+
+def _raise_plan_result_validation_error() -> None:
+    raise ConsistencyCheckExecutionError("consistency_check_plan_result_invalid")
+
+
 def _capture_run_snapshot(run: InferenceRun) -> _InferenceRunSnapshot:
     return _InferenceRunSnapshot(
         run_id=run.id,
@@ -332,6 +363,171 @@ def _capture_run_snapshot(run: InferenceRun) -> _InferenceRunSnapshot:
         prompt_tokens=run.prompt_tokens,
         completion_tokens=run.completion_tokens,
         total_tokens=run.total_tokens,
+    )
+
+
+def _validate_and_order_batch_result(
+    *,
+    authoritative_plan: ConsistencyCheckPlan,
+    batch: ConsistencyCheckBatchPlan,
+    result: ConsistencyCheckBatchExecutionResult,
+) -> tuple[ConsistencyCheckAssessment, ...]:
+    if result.project_id != authoritative_plan.project_id:
+        _raise_batch_result_validation_error()
+    if result.consistency_application_id != authoritative_plan.consistency_application_id:
+        _raise_batch_result_validation_error()
+    if result.source_result_manifest_hash != authoritative_plan.source_result_manifest_hash:
+        _raise_batch_result_validation_error()
+    if result.plan_manifest_hash != authoritative_plan.plan_manifest_hash:
+        _raise_batch_result_validation_error()
+    if result.batch_index != batch.batch_index:
+        _raise_batch_result_validation_error()
+    if result.batch_manifest_hash != batch.batch_manifest_hash:
+        _raise_batch_result_validation_error()
+
+    assessments = tuple(result.response.assessments)
+    if batch.candidate_count == 0:
+        if not result.skipped_empty:
+            _raise_batch_result_validation_error()
+        if result.input_batch_id is not None:
+            _raise_batch_result_validation_error()
+        if result.inference_run_id is not None:
+            _raise_batch_result_validation_error()
+        if result.request_hash is not None:
+            _raise_batch_result_validation_error()
+        if result.message_content_hash is not None:
+            _raise_batch_result_validation_error()
+        if assessments:
+            _raise_batch_result_validation_error()
+        return ()
+
+    if result.skipped_empty:
+        _raise_batch_result_validation_error()
+    if result.input_batch_id is None:
+        _raise_batch_result_validation_error()
+    if result.inference_run_id is None:
+        _raise_batch_result_validation_error()
+    if result.request_hash is None:
+        _raise_batch_result_validation_error()
+    if result.message_content_hash is None:
+        _raise_batch_result_validation_error()
+
+    assessment_by_candidate_id: dict[uuid.UUID, ConsistencyCheckAssessment] = {}
+    for assessment in assessments:
+        if assessment.candidate_id in assessment_by_candidate_id:
+            _raise_batch_result_validation_error()
+        assessment_by_candidate_id[assessment.candidate_id] = assessment
+    if tuple(assessment_by_candidate_id) != tuple(dict.fromkeys(assessment_by_candidate_id)):
+        _raise_batch_result_validation_error()
+
+    expected_candidate_ids = batch.candidate_ids
+    if set(assessment_by_candidate_id) != set(expected_candidate_ids):
+        _raise_batch_result_validation_error()
+    return tuple(assessment_by_candidate_id[candidate_id] for candidate_id in expected_candidate_ids)
+
+
+def _build_plan_result_manifest_hash(
+    *,
+    authoritative_plan: ConsistencyCheckPlan,
+    ordered_batch_results: Sequence[ConsistencyCheckBatchExecutionResult],
+    ordered_assessments_by_batch: Sequence[Sequence[ConsistencyCheckAssessment]],
+) -> str:
+    return duplicate_grouping_service.hash_deterministic_payload(
+        {
+            "project_id": str(authoritative_plan.project_id),
+            "consistency_application_id": str(authoritative_plan.consistency_application_id),
+            "source_result_manifest_hash": authoritative_plan.source_result_manifest_hash,
+            "plan_manifest_hash": authoritative_plan.plan_manifest_hash,
+            "batches": [
+                {
+                    "batch_index": batch_result.batch_index,
+                    "batch_manifest_hash": batch_result.batch_manifest_hash,
+                    "skipped_empty": batch_result.skipped_empty,
+                    "input_batch_id": (
+                        None
+                        if batch_result.input_batch_id is None
+                        else str(batch_result.input_batch_id)
+                    ),
+                    "inference_run_id": (
+                        None
+                        if batch_result.inference_run_id is None
+                        else str(batch_result.inference_run_id)
+                    ),
+                    "request_hash": batch_result.request_hash,
+                    "message_content_hash": batch_result.message_content_hash,
+                    "assessments": [
+                        _assessment_manifest_payload(assessment)
+                        for assessment in batch_assessments
+                    ],
+                }
+                for batch_result, batch_assessments in zip(
+                    ordered_batch_results,
+                    ordered_assessments_by_batch,
+                    strict=True,
+                )
+            ],
+        }
+    )
+
+
+def _build_plan_execution_result(
+    *,
+    authoritative_plan: ConsistencyCheckPlan,
+    ordered_batch_results: Sequence[ConsistencyCheckBatchExecutionResult],
+    ordered_assessments_by_batch: Sequence[Sequence[ConsistencyCheckAssessment]],
+) -> ConsistencyCheckPlanExecutionResult:
+    batch_count = len(authoritative_plan.batches)
+    executed_batch_count = len(ordered_batch_results)
+    skipped_empty_batch_count = sum(
+        1 for batch_result in ordered_batch_results if batch_result.skipped_empty
+    )
+    inference_run_ids = tuple(
+        batch_result.inference_run_id
+        for batch_result in ordered_batch_results
+    )
+    flattened_assessments: list[ConsistencyCheckAssessment] = []
+    seen_candidate_ids: set[uuid.UUID] = set()
+    for batch, batch_assessments in zip(
+        authoritative_plan.batches,
+        ordered_assessments_by_batch,
+        strict=True,
+    ):
+        if batch.candidate_count != len(batch_assessments):
+            _raise_plan_result_validation_error()
+        for expected_candidate_id, assessment in zip(
+            batch.candidate_ids,
+            batch_assessments,
+            strict=True,
+        ):
+            if assessment.candidate_id != expected_candidate_id:
+                _raise_plan_result_validation_error()
+            if assessment.candidate_id in seen_candidate_ids:
+                _raise_plan_result_validation_error()
+            seen_candidate_ids.add(assessment.candidate_id)
+            flattened_assessments.append(assessment)
+    expected_candidate_ids = tuple(
+        candidate.candidate_id
+        for batch in authoritative_plan.batches
+        for candidate in batch.candidates
+    )
+    if tuple(assessment.candidate_id for assessment in flattened_assessments) != expected_candidate_ids:
+        _raise_plan_result_validation_error()
+    result_manifest_hash = _build_plan_result_manifest_hash(
+        authoritative_plan=authoritative_plan,
+        ordered_batch_results=ordered_batch_results,
+        ordered_assessments_by_batch=ordered_assessments_by_batch,
+    )
+    return ConsistencyCheckPlanExecutionResult(
+        project_id=authoritative_plan.project_id,
+        consistency_application_id=authoritative_plan.consistency_application_id,
+        source_result_manifest_hash=authoritative_plan.source_result_manifest_hash,
+        plan_manifest_hash=authoritative_plan.plan_manifest_hash,
+        batch_count=batch_count,
+        executed_batch_count=executed_batch_count,
+        skipped_empty_batch_count=skipped_empty_batch_count,
+        inference_run_ids=inference_run_ids,
+        assessments=tuple(flattened_assessments),
+        result_manifest_hash=result_manifest_hash,
     )
 
 
@@ -695,3 +891,61 @@ async def execute_consistency_check_batch(
                 failure_code=classify_consistency_check_batch_failure(error),
             )
         raise
+
+
+async def execute_consistency_check_plan(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    project_id: uuid.UUID,
+    plan: ConsistencyCheckPlan,
+    prompt: PromptDefinition,
+    llm_client: LLMClient,
+    provider: str,
+    requested_model: str,
+) -> ConsistencyCheckPlanExecutionResult:
+    _require_uuid_instance(project_id, field_name="project_id")
+    provided_plan = _require_plan(plan)
+    validate_consistency_check_prompt(prompt)
+
+    authoritative_plan = await build_consistency_check_plan(
+        session_factory,
+        consistency_application_id=provided_plan.consistency_application_id,
+        config=provided_plan.config,
+    )
+    for batch in authoritative_plan.batches:
+        validate_consistency_check_batch_plan(plan=authoritative_plan, batch=batch)
+    for batch in provided_plan.batches:
+        validate_consistency_check_batch_plan(plan=provided_plan, batch=batch)
+
+    if provided_plan != authoritative_plan:
+        raise ConsistencyCheckPlanMismatchError("consistency_check_execution_plan_mismatch")
+    if project_id != authoritative_plan.project_id:
+        raise ConsistencyCheckExecutionError("consistency_check_execution_project_id_mismatch")
+
+    ordered_batch_results: list[ConsistencyCheckBatchExecutionResult] = []
+    ordered_assessments_by_batch: list[tuple[ConsistencyCheckAssessment, ...]] = []
+    for batch in authoritative_plan.batches:
+        batch_result = await execute_consistency_check_batch(
+            session_factory,
+            project_id=authoritative_plan.project_id,
+            plan=authoritative_plan,
+            batch_index=batch.batch_index,
+            prompt=prompt,
+            llm_client=llm_client,
+            provider=provider,
+            requested_model=requested_model,
+        )
+        ordered_batch_results.append(batch_result)
+        ordered_assessments_by_batch.append(
+            _validate_and_order_batch_result(
+                authoritative_plan=authoritative_plan,
+                batch=batch,
+                result=batch_result,
+            )
+        )
+
+    return _build_plan_execution_result(
+        authoritative_plan=authoritative_plan,
+        ordered_batch_results=ordered_batch_results,
+        ordered_assessments_by_batch=ordered_assessments_by_batch,
+    )

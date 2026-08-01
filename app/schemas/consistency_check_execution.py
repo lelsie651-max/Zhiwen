@@ -5,7 +5,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from app.schemas.agent_consistency_check import ConsistencyCheckResponse
+from app.schemas.agent_consistency_check import (
+    ConsistencyCheckAssessment,
+    ConsistencyCheckResponse,
+)
 
 
 class InferenceInputBlockSnapshot(BaseModel):
@@ -65,6 +68,26 @@ class ConsistencyCheckBatchExecutionResult(BaseModel):
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+
+class ConsistencyCheckPlanExecutionResult(BaseModel):
+    project_id: uuid.UUID
+    consistency_application_id: uuid.UUID
+    source_result_manifest_hash: str
+    plan_manifest_hash: str
+
+    batch_count: int
+    executed_batch_count: int
+    skipped_empty_batch_count: int
+
+    inference_run_ids: tuple[uuid.UUID | None, ...]
+    assessments: tuple[ConsistencyCheckAssessment, ...]
+    result_manifest_hash: str
 
     model_config = ConfigDict(
         frozen=True,
