@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 import uuid
 
 import pytest
@@ -419,6 +420,12 @@ def test_fact_value_inference_provenance_migration_adds_fk_and_constraints() -> 
     assert 'op.f("fk_fact_values_inference_run_id_inference_runs")' in content
     assert "Cannot add fact_value inference provenance" in content
     assert "explicit inference_run_id backfill" in content
+    assert "DO $$" in content
+    assert "IF EXISTS (" in content
+    assert "source_kind = 'ai'" in content
+    assert "op.get_bind()" not in content
+    assert ".scalar_one()" not in content
+    assert "latest" not in content
     assert "extraction_run_id IS NOT NULL AND inference_run_id IS NOT NULL" in content
     assert "source_kind = 'ai' OR inference_run_id IS NULL" in content
 
@@ -438,6 +445,30 @@ def test_fact_value_inference_provenance_migration_downgrade_restores_old_constr
     assert 'op.drop_column("fact_values", "inference_run_id")' in content
 
 
+def test_fact_value_inference_provenance_targeted_offline_sql_generation_succeeds() -> None:
+    root = Path(__file__).resolve().parents[1]
+    upgrade = subprocess.run(
+        ["alembic", "upgrade", "202607310330:202607311030", "--sql"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    downgrade = subprocess.run(
+        ["alembic", "downgrade", "202607311030:202607310330", "--sql"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert upgrade.returncode == 0, upgrade.stderr or upgrade.stdout
+    assert "Cannot add fact_value inference provenance" in upgrade.stdout
+    assert "DO $$" in upgrade.stdout
+    assert downgrade.returncode == 0, downgrade.stderr or downgrade.stdout
+    assert "DROP COLUMN inference_run_id" in downgrade.stdout
+
+
 def test_fact_entity_links_migration_adds_columns_constraints_and_safe_abort() -> None:
     migration_path = (
         Path(__file__).resolve().parents[1]
@@ -454,6 +485,8 @@ def test_fact_entity_links_migration_adds_columns_constraints_and_safe_abort() -
     assert 'op.f("fk_fact_values_referenced_entity_id_entities")' in content
     assert "Cannot add fact entity links" in content
     assert "explicit referenced_entity_id backfill" in content
+    assert "DO $$" in content
+    assert "op.get_bind()" not in content
     assert "((value_type = 'entity_ref' AND referenced_entity_id IS NOT NULL) OR " in content
 
 
@@ -493,6 +526,22 @@ def test_fact_migrations_include_inference_provenance_followup() -> None:
     )
 
     assert fact_migrations == expected_migrations
+
+
+def test_full_alembic_upgrade_head_sql_generates_to_current_head() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["alembic", "upgrade", "head", "--sql"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "-- Running upgrade 202607310330 -> 202607311030" in result.stdout
+    assert "-- Running upgrade 202608010100 -> 202608010200" in result.stdout
+    assert "INSERT INTO alembic_version" in result.stdout
 
 
 def test_fact_tables_compile_with_postgresql_offline_ddl() -> None:

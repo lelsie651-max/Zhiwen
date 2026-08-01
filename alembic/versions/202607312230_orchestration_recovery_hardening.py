@@ -33,48 +33,49 @@ _FEOB_PENDING_SQL = (
     "AND completed_at IS NULL AND failure_code IS NULL)"
 )
 
-
-def _ensure_no_incompatible_orchestration_rows() -> None:
-    connection = op.get_bind()
-    incompatible_orchestration = connection.execute(
-        sa.text(
-            """
-            SELECT id
-            FROM fact_extraction_orchestrations
-            WHERE completed_batch_count + failed_batch_count > batch_count
-               OR (status = 'partial' AND (
-                    completed_batch_count <= 0
-                    OR failed_batch_count <= 0
-                    OR completed_batch_count + failed_batch_count <> batch_count
-               ))
-               OR (status = 'failed' AND (
-                    completed_batch_count <> 0
-                    OR failed_batch_count <> batch_count
-               ))
-            LIMIT 1
-            """
-        )
-    ).first()
-    if incompatible_orchestration is not None:
-        raise RuntimeError("Cannot apply 202607312230: incompatible orchestration terminal counts exist.")
-
-    incompatible_batch = connection.execute(
-        sa.text(
-            """
-            SELECT id
-            FROM fact_extraction_orch_batches
-            WHERE status = 'pending'
-              AND current_inference_run_id IS NOT NULL
-            LIMIT 1
-            """
-        )
-    ).first()
-    if incompatible_batch is not None:
-        raise RuntimeError("Cannot apply 202607312230: pending batch rows still reference current_inference_run_id.")
-
-
 def upgrade() -> None:
-    _ensure_no_incompatible_orchestration_rows()
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM fact_extraction_orchestrations
+                WHERE completed_batch_count + failed_batch_count > batch_count
+                   OR (status = 'partial' AND (
+                        completed_batch_count <= 0
+                        OR failed_batch_count <= 0
+                        OR completed_batch_count + failed_batch_count <> batch_count
+                   ))
+                   OR (status = 'failed' AND (
+                        completed_batch_count <> 0
+                        OR failed_batch_count <> batch_count
+                   ))
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot apply 202607312230: incompatible orchestration terminal counts exist.';
+            END IF;
+        END
+        $$;
+        """
+    )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM fact_extraction_orch_batches
+                WHERE status = 'pending'
+                  AND current_inference_run_id IS NOT NULL
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot apply 202607312230: pending batch rows still reference current_inference_run_id.';
+            END IF;
+        END
+        $$;
+        """
+    )
 
     op.drop_constraint("feo_partial_shape", "fact_extraction_orchestrations", type_="check")
     op.drop_constraint("feo_failed_shape", "fact_extraction_orchestrations", type_="check")

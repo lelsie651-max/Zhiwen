@@ -2267,6 +2267,8 @@ def test_orchestration_migration_is_latest_head_and_declares_tables() -> None:
     assert historical_migration.count("feo_failed_shape") == 1
     assert historical_migration.count("feob_pending_shape") == 1
     assert '"feo_terminal_batch_counts_within_batch_count",' in migration
+    assert "DO $$" in migration
+    assert "op.get_bind()" not in migration
     assert 'op.drop_constraint("feo_partial_shape"' in migration
     assert 'op.drop_constraint("feo_failed_shape"' in migration
     assert 'op.drop_constraint("feob_pending_shape"' in migration

@@ -37,15 +37,22 @@ def upgrade() -> None:
         ondelete="RESTRICT",
     )
 
-    bind = op.get_bind()
-    existing_ai_rows = bind.execute(
-        sa.text("SELECT count(*) FROM fact_values WHERE source_kind = 'ai'")
-    ).scalar_one()
-    if existing_ai_rows:
-        raise RuntimeError(
-            "Cannot add fact_value inference provenance: existing AI fact_values "
-            "require explicit inference_run_id backfill."
-        )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM fact_values
+                WHERE source_kind = 'ai'
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot add fact_value inference provenance: existing AI fact_values require explicit inference_run_id backfill.';
+            END IF;
+        END
+        $$;
+        """
+    )
 
     op.drop_constraint(op.f(_OLD_AI_CHECK), "fact_values", type_="check")
     op.create_check_constraint(

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from alembic import op
+from alembic import context, op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
@@ -76,42 +76,98 @@ def _build_canonical_json_hash(response_json: dict) -> str:
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-
-    op.add_column(
-        "inference_runs",
-        sa.Column("response_json_hash", sa.String(length=64), nullable=True),
-    )
-
-    rows = bind.execute(
-        sa.text(
+    if context.is_offline_mode():
+        op.add_column(
+            "inference_runs",
+            sa.Column("response_json_hash", sa.String(length=64), nullable=True),
+        )
+        op.execute(
             """
-            SELECT id, response_json
-            FROM inference_runs
-            WHERE status = 'completed'
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM inference_runs
+                    WHERE status = 'completed'
+                ) THEN
+                    RAISE EXCEPTION
+                        'Cannot offline-apply 202607311900: completed inference runs require online response_json_hash backfill.';
+                END IF;
+            END
+            $$;
             """
         )
-    ).mappings()
-    for row in rows:
-        response_json = row["response_json"]
-        if response_json is None:
-            raise RuntimeError(
-                "Cannot backfill response_json_hash: completed inference run is missing response_json."
-            )
-        response_json_hash = _build_canonical_json_hash(response_json)
-        bind.execute(
+    else:
+        bind = op.get_bind()
+
+        op.add_column(
+            "inference_runs",
+            sa.Column("response_json_hash", sa.String(length=64), nullable=True),
+        )
+
+        rows = bind.execute(
             sa.text(
                 """
-                UPDATE inference_runs
-                SET response_json_hash = :response_json_hash
-                WHERE id = :run_id
+                SELECT id, response_json
+                FROM inference_runs
+                WHERE status = 'completed'
                 """
-            ),
-            {
-                "response_json_hash": response_json_hash,
-                "run_id": row["id"],
-            },
+            )
+        ).mappings()
+        for row in rows:
+            response_json = row["response_json"]
+            if response_json is None:
+                raise RuntimeError(
+                    "Cannot backfill response_json_hash: completed inference run is missing response_json."
+                )
+            response_json_hash = _build_canonical_json_hash(response_json)
+            bind.execute(
+                sa.text(
+                    """
+                    UPDATE inference_runs
+                    SET response_json_hash = :response_json_hash
+                    WHERE id = :run_id
+                    """
+                ),
+                {
+                    "response_json_hash": response_json_hash,
+                    "run_id": row["id"],
+                },
+            )
+
+    if context.is_offline_mode():
+        op.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM fact_values
+                    WHERE inference_run_id IS NOT NULL
+                ) THEN
+                    RAISE EXCEPTION
+                        'Cannot offline-apply 202607311900: existing AI FactValue rows require explicit application backfill.';
+                END IF;
+            END
+            $$;
+            """
         )
+    else:
+        bind = op.get_bind()
+        existing_ai_fact_value = bind.execute(
+            sa.text(
+                """
+                SELECT 1
+                FROM fact_values
+                WHERE inference_run_id IS NOT NULL
+                LIMIT 1
+                """
+            )
+        ).first()
+        if existing_ai_fact_value is not None:
+            raise RuntimeError(
+                "Cannot create fact_extraction_batch_applications: existing AI FactValue rows require explicit application backfill."
+            )
 
     op.drop_constraint("inference_runs_pending_shape", "inference_runs", type_="check")
     op.drop_constraint("inference_runs_running_shape", "inference_runs", type_="check")
@@ -143,21 +199,6 @@ def upgrade() -> None:
         "inference_runs",
         _RUN_FAILED_SHAPE_SQL,
     )
-
-    existing_ai_fact_value = bind.execute(
-        sa.text(
-            """
-            SELECT 1
-            FROM fact_values
-            WHERE inference_run_id IS NOT NULL
-            LIMIT 1
-            """
-        )
-    ).first()
-    if existing_ai_fact_value is not None:
-        raise RuntimeError(
-            "Cannot create fact_extraction_batch_applications: existing AI FactValue rows require explicit application backfill."
-        )
 
     op.create_table(
         "fact_extraction_batch_applications",

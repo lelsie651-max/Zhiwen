@@ -18,24 +18,24 @@ depends_on = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    duplicate_row = bind.execute(
-        sa.text(
-            """
-            SELECT fact_id, inference_run_id, value_hash
-            FROM fact_values
-            WHERE inference_run_id IS NOT NULL
-            GROUP BY fact_id, inference_run_id, value_hash
-            HAVING count(*) > 1
-            LIMIT 1
-            """
-        )
-    ).first()
-    if duplicate_row is not None:
-        raise RuntimeError(
-            "Cannot create uq_fv_fact_ir_value_hash: "
-            "duplicate AI fact values share the same fact_id, inference_run_id, and value_hash."
-        )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM fact_values
+                WHERE inference_run_id IS NOT NULL
+                GROUP BY fact_id, inference_run_id, value_hash
+                HAVING count(*) > 1
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot create uq_fv_fact_ir_value_hash: duplicate AI fact values share the same fact_id, inference_run_id, and value_hash.';
+            END IF;
+        END
+        $$;
+        """
+    )
 
     op.create_unique_constraint(
         "uq_fv_fact_ir_value_hash",

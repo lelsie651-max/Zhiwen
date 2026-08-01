@@ -274,6 +274,8 @@ def test_processing_job_single_head_and_result_link_migration_exist() -> None:
     assert 'down_revision: str | None = "202607311430"' in content
     assert '"uq_pj_result_run_id"' in content
     assert "multiple processing jobs reference the same extraction run" in content
+    assert "DO $$" in content
+    assert "op.get_bind()" not in content
 
 
 def test_processing_job_table_compiles_with_postgresql_offline_ddl() -> None:

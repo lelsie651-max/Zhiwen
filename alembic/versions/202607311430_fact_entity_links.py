@@ -54,15 +54,22 @@ def upgrade() -> None:
         ondelete="RESTRICT",
     )
 
-    bind = op.get_bind()
-    existing_entity_ref_rows = bind.execute(
-        sa.text("SELECT count(*) FROM fact_values WHERE value_type = 'entity_ref'")
-    ).scalar_one()
-    if existing_entity_ref_rows:
-        raise RuntimeError(
-            "Cannot add fact entity links: existing entity_ref fact_values "
-            "require explicit referenced_entity_id backfill."
-        )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM fact_values
+                WHERE value_type = 'entity_ref'
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot add fact entity links: existing entity_ref fact_values require explicit referenced_entity_id backfill.';
+            END IF;
+        END
+        $$;
+        """
+    )
 
     op.create_check_constraint(
         op.f(_ENTITY_REF_PAIR_CHECK),

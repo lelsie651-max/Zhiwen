@@ -13,24 +13,24 @@ depends_on: Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    duplicate_active = bind.execute(
-        sa.text(
-            """
-            SELECT input_batch_id, request_hash
-            FROM inference_runs
-            WHERE status IN ('pending', 'running')
-            GROUP BY input_batch_id, request_hash
-            HAVING count(*) > 1
-            LIMIT 1
-            """
-        )
-    ).first()
-    if duplicate_active is not None:
-        raise RuntimeError(
-            "Cannot create uq_ir_active_request: "
-            "multiple active inference runs share the same input_batch_id and request_hash."
-        )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM inference_runs
+                WHERE status IN ('pending', 'running')
+                GROUP BY input_batch_id, request_hash
+                HAVING count(*) > 1
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot create uq_ir_active_request: multiple active inference runs share the same input_batch_id and request_hash.';
+            END IF;
+        END
+        $$;
+        """
+    )
 
     op.create_index(
         "uq_ir_active_request",

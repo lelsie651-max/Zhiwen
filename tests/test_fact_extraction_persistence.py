@@ -1690,14 +1690,19 @@ def test_new_migration_source_contains_duplicate_guard_and_downgrade() -> None:
     migration = Path("alembic/versions/202607311800_fact_value_inference_replay.py").read_text(encoding="utf-8")
     assert "HAVING count(*) > 1" in migration
     assert "uq_fv_fact_ir_value_hash" in migration
+    assert "DO $$" in migration
+    assert "op.get_bind()" not in migration
     assert "drop_constraint" in migration
 
 
 def test_response_json_hash_migration_contains_backfill_and_ai_fact_guard() -> None:
     migration = Path("alembic/versions/202607311900_inference_response_json_hash.py").read_text(encoding="utf-8")
     assert "response_json_hash" in migration
+    assert "context.is_offline_mode()" in migration
     assert "WHERE status = 'completed'" in migration
+    assert "Cannot offline-apply 202607311900: completed inference runs require online response_json_hash backfill." in migration
     assert "Cannot create fact_extraction_batch_applications" in migration
+    assert "Cannot offline-apply 202607311900: existing AI FactValue rows require explicit application backfill." in migration
     assert "uq_feba_inference_run_id" in migration
     assert "jsonb_typeof(result_json) = 'object'" in migration
 

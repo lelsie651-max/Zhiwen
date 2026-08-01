@@ -13,24 +13,24 @@ depends_on: Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    duplicate_link = bind.execute(
-        sa.text(
-            """
-            SELECT result_extraction_run_id
-            FROM processing_jobs
-            WHERE result_extraction_run_id IS NOT NULL
-            GROUP BY result_extraction_run_id
-            HAVING count(*) > 1
-            LIMIT 1
-            """
-        )
-    ).scalar_one_or_none()
-    if duplicate_link is not None:
-        raise RuntimeError(
-            "Cannot add unique processing job result links: "
-            "multiple processing jobs reference the same extraction run."
-        )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM processing_jobs
+                WHERE result_extraction_run_id IS NOT NULL
+                GROUP BY result_extraction_run_id
+                HAVING count(*) > 1
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot add unique processing job result links: multiple processing jobs reference the same extraction run.';
+            END IF;
+        END
+        $$;
+        """
+    )
 
     op.create_unique_constraint(
         "uq_pj_result_run_id",
