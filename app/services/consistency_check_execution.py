@@ -38,7 +38,6 @@ from app.services.consistency_check import (
     build_consistency_check_plan,
 )
 from app.services.inference import (
-    InferenceRunNotFoundError,
     claim_inference_run_for_execution,
     complete_inference_run,
     create_inference_input_batch,
@@ -202,6 +201,10 @@ def _build_snapshot_records(
     return records
 
 
+def _raise_materialization_error() -> None:
+    raise ConsistencyCheckBatchMaterializationError("consistency_check_execution_materialization_invalid")
+
+
 def _materialize_batch_snapshot(
     *,
     batch: Any,
@@ -209,28 +212,38 @@ def _materialize_batch_snapshot(
     expected_block_ids: Sequence[uuid.UUID],
 ) -> MaterializedConsistencyCheckBatch:
     if batch.project_id != project_id:
-        raise ConsistencyCheckBatchMaterializationError("materialized batch project_id mismatch")
+        _raise_materialization_error()
     if batch.task_type != _CONSISTENCY_CHECK_TASK_TYPE:
-        raise ConsistencyCheckBatchMaterializationError("materialized batch task_type mismatch")
+        _raise_materialization_error()
+    if batch.selection_strategy != CONSISTENCY_CHECK_EXECUTOR_NAME:
+        _raise_materialization_error()
+    if batch.selection_metadata != _build_selection_metadata():
+        _raise_materialization_error()
     if "blocks" not in batch.__dict__:
-        raise ConsistencyCheckBatchMaterializationError("materialized batch blocks are not loaded")
+        _raise_materialization_error()
 
     ordered_blocks = tuple(sorted(batch.__dict__["blocks"], key=lambda block: block.source_order))
     if len(ordered_blocks) != batch.block_count:
-        raise ConsistencyCheckBatchMaterializationError("materialized batch block_count mismatch")
+        _raise_materialization_error()
     if len(ordered_blocks) != len(expected_block_ids):
-        raise ConsistencyCheckBatchMaterializationError("materialized batch expected block count mismatch")
+        _raise_materialization_error()
 
     block_ids = tuple(block.source_block_id_snapshot for block in ordered_blocks)
     if block_ids != tuple(expected_block_ids):
-        raise ConsistencyCheckBatchMaterializationError("materialized batch block_ids do not match expected order")
+        _raise_materialization_error()
 
     character_count = 0
     snapshots: list[InferenceInputBlockSnapshot] = []
-    for block in ordered_blocks:
+    for expected_block_id, block in zip(expected_block_ids, ordered_blocks, strict=True):
+        if block.document_block_id is None:
+            _raise_materialization_error()
+        if block.document_block_id != block.source_block_id_snapshot:
+            _raise_materialization_error()
+        if block.document_block_id != expected_block_id:
+            _raise_materialization_error()
         content_hash = _sha256_text(block.content_text)
         if content_hash != block.content_hash:
-            raise ConsistencyCheckBatchMaterializationError("materialized block content_hash mismatch")
+            _raise_materialization_error()
         character_count += len(block.content_text)
         snapshots.append(
             InferenceInputBlockSnapshot(
@@ -254,10 +267,10 @@ def _materialize_batch_snapshot(
         )
 
     if character_count != batch.character_count:
-        raise ConsistencyCheckBatchMaterializationError("materialized batch character_count mismatch")
+        _raise_materialization_error()
     snapshot_hash = build_inference_input_batch_snapshot_hash(_build_snapshot_records(ordered_blocks))
     if snapshot_hash != batch.snapshot_hash:
-        raise ConsistencyCheckBatchMaterializationError("materialized batch snapshot_hash mismatch")
+        _raise_materialization_error()
 
     return MaterializedConsistencyCheckBatch(
         id=batch.id,
@@ -293,6 +306,7 @@ def _build_request_metadata(
     message_content_hash: str,
 ) -> dict[str, Any]:
     return {
+        "project_id": str(plan.project_id),
         "consistency_application_id": str(plan.consistency_application_id),
         "source_result_manifest_hash": plan.source_result_manifest_hash,
         "plan_manifest_hash": plan.plan_manifest_hash,
@@ -321,19 +335,50 @@ def _capture_run_snapshot(run: InferenceRun) -> _InferenceRunSnapshot:
     )
 
 
-async def _load_run_snapshot(
+def _build_prepare_run_kwargs(
+    *,
+    project_id: uuid.UUID,
+    input_batch_id: uuid.UUID,
+    prompt: PromptDefinition,
+    provider: str,
+    requested_model: str,
+    request_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "project_id": project_id,
+        "input_batch_id": input_batch_id,
+        "task_type": _CONSISTENCY_CHECK_TASK_TYPE,
+        "agent_name": prompt.agent_name,
+        "agent_version": prompt.agent_version,
+        "prompt_name": prompt.prompt_name,
+        "prompt_version": prompt.prompt_version,
+        "prompt_contract_hash": prompt.contract_hash,
+        "provider": provider,
+        "requested_model": requested_model,
+        "temperature": prompt.temperature,
+        "max_output_tokens": prompt.max_output_tokens,
+        "request_metadata": request_metadata,
+    }
+
+
+async def _reprepare_completed_run(
     session_factory: Callable[[], AsyncSession],
     *,
-    run_id: uuid.UUID,
+    expected_run_id: uuid.UUID,
+    prepare_kwargs: dict[str, Any],
 ) -> _InferenceRunSnapshot:
     async with session_factory() as session:
         try:
-            run = await inference_repository.get_run_for_update(session, run_id)
-            if run is None:
-                raise InferenceRunNotFoundError("Target run not found.")
-            snapshot = _capture_run_snapshot(run)
-            await session.commit()
-            return snapshot
+            prepared = await prepare_inference_run(session, **prepare_kwargs)
+            if not prepared.reused_completed:
+                raise ConsistencyCheckExecutionError(
+                    "consistency_check_execution_completed_reprepare_invalid"
+                )
+            if prepared.run.id != expected_run_id:
+                raise ConsistencyCheckExecutionError(
+                    "consistency_check_execution_completed_run_id_mismatch"
+                )
+            return _capture_run_snapshot(prepared.run)
         except BaseException:
             await session.rollback()
             raise
@@ -401,6 +446,7 @@ def classify_consistency_check_batch_failure(error: BaseException) -> str:
             ConsistencyCheckPlanError,
             ConsistencyCheckPlanMismatchError,
             ConsistencyCheckBatchMaterializationError,
+            ConsistencyCheckExecutionError,
         ),
     ):
         return "consistency_check_context_invalid"
@@ -411,7 +457,6 @@ def classify_consistency_check_batch_failure(error: BaseException) -> str:
 
 def _build_execution_result(
     *,
-    project_id: uuid.UUID,
     authoritative_plan: ConsistencyCheckPlan,
     batch: ConsistencyCheckBatchPlan,
     input_batch_id: uuid.UUID | None,
@@ -422,7 +467,7 @@ def _build_execution_result(
     response: ConsistencyCheckResponse,
 ) -> ConsistencyCheckBatchExecutionResult:
     return ConsistencyCheckBatchExecutionResult(
-        project_id=project_id,
+        project_id=authoritative_plan.project_id,
         consistency_application_id=authoritative_plan.consistency_application_id,
         source_result_manifest_hash=authoritative_plan.source_result_manifest_hash,
         plan_manifest_hash=authoritative_plan.plan_manifest_hash,
@@ -468,10 +513,11 @@ async def execute_consistency_check_batch(
 
     if provided_plan != authoritative_plan:
         raise ConsistencyCheckPlanMismatchError("consistency_check_execution_plan_mismatch")
+    if project_id != authoritative_plan.project_id:
+        raise ConsistencyCheckExecutionError("consistency_check_execution_project_id_mismatch")
 
     if authoritative_batch.candidate_count == 0:
         return _build_execution_result(
-            project_id=project_id,
             authoritative_plan=authoritative_plan,
             batch=authoritative_batch,
             input_batch_id=None,
@@ -490,7 +536,7 @@ async def execute_consistency_check_batch(
             try:
                 created_batch = await create_inference_input_batch(
                     session,
-                    project_id=project_id,
+                    project_id=authoritative_plan.project_id,
                     task_type=_CONSISTENCY_CHECK_TASK_TYPE,
                     block_ids=expected_block_ids,
                     selection_strategy=CONSISTENCY_CHECK_EXECUTOR_NAME,
@@ -498,7 +544,7 @@ async def execute_consistency_check_batch(
                 )
                 loaded_batch = await inference_repository.get_batch_by_identity(
                     session,
-                    project_id,
+                    authoritative_plan.project_id,
                     _CONSISTENCY_CHECK_TASK_TYPE,
                     created_batch.snapshot_hash,
                 )
@@ -508,7 +554,7 @@ async def execute_consistency_check_batch(
                     )
                 materialized_batch = _materialize_batch_snapshot(
                     batch=loaded_batch,
-                    project_id=project_id,
+                    project_id=authoritative_plan.project_id,
                     expected_block_ids=expected_block_ids,
                 )
                 await session.commit()
@@ -528,25 +574,18 @@ async def execute_consistency_check_batch(
             prompt=prompt,
             message_content_hash=message_content_hash,
         )
+        prepare_run_kwargs = _build_prepare_run_kwargs(
+            project_id=authoritative_plan.project_id,
+            input_batch_id=materialized_batch.id,
+            prompt=prompt,
+            provider=provider,
+            requested_model=requested_model,
+            request_metadata=request_metadata,
+        )
 
         async with session_factory() as session:
             try:
-                prepared = await prepare_inference_run(
-                    session,
-                    project_id=project_id,
-                    input_batch_id=materialized_batch.id,
-                    task_type=_CONSISTENCY_CHECK_TASK_TYPE,
-                    agent_name=prompt.agent_name,
-                    agent_version=prompt.agent_version,
-                    prompt_name=prompt.prompt_name,
-                    prompt_version=prompt.prompt_version,
-                    prompt_contract_hash=prompt.contract_hash,
-                    provider=provider,
-                    requested_model=requested_model,
-                    temperature=prompt.temperature,
-                    max_output_tokens=prompt.max_output_tokens,
-                    request_metadata=request_metadata,
-                )
+                prepared = await prepare_inference_run(session, **prepare_run_kwargs)
                 prepared_snapshot = _capture_run_snapshot(prepared.run)
             except BaseException:
                 await session.rollback()
@@ -558,7 +597,6 @@ async def execute_consistency_check_batch(
                 batch=authoritative_batch,
             )
             return _build_execution_result(
-                project_id=project_id,
                 authoritative_plan=authoritative_plan,
                 batch=authoritative_batch,
                 input_batch_id=materialized_batch.id,
@@ -580,16 +618,16 @@ async def execute_consistency_check_batch(
                 raise
 
         if claim.status == InferenceRunStatus.COMPLETED.value:
-            completed_snapshot = await _load_run_snapshot(
+            completed_snapshot = await _reprepare_completed_run(
                 session_factory,
-                run_id=prepared_snapshot.run_id,
+                expected_run_id=prepared_snapshot.run_id,
+                prepare_kwargs=prepare_run_kwargs,
             )
             response = parse_consistency_check_response_object(
                 completed_snapshot.response_json or {},
                 batch=authoritative_batch,
             )
             return _build_execution_result(
-                project_id=project_id,
                 authoritative_plan=authoritative_plan,
                 batch=authoritative_batch,
                 input_batch_id=materialized_batch.id,
@@ -630,7 +668,6 @@ async def execute_consistency_check_batch(
                 raise
 
         return _build_execution_result(
-            project_id=project_id,
             authoritative_plan=authoritative_plan,
             batch=authoritative_batch,
             input_batch_id=materialized_batch.id,

@@ -140,6 +140,7 @@ def _candidate(
 def _plan(
     candidates: tuple[ConsistencyCheckCandidateBundle, ...],
     *,
+    project_id: uuid.UUID | None = None,
     consistency_application_id: uuid.UUID | None = None,
     source_result_manifest_hash: str = "a" * 64,
     config: ConsistencyCheckPlannerConfig | None = None,
@@ -148,6 +149,7 @@ def _plan(
         max_candidates_per_batch=10,
         max_evidence_characters_per_batch=10_000,
     )
+    resolved_project_id = project_id or uuid.uuid4()
     application_id = consistency_application_id or uuid.uuid4()
     batches = consistency_check_service._build_consistency_check_batches(
         consistency_application_id=application_id,
@@ -157,6 +159,7 @@ def _plan(
     )
     plan_manifest_hash = duplicate_grouping_service.hash_deterministic_payload(
         {
+            "project_id": str(resolved_project_id),
             "consistency_application_id": str(application_id),
             "source_result_manifest_hash": source_result_manifest_hash,
             "planner_name": CONSISTENCY_CHECK_PLANNER_NAME,
@@ -178,6 +181,7 @@ def _plan(
         }
     )
     plan = ConsistencyCheckPlan(
+        project_id=resolved_project_id,
         consistency_application_id=application_id,
         source_result_manifest_hash=source_result_manifest_hash,
         planner_name=CONSISTENCY_CHECK_PLANNER_NAME,
@@ -194,14 +198,20 @@ def _orm_batch(
     project_id: uuid.UUID,
     source_block_ids: tuple[uuid.UUID, ...],
     texts_by_block_id: dict[uuid.UUID, str],
+    selection_strategy: str | None = None,
+    selection_metadata: dict | None = None,
     snapshot_hash: str = "c" * 64,
 ) -> InferenceInputBatch:
     batch = InferenceInputBatch(
         id=uuid.uuid4(),
         project_id=project_id,
         task_type="consistency_check",
-        selection_strategy=execution_service.CONSISTENCY_CHECK_EXECUTOR_NAME,
-        selection_metadata={},
+        selection_strategy=selection_strategy or execution_service.CONSISTENCY_CHECK_EXECUTOR_NAME,
+        selection_metadata=(
+            selection_metadata
+            if selection_metadata is not None
+            else execution_service._build_selection_metadata()
+        ),
         block_count=len(source_block_ids),
         character_count=sum(len(texts_by_block_id[block_id]) for block_id in source_block_ids),
         snapshot_hash=snapshot_hash,
@@ -323,7 +333,7 @@ def async_lambda(result):
 def test_execute_consistency_check_batch_skips_empty_batch_without_run_or_llm(monkeypatch):
     session_factory = SessionFactory()
     project_id = uuid.uuid4()
-    plan, _batch = _plan(())
+    plan, _batch = _plan((), project_id=project_id)
     called = {"create_batch": 0}
 
     async def fake_build_plan(_session_factory, *, consistency_application_id, config):
@@ -361,6 +371,42 @@ def test_execute_consistency_check_batch_skips_empty_batch_without_run_or_llm(mo
     assert client.calls == []
 
 
+def test_execute_consistency_check_batch_rejects_mismatched_project_id_for_empty_batch(monkeypatch):
+    session_factory = SessionFactory()
+    authoritative_project_id = uuid.uuid4()
+    provided_project_id = uuid.uuid4()
+    plan, _batch = _plan((), project_id=authoritative_project_id)
+    called = {"create_batch": 0}
+
+    async def fake_build_plan(_session_factory, *, consistency_application_id, config):
+        return plan
+
+    async def fake_create_batch(*args, **kwargs):
+        called["create_batch"] += 1
+        raise AssertionError("should not create input batch when project_id mismatches")
+
+    monkeypatch.setattr(execution_service, "build_consistency_check_plan", fake_build_plan)
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", fake_create_batch)
+    client = MockLLMClient(["{}"])
+
+    with pytest.raises(execution_service.ConsistencyCheckExecutionError):
+        run_async(
+            execution_service.execute_consistency_check_batch(
+                session_factory,
+                project_id=provided_project_id,
+                plan=plan,
+                batch_index=0,
+                prompt=PROMPT,
+                llm_client=client,
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+            )
+        )
+
+    assert called["create_batch"] == 0
+    assert client.calls == []
+
+
 def test_execute_consistency_check_batch_materializes_block_order_with_first_seen_dedup(monkeypatch):
     session_factory = SessionFactory()
     project_id = uuid.uuid4()
@@ -390,7 +436,7 @@ def test_execute_consistency_check_batch_materializes_block_order_with_first_see
             ),
         ),
     )
-    plan, batch = _plan((candidate,))
+    plan, batch = _plan((candidate,), project_id=project_id)
     expected_block_ids = (block_a, block_b, block_c)
     orm_batch = _orm_batch(
         project_id=project_id,
@@ -468,6 +514,62 @@ def test_execute_consistency_check_batch_materializes_block_order_with_first_see
     assert result.response == ConsistencyCheckResponse.model_validate(_response_payload(batch))
 
 
+def test_execute_consistency_check_batch_rejects_mismatched_project_id_before_non_empty_execution(
+    monkeypatch,
+):
+    session_factory = SessionFactory()
+    authoritative_project_id = uuid.uuid4()
+    provided_project_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_json="A",
+                evidences=(_evidence(1, document_block_id=block_id, excerpt="alpha", source_order=0),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_json="B",
+                evidences=(_evidence(2, document_block_id=block_id, excerpt="beta", source_order=1),),
+            ),
+        ),
+    )
+    plan, _batch = _plan((candidate,), project_id=authoritative_project_id)
+    called = {"create_batch": 0}
+
+    async def fake_build_plan(_session_factory, *, consistency_application_id, config):
+        return plan
+
+    async def fake_create_batch(*args, **kwargs):
+        called["create_batch"] += 1
+        raise AssertionError("should not create input batch when project_id mismatches")
+
+    monkeypatch.setattr(execution_service, "build_consistency_check_plan", fake_build_plan)
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", fake_create_batch)
+    client = MockLLMClient(["{}"])
+
+    with pytest.raises(execution_service.ConsistencyCheckExecutionError):
+        run_async(
+            execution_service.execute_consistency_check_batch(
+                session_factory,
+                project_id=provided_project_id,
+                plan=plan,
+                batch_index=0,
+                prompt=PROMPT,
+                llm_client=client,
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+            )
+        )
+
+    assert called["create_batch"] == 0
+    assert client.calls == []
+
+
 def test_execute_consistency_check_batch_rejects_plan_rebuild_mismatch(monkeypatch):
     session_factory = SessionFactory()
     project_id = uuid.uuid4()
@@ -489,7 +591,7 @@ def test_execute_consistency_check_batch_rejects_plan_rebuild_mismatch(monkeypat
             ),
         ),
     )
-    plan, _batch = _plan((candidate,))
+    plan, _batch = _plan((candidate,), project_id=project_id)
     provided_plan = replace(plan, plan_manifest_hash="f" * 64)
     create_calls = {"count": 0}
 
@@ -541,7 +643,7 @@ def test_execute_consistency_check_batch_calls_llm_only_after_sessions_close(mon
             ),
         ),
     )
-    plan, batch = _plan((candidate,))
+    plan, batch = _plan((candidate,), project_id=project_id)
     orm_batch = _orm_batch(
         project_id=project_id,
         source_block_ids=(block_id,),
@@ -637,7 +739,7 @@ def test_execute_consistency_check_batch_success_completes_new_run(monkeypatch):
             ),
         ),
     )
-    plan, batch = _plan((candidate,))
+    plan, batch = _plan((candidate,), project_id=project_id)
     orm_batch = _orm_batch(
         project_id=project_id,
         source_block_ids=(block_id,),
@@ -743,7 +845,7 @@ def test_execute_consistency_check_batch_reuses_completed_run_without_llm(monkey
             ),
         ),
     )
-    plan, batch = _plan((candidate,))
+    plan, batch = _plan((candidate,), project_id=project_id)
     orm_batch = _orm_batch(
         project_id=project_id,
         source_block_ids=(block_id,),
@@ -791,6 +893,308 @@ def test_execute_consistency_check_batch_reuses_completed_run_without_llm(monkey
     assert client.calls == []
 
 
+def test_execute_consistency_check_batch_reuses_claim_race_completed_run_without_llm(monkeypatch):
+    session_factory = SessionFactory()
+    project_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_json="A",
+                evidences=(_evidence(1, document_block_id=block_id, excerpt="alpha", source_order=0),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_json="B",
+                evidences=(_evidence(2, document_block_id=block_id, excerpt="beta", source_order=1),),
+            ),
+        ),
+    )
+    plan, batch = _plan((candidate,), project_id=project_id)
+    orm_batch = _orm_batch(
+        project_id=project_id,
+        source_block_ids=(block_id,),
+        texts_by_block_id={block_id: "Shared block"},
+    )
+    request_hash = sha256("req-claim-completed")
+    pending_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=request_hash,
+        status=InferenceRunStatus.PENDING.value,
+    )
+    completed_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=request_hash,
+        status=InferenceRunStatus.COMPLETED.value,
+        response_json=_response_payload(batch),
+    )
+    completed_run.id = pending_run.id
+    prepare_calls = {"count": 0}
+
+    async def fake_build_plan(_session_factory, *, consistency_application_id, config):
+        return plan
+
+    async def fake_prepare(*args, **kwargs):
+        prepare_calls["count"] += 1
+        if prepare_calls["count"] == 1:
+            return PreparedInferenceRun(run=pending_run, created=True, reused_completed=False)
+        return PreparedInferenceRun(run=completed_run, created=False, reused_completed=True)
+
+    monkeypatch.setattr(execution_service, "build_consistency_check_plan", fake_build_plan)
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", async_lambda(orm_batch))
+    monkeypatch.setattr(
+        execution_service.inference_repository,
+        "get_batch_by_identity",
+        async_lambda(orm_batch),
+    )
+    monkeypatch.setattr(execution_service, "prepare_inference_run", fake_prepare)
+    monkeypatch.setattr(
+        execution_service,
+        "claim_inference_run_for_execution",
+        async_lambda(
+            InferenceRunClaim(
+                run_id=pending_run.id,
+                status=InferenceRunStatus.COMPLETED.value,
+                claimed=False,
+            )
+        ),
+    )
+    client = MockLLMClient(["{}"])
+
+    result = run_async(
+        execution_service.execute_consistency_check_batch(
+            session_factory,
+            project_id=project_id,
+            plan=plan,
+            batch_index=0,
+            prompt=PROMPT,
+            llm_client=client,
+            provider="deepseek",
+            requested_model="deepseek-v4-flash",
+        )
+    )
+
+    assert prepare_calls["count"] == 2
+    assert result.reused_completed_run is True
+    assert result.inference_run_id == completed_run.id
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure_exc", "expected_message"),
+    [
+        (
+            inference_service.InferenceRunStateError(
+                "Completed run response_json_hash does not match stored response_json."
+            ),
+            "response_json_hash",
+        ),
+        (
+            inference_service.InferenceRunStateError(
+                "Completed run has an invalid finish_reason."
+            ),
+            "finish_reason",
+        ),
+        (
+            inference_service.InferenceRunStateError(
+                "Completed run request_hash does not match the request."
+            ),
+            "request_hash",
+        ),
+        (
+            inference_service.InferenceRunStateError(
+                "Completed run is missing terminal completion metadata."
+            ),
+            "terminal completion metadata",
+        ),
+    ],
+)
+def test_execute_consistency_check_batch_rejects_invalid_claim_race_completed_reprepare(
+    monkeypatch,
+    failure_exc,
+    expected_message,
+):
+    session_factory = SessionFactory()
+    project_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_json="A",
+                evidences=(_evidence(1, document_block_id=block_id, excerpt="alpha", source_order=0),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_json="B",
+                evidences=(_evidence(2, document_block_id=block_id, excerpt="beta", source_order=1),),
+            ),
+        ),
+    )
+    plan, _batch = _plan((candidate,), project_id=project_id)
+    orm_batch = _orm_batch(
+        project_id=project_id,
+        source_block_ids=(block_id,),
+        texts_by_block_id={block_id: "Shared block"},
+    )
+    pending_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=sha256("req-claim-invalid"),
+        status=InferenceRunStatus.PENDING.value,
+    )
+    prepare_calls = {"count": 0}
+
+    async def fake_build_plan(_session_factory, *, consistency_application_id, config):
+        return plan
+
+    async def fake_prepare(*args, **kwargs):
+        prepare_calls["count"] += 1
+        if prepare_calls["count"] == 1:
+            return PreparedInferenceRun(run=pending_run, created=True, reused_completed=False)
+        raise failure_exc
+
+    monkeypatch.setattr(execution_service, "build_consistency_check_plan", fake_build_plan)
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", async_lambda(orm_batch))
+    monkeypatch.setattr(
+        execution_service.inference_repository,
+        "get_batch_by_identity",
+        async_lambda(orm_batch),
+    )
+    monkeypatch.setattr(execution_service, "prepare_inference_run", fake_prepare)
+    monkeypatch.setattr(
+        execution_service,
+        "claim_inference_run_for_execution",
+        async_lambda(
+            InferenceRunClaim(
+                run_id=pending_run.id,
+                status=InferenceRunStatus.COMPLETED.value,
+                claimed=False,
+            )
+        ),
+    )
+    client = MockLLMClient(["{}"])
+
+    with pytest.raises(inference_service.InferenceRunStateError) as exc_info:
+        run_async(
+            execution_service.execute_consistency_check_batch(
+                session_factory,
+                project_id=project_id,
+                plan=plan,
+                batch_index=0,
+                prompt=PROMPT,
+                llm_client=client,
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+            )
+        )
+
+    assert prepare_calls["count"] == 2
+    assert expected_message in str(exc_info.value)
+    assert client.calls == []
+
+
+def test_execute_consistency_check_batch_rejects_claim_race_completed_other_run_id(monkeypatch):
+    session_factory = SessionFactory()
+    project_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_json="A",
+                evidences=(_evidence(1, document_block_id=block_id, excerpt="alpha", source_order=0),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_json="B",
+                evidences=(_evidence(2, document_block_id=block_id, excerpt="beta", source_order=1),),
+            ),
+        ),
+    )
+    plan, batch = _plan((candidate,), project_id=project_id)
+    orm_batch = _orm_batch(
+        project_id=project_id,
+        source_block_ids=(block_id,),
+        texts_by_block_id={block_id: "Shared block"},
+    )
+    request_hash = sha256("req-claim-other-id")
+    pending_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=request_hash,
+        status=InferenceRunStatus.PENDING.value,
+    )
+    other_completed_run = _run(
+        project_id=project_id,
+        input_batch_id=orm_batch.id,
+        request_hash=request_hash,
+        status=InferenceRunStatus.COMPLETED.value,
+        response_json=_response_payload(batch),
+    )
+
+    async def fake_build_plan(_session_factory, *, consistency_application_id, config):
+        return plan
+
+    async def fake_prepare(*args, **kwargs):
+        if fake_prepare.calls == 0:
+            fake_prepare.calls += 1
+            return PreparedInferenceRun(run=pending_run, created=True, reused_completed=False)
+        return PreparedInferenceRun(run=other_completed_run, created=False, reused_completed=True)
+
+    fake_prepare.calls = 0
+
+    monkeypatch.setattr(execution_service, "build_consistency_check_plan", fake_build_plan)
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", async_lambda(orm_batch))
+    monkeypatch.setattr(
+        execution_service.inference_repository,
+        "get_batch_by_identity",
+        async_lambda(orm_batch),
+    )
+    monkeypatch.setattr(execution_service, "prepare_inference_run", fake_prepare)
+    monkeypatch.setattr(
+        execution_service,
+        "claim_inference_run_for_execution",
+        async_lambda(
+            InferenceRunClaim(
+                run_id=pending_run.id,
+                status=InferenceRunStatus.COMPLETED.value,
+                claimed=False,
+            )
+        ),
+    )
+    client = MockLLMClient(["{}"])
+
+    with pytest.raises(execution_service.ConsistencyCheckExecutionError) as exc_info:
+        run_async(
+            execution_service.execute_consistency_check_batch(
+                session_factory,
+                project_id=project_id,
+                plan=plan,
+                batch_index=0,
+                prompt=PROMPT,
+                llm_client=client,
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+            )
+        )
+
+    assert "run_id_mismatch" in str(exc_info.value)
+    assert client.calls == []
+
+
 def test_execute_consistency_check_batch_running_claim_does_not_call_llm(monkeypatch):
     session_factory = SessionFactory()
     project_id = uuid.uuid4()
@@ -812,7 +1216,7 @@ def test_execute_consistency_check_batch_running_claim_does_not_call_llm(monkeyp
             ),
         ),
     )
-    plan, _batch = _plan((candidate,))
+    plan, _batch = _plan((candidate,), project_id=project_id)
     orm_batch = _orm_batch(
         project_id=project_id,
         source_block_ids=(block_id,),
@@ -898,7 +1302,7 @@ def test_execute_consistency_check_batch_invalid_model_response_fails_claimed_ru
             ),
         ),
     )
-    plan, batch = _plan((candidate,))
+    plan, batch = _plan((candidate,), project_id=project_id)
     orm_batch = _orm_batch(
         project_id=project_id,
         source_block_ids=(block_id,),
@@ -1002,7 +1406,7 @@ def test_execute_consistency_check_batch_cancelled_records_failure_and_reraises(
             ),
         ),
     )
-    plan, _batch = _plan((candidate,))
+    plan, _batch = _plan((candidate,), project_id=project_id)
     orm_batch = _orm_batch(
         project_id=project_id,
         source_block_ids=(block_id,),
@@ -1109,11 +1513,13 @@ def test_execute_consistency_check_batch_request_metadata_is_complete_and_change
     )
     plan_a, batch_a = _plan(
         (candidate_a,),
+        project_id=project_id,
         consistency_application_id=shared_application_id,
         source_result_manifest_hash="a" * 64,
     )
     plan_b, batch_b = _plan(
         (candidate_b,),
+        project_id=project_id,
         consistency_application_id=shared_application_id,
         source_result_manifest_hash="b" * 64,
     )
@@ -1241,6 +1647,7 @@ def test_execute_consistency_check_batch_request_metadata_is_complete_and_change
 
     first_metadata = captured_metadata[0]
     assert first_metadata == {
+        "project_id": str(plan_a.project_id),
         "consistency_application_id": str(plan_a.consistency_application_id),
         "source_result_manifest_hash": plan_a.source_result_manifest_hash,
         "plan_manifest_hash": plan_a.plan_manifest_hash,
@@ -1258,6 +1665,152 @@ def test_execute_consistency_check_batch_request_metadata_is_complete_and_change
     assert captured_metadata[0]["plan_manifest_hash"] != captured_metadata[1]["plan_manifest_hash"]
     assert captured_metadata[0]["batch_manifest_hash"] != captured_metadata[1]["batch_manifest_hash"]
     assert captured_metadata[0]["message_content_hash"] != captured_metadata[1]["message_content_hash"]
+
+
+@pytest.mark.parametrize(
+    ("selection_strategy", "selection_metadata"),
+    [
+        ("wrong_executor", None),
+        (
+            execution_service.CONSISTENCY_CHECK_EXECUTOR_NAME,
+            {"executor_name": "wrong", "executor_version": "1.0.0", "input_kind": "consistency_check_evidence_blocks"},
+        ),
+    ],
+)
+def test_execute_consistency_check_batch_rejects_invalid_materialized_batch_provenance(
+    monkeypatch,
+    selection_strategy,
+    selection_metadata,
+):
+    session_factory = SessionFactory()
+    project_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_json="A",
+                evidences=(_evidence(1, document_block_id=block_id, excerpt="alpha", source_order=0),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_json="B",
+                evidences=(_evidence(2, document_block_id=block_id, excerpt="beta", source_order=1),),
+            ),
+        ),
+    )
+    plan, _batch = _plan((candidate,), project_id=project_id)
+    orm_batch = _orm_batch(
+        project_id=project_id,
+        source_block_ids=(block_id,),
+        texts_by_block_id={block_id: "Shared block"},
+        selection_strategy=selection_strategy,
+        selection_metadata=(
+            execution_service._build_selection_metadata()
+            if selection_metadata is None
+            else selection_metadata
+        ),
+    )
+
+    async def fake_build_plan(_session_factory, *, consistency_application_id, config):
+        return plan
+
+    monkeypatch.setattr(execution_service, "build_consistency_check_plan", fake_build_plan)
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", async_lambda(orm_batch))
+    monkeypatch.setattr(
+        execution_service.inference_repository,
+        "get_batch_by_identity",
+        async_lambda(orm_batch),
+    )
+    client = MockLLMClient(["{}"])
+
+    with pytest.raises(execution_service.ConsistencyCheckBatchMaterializationError):
+        run_async(
+            execution_service.execute_consistency_check_batch(
+                session_factory,
+                project_id=project_id,
+                plan=plan,
+                batch_index=0,
+                prompt=PROMPT,
+                llm_client=client,
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+            )
+        )
+
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda batch, expected_block_id: setattr(batch.blocks[0], "document_block_id", None),
+        lambda batch, expected_block_id: setattr(batch.blocks[0], "document_block_id", uuid.uuid4()),
+        lambda batch, expected_block_id: setattr(batch.blocks[0], "source_block_id_snapshot", uuid.uuid4()),
+    ],
+)
+def test_execute_consistency_check_batch_rejects_invalid_materialized_document_block_binding(
+    monkeypatch,
+    mutator,
+):
+    session_factory = SessionFactory()
+    project_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_json="A",
+                evidences=(_evidence(1, document_block_id=block_id, excerpt="alpha", source_order=0),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_json="B",
+                evidences=(_evidence(2, document_block_id=block_id, excerpt="beta", source_order=1),),
+            ),
+        ),
+    )
+    plan, _batch = _plan((candidate,), project_id=project_id)
+    orm_batch = _orm_batch(
+        project_id=project_id,
+        source_block_ids=(block_id,),
+        texts_by_block_id={block_id: "Shared block"},
+    )
+    mutator(orm_batch, block_id)
+
+    async def fake_build_plan(_session_factory, *, consistency_application_id, config):
+        return plan
+
+    monkeypatch.setattr(execution_service, "build_consistency_check_plan", fake_build_plan)
+    monkeypatch.setattr(execution_service, "create_inference_input_batch", async_lambda(orm_batch))
+    monkeypatch.setattr(
+        execution_service.inference_repository,
+        "get_batch_by_identity",
+        async_lambda(orm_batch),
+    )
+    client = MockLLMClient(["{}"])
+
+    with pytest.raises(execution_service.ConsistencyCheckBatchMaterializationError):
+        run_async(
+            execution_service.execute_consistency_check_batch(
+                session_factory,
+                project_id=project_id,
+                plan=plan,
+                batch_index=0,
+                prompt=PROMPT,
+                llm_client=client,
+                provider="deepseek",
+                requested_model="deepseek-v4-flash",
+            )
+        )
+
+    assert client.calls == []
 
 
 def test_execute_consistency_check_batch_invalid_response_does_not_leak_sensitive_sentinel(monkeypatch):
@@ -1281,7 +1834,7 @@ def test_execute_consistency_check_batch_invalid_response_does_not_leak_sensitiv
             ),
         ),
     )
-    plan, _batch = _plan((candidate,))
+    plan, _batch = _plan((candidate,), project_id=project_id)
     orm_batch = _orm_batch(
         project_id=project_id,
         source_block_ids=(block_id,),

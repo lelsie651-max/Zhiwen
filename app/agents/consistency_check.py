@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import uuid
 from typing import Any, TYPE_CHECKING
 
 from pydantic import ValidationError
@@ -84,6 +85,7 @@ def _candidate_evidence_character_count(candidate: ConsistencyCheckCandidateBund
 def _build_plan_manifest_hash(plan: ConsistencyCheckPlan) -> str:
     return duplicate_grouping_service.hash_deterministic_payload(
         {
+            "project_id": str(plan.project_id),
             "consistency_application_id": str(plan.consistency_application_id),
             "source_result_manifest_hash": plan.source_result_manifest_hash,
             "planner_name": plan.planner_name,
@@ -129,6 +131,8 @@ def validate_consistency_check_batch_plan(
         raise AgentConsistencyCheckContextError("batch must be a ConsistencyCheckBatchPlan")
     if not plan.batches:
         raise AgentConsistencyCheckContextError("plan must contain at least one batch")
+    if not isinstance(plan.project_id, uuid.UUID):
+        raise AgentConsistencyCheckContextError("plan project_id must be a UUID")
     if plan.planner_name != CONSISTENCY_CHECK_PLANNER_NAME:
         raise AgentConsistencyCheckContextError("plan planner_name mismatch")
     if plan.planner_version != CONSISTENCY_CHECK_PLANNER_VERSION:
@@ -183,6 +187,7 @@ def render_consistency_check_message_contents(
 
     envelope = {
         "response_contract": prompt.response_json_schema,
+        "project_id": str(plan.project_id),
         "consistency_application_id": str(plan.consistency_application_id),
         "source_result_manifest_hash": plan.source_result_manifest_hash,
         "batch_index": batch.batch_index,

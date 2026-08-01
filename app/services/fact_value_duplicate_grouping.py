@@ -83,6 +83,7 @@ class FactValueConsistencyCandidateInvariantError(FactValueConsistencyCandidateE
 
 @dataclass(frozen=True, slots=True)
 class AuthenticatedFactValueConsistencyCandidateApplication:
+    project_id: uuid.UUID
     application: FactValueConsistencyCandidateApplicationLedger
     source_duplicate_grouping_application: DuplicateGroupingApplicationLedger
     write_plan: FactValueConsistencyCandidateWritePlan
@@ -1333,6 +1334,7 @@ async def authenticate_fact_value_consistency_candidate_application(
             await read_session.rollback()
 
     return AuthenticatedFactValueConsistencyCandidateApplication(
+        project_id=state.project_id,
         application=application,
         source_duplicate_grouping_application=source_application,
         write_plan=write_plan,

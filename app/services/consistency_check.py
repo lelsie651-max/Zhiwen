@@ -423,6 +423,7 @@ async def build_consistency_check_plan(
     )
     plan_manifest_hash = duplicate_grouping_service.hash_deterministic_payload(
         {
+            "project_id": str(authenticated.project_id),
             "consistency_application_id": str(consistency_application_id),
             "source_result_manifest_hash": authenticated.application.result_manifest_hash,
             "planner_name": CONSISTENCY_CHECK_PLANNER_NAME,
@@ -441,6 +442,7 @@ async def build_consistency_check_plan(
         },
     )
     return ConsistencyCheckPlan(
+        project_id=authenticated.project_id,
         consistency_application_id=consistency_application_id,
         source_result_manifest_hash=authenticated.application.result_manifest_hash,
         planner_name=CONSISTENCY_CHECK_PLANNER_NAME,

@@ -93,6 +93,7 @@ def _candidate(
 def _plan(
     candidates: tuple[ConsistencyCheckCandidateBundle, ...],
     *,
+    project_id: uuid.UUID = uuid.UUID("71000000-0000-0000-0000-000000000001"),
     consistency_application_id: uuid.UUID = uuid.UUID("70000000-0000-0000-0000-000000000001"),
     source_result_manifest_hash: str = "a" * 64,
     config: ConsistencyCheckPlannerConfig | None = None,
@@ -109,6 +110,7 @@ def _plan(
     )
     plan_manifest_hash = duplicate_grouping_service.hash_deterministic_payload(
         {
+            "project_id": str(project_id),
             "consistency_application_id": str(consistency_application_id),
             "source_result_manifest_hash": source_result_manifest_hash,
             "planner_name": CONSISTENCY_CHECK_PLANNER_NAME,
@@ -130,6 +132,7 @@ def _plan(
         }
     )
     plan = ConsistencyCheckPlan(
+        project_id=project_id,
         consistency_application_id=consistency_application_id,
         source_result_manifest_hash=source_result_manifest_hash,
         planner_name=CONSISTENCY_CHECK_PLANNER_NAME,
@@ -212,6 +215,7 @@ def test_renderer_keeps_excerpt_as_json_string_data_even_when_it_contains_inject
 
     assert system.role == "system"
     assert user.role == "user"
+    assert payload["project_id"] == str(plan.project_id)
     assert payload["candidates"][0]["members"][0]["evidences"][0]["excerpt"] == injected
     assert user.content.split("\n\n", 1)[1].strip() == cc._canonical_json(payload)
 
@@ -248,6 +252,33 @@ def test_renderer_rejects_tampered_batch_manifest_or_counts():
 
     with pytest.raises(cc.AgentConsistencyCheckContextError):
         cc.render_consistency_check_messages(prompt=PROMPT, plan=plan, batch=bad_batch)
+
+
+def test_renderer_rejects_tampered_project_id_in_plan_manifest():
+    candidate = _candidate(
+        1,
+        members=(
+            _member(
+                1,
+                semantic_key_hash="1" * 64,
+                value_type="string",
+                value_json="A",
+                evidences=(_evidence(1, excerpt="alpha"),),
+            ),
+            _member(
+                2,
+                semantic_key_hash="2" * 64,
+                value_type="string",
+                value_json="B",
+                evidences=(_evidence(2, excerpt="beta"),),
+            ),
+        ),
+    )
+    plan, batch = _plan((candidate,))
+    tampered_plan = replace(plan, project_id=uuid.uuid4())
+
+    with pytest.raises(cc.AgentConsistencyCheckContextError):
+        cc.render_consistency_check_messages(prompt=PROMPT, plan=tampered_plan, batch=batch)
 
 
 def test_parse_accepts_empty_assessments_for_empty_batch():

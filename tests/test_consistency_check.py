@@ -137,6 +137,7 @@ def _candidate_spec(
 def make_authenticated_application(
     candidate_specs: list[dict],
     *,
+    project_id: uuid.UUID | None = None,
     consistency_application_id: uuid.UUID | None = None,
     duplicate_grouping_application_id: uuid.UUID | None = None,
     orchestration_id: uuid.UUID | None = None,
@@ -145,6 +146,7 @@ def make_authenticated_application(
 ) -> SimpleNamespace:
     application_id = consistency_application_id or uuid.uuid4()
     source_application_id = duplicate_grouping_application_id or uuid.uuid4()
+    actual_project_id = project_id or uuid.uuid4()
     actual_orchestration_id = orchestration_id or uuid.uuid4()
     actual_extraction_run_id = extraction_run_id or uuid.uuid4()
     candidate_ledgers: list[FactValueConsistencyCandidateLedger] = []
@@ -203,6 +205,7 @@ def make_authenticated_application(
         created_at=datetime.now(timezone.utc),
     )
     return SimpleNamespace(
+        project_id=actual_project_id,
         application=application,
         source_duplicate_grouping_application=source_application,
         write_plan=None,
@@ -810,6 +813,7 @@ def test_build_consistency_check_plan_does_not_anchor_to_duplicate_grouping_resu
     baseline = make_authenticated_application(candidate_specs, result_manifest_hash="3" * 64)
     drifted_upstream = make_authenticated_application(
         candidate_specs,
+        project_id=baseline.project_id,
         consistency_application_id=baseline.application.id,
         duplicate_grouping_application_id=baseline.source_duplicate_grouping_application.id,
         orchestration_id=baseline.application.orchestration_id,
@@ -817,6 +821,7 @@ def test_build_consistency_check_plan_does_not_anchor_to_duplicate_grouping_resu
         result_manifest_hash=baseline.application.result_manifest_hash,
     )
     drifted_upstream = SimpleNamespace(
+        project_id=drifted_upstream.project_id,
         application=drifted_upstream.application,
         source_duplicate_grouping_application=replace(
             drifted_upstream.source_duplicate_grouping_application,
@@ -886,6 +891,97 @@ def test_build_consistency_check_plan_does_not_anchor_to_duplicate_grouping_resu
     assert drifted_plan.source_result_manifest_hash != drifted_upstream.source_duplicate_grouping_application.result_manifest_hash
     assert drifted_plan.batches[0].batch_manifest_hash == baseline_plan.batches[0].batch_manifest_hash
     assert drifted_plan.plan_manifest_hash == baseline_plan.plan_manifest_hash
+
+
+def test_build_consistency_check_plan_binds_project_id_into_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    candidate_specs = [
+        _candidate_spec(
+            fact_id=uuid.uuid4(),
+            members=[
+                _member_spec(
+                    semantic_key_hash="1" * 64,
+                    value_json="A",
+                    evidences=[_evidence_spec(source_order=0, excerpt="alpha", location_key="md:a")],
+                ),
+                _member_spec(
+                    semantic_key_hash="2" * 64,
+                    value_json="B",
+                    evidences=[_evidence_spec(source_order=0, excerpt="beta", location_key="md:b")],
+                ),
+            ],
+        )
+    ]
+    shared_application_id = uuid.uuid4()
+    shared_grouping_application_id = uuid.uuid4()
+    shared_orchestration_id = uuid.uuid4()
+    shared_extraction_run_id = uuid.uuid4()
+    first_project_id = uuid.uuid4()
+    second_project_id = uuid.uuid4()
+    authenticated_a = make_authenticated_application(
+        candidate_specs,
+        project_id=first_project_id,
+        consistency_application_id=shared_application_id,
+        duplicate_grouping_application_id=shared_grouping_application_id,
+        orchestration_id=shared_orchestration_id,
+        extraction_run_id=shared_extraction_run_id,
+        result_manifest_hash="5" * 64,
+    )
+    authenticated_b = make_authenticated_application(
+        candidate_specs,
+        project_id=second_project_id,
+        consistency_application_id=shared_application_id,
+        duplicate_grouping_application_id=shared_grouping_application_id,
+        orchestration_id=shared_orchestration_id,
+        extraction_run_id=shared_extraction_run_id,
+        result_manifest_hash="5" * 64,
+    )
+    rows = make_rows(authenticated_a, candidate_specs)
+    session_factory = SessionFactory()
+    current = {"value": authenticated_a}
+
+    async def fake_auth(_session_factory, *, consistency_application_id):
+        return current["value"]
+
+    async def fake_rows(_session, *, consistency_application_id):
+        return rows
+
+    monkeypatch.setattr(
+        duplicate_grouping_service,
+        "authenticate_fact_value_consistency_candidate_application",
+        fake_auth,
+    )
+    monkeypatch.setattr(
+        consistency_check_repository,
+        "list_consistency_check_candidate_rows",
+        fake_rows,
+    )
+
+    first_plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=shared_application_id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+    current["value"] = authenticated_b
+    second_plan = run_async(
+        consistency_check_service.build_consistency_check_plan(
+            session_factory,
+            consistency_application_id=shared_application_id,
+            config=ConsistencyCheckPlannerConfig(
+                max_candidates_per_batch=8,
+                max_evidence_characters_per_batch=500,
+            ),
+        )
+    )
+
+    assert first_plan.project_id == first_project_id
+    assert second_plan.project_id == second_project_id
+    assert first_plan.batches == second_plan.batches
+    assert first_plan.plan_manifest_hash != second_plan.plan_manifest_hash
 
 
 def test_build_consistency_check_plan_batches_without_splitting_candidates(

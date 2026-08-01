@@ -78,6 +78,7 @@ class ConsistencyCheckBatchPlan:
 
 @dataclass(frozen=True, slots=True)
 class ConsistencyCheckPlan:
+    project_id: uuid.UUID
     consistency_application_id: uuid.UUID
     source_result_manifest_hash: str
     planner_name: str
