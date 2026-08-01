@@ -91,15 +91,20 @@ class SessionFactory:
 class LedgerStore:
     def __init__(self) -> None:
         self.application: ConsistencyCheckApplicationLedgerRecord | None = None
+        self.authenticated_application: ConsistencyCheckApplicationLedgerRecord | None = None
         self.assessment: ConsistencyAssessmentLedgerRecord | None = None
+        self.authenticated_assessment: ConsistencyAssessmentLedgerRecord | None = None
         self.candidate_members: list[ConsistencyReviewCandidateMemberRecord] = []
         self.decisions: list[ConsistencyReviewDecisionLedgerRecord] = []
         self.selections: list[ConsistencyReviewDecisionSelectionLedgerRecord] = []
         self.actor: User | None = None
         self.membership: ProjectMember | None = None
+        self.locked_actor: User | None = None
+        self.locked_membership: ProjectMember | None = None
         self.create_decision_error: Exception | None = None
         self.create_selection_error: Exception | None = None
         self.on_create_decision = None
+        self.lock_events: list[str] = []
 
 
 def _build_actor(*, user_id: uuid.UUID, status: str = "active") -> User:
@@ -195,6 +200,8 @@ def _build_store() -> tuple[LedgerStore, dict[str, uuid.UUID]]:
         assessment_manifest_hash="f" * 64,
         created_at=created_at,
     )
+    store.authenticated_application = deepcopy(store.application)
+    store.authenticated_assessment = deepcopy(store.assessment)
     fv1 = _uuid("fv-1")
     fv2 = _uuid("fv-2")
     fv3 = _uuid("fv-3")
@@ -227,6 +234,8 @@ def _build_store() -> tuple[LedgerStore, dict[str, uuid.UUID]]:
         user_id=actor_id,
         role=ProjectMemberRole.OWNER.value,
     )
+    store.locked_actor = store.actor
+    store.locked_membership = store.membership
     ids = {
         "project_id": project_id,
         "app_id": app_id,
@@ -243,10 +252,10 @@ def _build_store() -> tuple[LedgerStore, dict[str, uuid.UUID]]:
 
 
 def _build_authenticated_context(store: LedgerStore):
-    assert store.application is not None
-    assert store.assessment is not None
+    assert store.authenticated_application is not None
+    assert store.authenticated_assessment is not None
     candidate = SimpleNamespace(
-        candidate_id=store.assessment.source_consistency_candidate_id,
+        candidate_id=store.authenticated_assessment.source_consistency_candidate_id,
         members=tuple(
             SimpleNamespace(
                 consistency_application_id=member.consistency_application_id,
@@ -259,12 +268,12 @@ def _build_authenticated_context(store: LedgerStore):
         ),
     )
     return SimpleNamespace(
-        application=store.application,
+        application=store.authenticated_application,
         authenticated_source=SimpleNamespace(),
         candidate_bundles=(candidate,),
         source_rows=(),
         batches=(),
-        assessments=(store.assessment,),
+        assessments=(store.authenticated_assessment,),
         citations=(),
     )
 
@@ -348,12 +357,34 @@ def _install_common_monkeypatches(monkeypatch, store: LedgerStore) -> None:
         return _build_authenticated_context(store)
 
     async def fake_get_active_user_by_id(_session, *, user_id):
-        if store.actor is not None and user_id == store.actor.id:
+        if (
+            store.actor is not None
+            and user_id == store.actor.id
+            and store.actor.status == "active"
+        ):
             return store.actor
         return None
 
     async def fake_get_project_member_for_project(_session, *, project_id, user_id):
         membership = store.membership
+        if (
+            membership is not None
+            and membership.project_id == project_id
+            and membership.user_id == user_id
+        ):
+            return membership
+        return None
+
+    async def fake_get_active_user_by_id_for_update(_session, *, user_id):
+        store.lock_events.append("user")
+        actor = store.locked_actor
+        if actor is not None and user_id == actor.id and actor.status == "active":
+            return actor
+        return None
+
+    async def fake_get_project_member_for_project_for_update(_session, *, project_id, user_id):
+        store.lock_events.append("project_member")
+        membership = store.locked_membership
         if (
             membership is not None
             and membership.project_id == project_id
@@ -378,6 +409,7 @@ def _install_common_monkeypatches(monkeypatch, store: LedgerStore) -> None:
             and consistency_check_application_id == store.assessment.consistency_check_application_id
             and assessment_id == store.assessment.id
         ):
+            store.lock_events.append("assessment")
             return store.assessment
         return None
 
@@ -478,6 +510,16 @@ def _install_common_monkeypatches(monkeypatch, store: LedgerStore) -> None:
     )
     monkeypatch.setattr(
         review_service.consistency_review_repository,
+        "get_active_user_by_id_for_update",
+        fake_get_active_user_by_id_for_update,
+    )
+    monkeypatch.setattr(
+        review_service.consistency_review_repository,
+        "get_project_member_for_project_for_update",
+        fake_get_project_member_for_project_for_update,
+    )
+    monkeypatch.setattr(
+        review_service.consistency_review_repository,
         "get_consistency_check_application_by_id",
         fake_get_consistency_check_application_by_id,
     )
@@ -542,6 +584,64 @@ def test_append_consistency_review_decision_allows_owner_and_editor(monkeypatch,
     assert result.decision_no == 1
     assert result.selected_fact_value_ids == (ids["fv2"],)
     assert store.decisions[0].comment == "choose second"
+    assert store.lock_events[:3] == ["assessment", "user", "project_member"]
+
+
+@pytest.mark.parametrize(
+    ("mutate_locked_state", "error_code"),
+    [
+        (
+            lambda store, ids: setattr(
+                store,
+                "locked_actor",
+                _build_actor(user_id=ids["actor_id"], status="inactive"),
+            ),
+            "consistency_review_actor_not_found",
+        ),
+        (
+            lambda store, _ids: setattr(store, "locked_membership", None),
+            "consistency_review_actor_membership_not_found",
+        ),
+        (
+            lambda store, ids: setattr(
+                store,
+                "locked_membership",
+                _build_membership(
+                    project_id=ids["project_id"],
+                    user_id=ids["actor_id"],
+                    role=ProjectMemberRole.VIEWER.value,
+                ),
+            ),
+            "consistency_review_actor_permission_denied",
+        ),
+    ],
+)
+def test_append_consistency_review_decision_rejects_when_actor_changes_before_write_commit(
+    monkeypatch,
+    mutate_locked_state,
+    error_code: str,
+) -> None:
+    store, ids = _build_store()
+    mutate_locked_state(store, ids)
+    session_factory = SessionFactory(store)
+    _install_common_monkeypatches(monkeypatch, store)
+
+    with pytest.raises(review_service.ConsistencyReviewStateError, match=error_code):
+        run_async(
+            review_service.append_consistency_review_decision(
+                session_factory,
+                project_id=ids["project_id"],
+                consistency_check_application_id=ids["app_id"],
+                assessment_id=ids["assessment_id"],
+                actor_id=ids["actor_id"],
+                expected_current_decision_id=None,
+                decision_kind="select_one",
+                selected_fact_value_ids=[ids["fv1"]],
+            )
+        )
+
+    assert store.decisions == []
+    assert store.selections == []
 
 
 @pytest.mark.parametrize(
@@ -825,6 +925,72 @@ def test_append_consistency_review_decision_retries_same_request_idempotently(mo
     assert len(store.decisions) == 1
 
 
+@pytest.mark.parametrize(
+    ("mutate_locked_state", "error_code"),
+    [
+        (
+            lambda store, ids: setattr(
+                store,
+                "locked_actor",
+                _build_actor(user_id=ids["actor_id"], status="inactive"),
+            ),
+            "consistency_review_actor_not_found",
+        ),
+        (
+            lambda store, _ids: setattr(store, "locked_membership", None),
+            "consistency_review_actor_membership_not_found",
+        ),
+        (
+            lambda store, ids: setattr(
+                store,
+                "locked_membership",
+                _build_membership(
+                    project_id=ids["project_id"],
+                    user_id=ids["actor_id"],
+                    role=ProjectMemberRole.VIEWER.value,
+                ),
+            ),
+            "consistency_review_actor_permission_denied",
+        ),
+    ],
+)
+def test_append_consistency_review_decision_existing_matching_path_reauths_actor(
+    monkeypatch,
+    mutate_locked_state,
+    error_code: str,
+) -> None:
+    store, ids = _build_store()
+    existing_decision, existing_selections = _committed_decision(
+        store,
+        ids,
+        decision_no=1,
+        supersedes_decision_id=None,
+        decision_kind="select_one",
+        comment="same request",
+        selected_fact_value_ids=(ids["fv1"],),
+    )
+    store.decisions.append(existing_decision)
+    store.selections.extend(existing_selections)
+    mutate_locked_state(store, ids)
+    session_factory = SessionFactory(store)
+    _install_common_monkeypatches(monkeypatch, store)
+
+    with pytest.raises(review_service.ConsistencyReviewStateError, match=error_code):
+        run_async(
+            review_service.append_consistency_review_decision(
+                session_factory,
+                project_id=ids["project_id"],
+                consistency_check_application_id=ids["app_id"],
+                assessment_id=ids["assessment_id"],
+                actor_id=ids["actor_id"],
+                expected_current_decision_id=None,
+                decision_kind="select_one",
+                selected_fact_value_ids=[ids["fv1"]],
+                comment="same request",
+            )
+        )
+
+
 def test_append_consistency_review_decision_handles_same_request_concurrent_conflict(monkeypatch) -> None:
     store, ids = _build_store()
     session_factory = SessionFactory(store)
@@ -867,6 +1033,79 @@ def test_append_consistency_review_decision_handles_same_request_concurrent_conf
     assert result.decision_id == store.decisions[0].id
 
 
+@pytest.mark.parametrize(
+    ("mutate_after_conflict", "error_code"),
+    [
+        (
+            lambda store, ids: setattr(
+                store,
+                "locked_actor",
+                _build_actor(user_id=ids["actor_id"], status="inactive"),
+            ),
+            "consistency_review_actor_not_found",
+        ),
+        (
+            lambda store, _ids: setattr(store, "locked_membership", None),
+            "consistency_review_actor_membership_not_found",
+        ),
+        (
+            lambda store, ids: setattr(
+                store,
+                "locked_membership",
+                _build_membership(
+                    project_id=ids["project_id"],
+                    user_id=ids["actor_id"],
+                    role=ProjectMemberRole.VIEWER.value,
+                ),
+            ),
+            "consistency_review_actor_permission_denied",
+        ),
+    ],
+)
+def test_append_consistency_review_decision_integrity_recovery_reauths_actor(
+    monkeypatch,
+    mutate_after_conflict,
+    error_code: str,
+) -> None:
+    store, ids = _build_store()
+    session_factory = SessionFactory(store)
+
+    def concurrent_winner(_pending_decision) -> None:
+        if store.decisions:
+            return
+        winner, winner_selections = _committed_decision(
+            store,
+            ids,
+            decision_no=1,
+            supersedes_decision_id=None,
+            decision_kind="select_one",
+            comment="same request",
+            selected_fact_value_ids=(ids["fv1"],),
+        )
+        store.decisions.append(winner)
+        store.selections.extend(winner_selections)
+        mutate_after_conflict(store, ids)
+        store.create_decision_error = _integrity_error("uq_ccrevd_manifest_hash")
+
+    store.on_create_decision = concurrent_winner
+    _install_common_monkeypatches(monkeypatch, store)
+
+    with pytest.raises(review_service.ConsistencyReviewStateError, match=error_code):
+        run_async(
+            review_service.append_consistency_review_decision(
+                session_factory,
+                project_id=ids["project_id"],
+                consistency_check_application_id=ids["app_id"],
+                assessment_id=ids["assessment_id"],
+                actor_id=ids["actor_id"],
+                expected_current_decision_id=None,
+                decision_kind="select_one",
+                selected_fact_value_ids=[ids["fv1"]],
+                comment="same request",
+            )
+        )
+
+
 def test_append_consistency_review_decision_rejects_different_request_after_concurrent_win(monkeypatch) -> None:
     store, ids = _build_store()
     session_factory = SessionFactory(store)
@@ -900,6 +1139,52 @@ def test_append_consistency_review_decision_rejects_different_request_after_conc
                 expected_current_decision_id=None,
                 decision_kind="select_one",
                 selected_fact_value_ids=[ids["fv2"]],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("plan_manifest_hash", "1" * 64),
+        ("execution_identity_hash", "2" * 64),
+        ("prompt_contract_hash", "3" * 64),
+        ("provider", "anthropic"),
+        ("requested_model", "claude-4"),
+        ("executor_name", "other-executor"),
+        ("executor_version", "9.9.9"),
+        ("batch_count", 2),
+        ("executed_batch_count", 0),
+        ("skipped_empty_batch_count", 1),
+        ("inference_run_count", 2),
+        ("assessment_count", 2),
+    ],
+)
+def test_append_consistency_review_decision_fails_closed_on_application_field_drift(
+    monkeypatch,
+    field_name: str,
+    field_value,
+) -> None:
+    store, ids = _build_store()
+    assert store.application is not None
+    store.application = replace(store.application, **{field_name: field_value})
+    session_factory = SessionFactory(store)
+    _install_common_monkeypatches(monkeypatch, store)
+
+    with pytest.raises(
+        review_service.ConsistencyReviewInvariantError,
+        match="consistency_review_immutable_ledger_mismatch",
+    ):
+        run_async(
+            review_service.append_consistency_review_decision(
+                session_factory,
+                project_id=ids["project_id"],
+                consistency_check_application_id=ids["app_id"],
+                assessment_id=ids["assessment_id"],
+                actor_id=ids["actor_id"],
+                expected_current_decision_id=None,
+                decision_kind="select_one",
+                selected_fact_value_ids=[ids["fv1"]],
             )
         )
 

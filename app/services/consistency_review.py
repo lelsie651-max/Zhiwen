@@ -321,26 +321,54 @@ async def _authorize_actor(
                 read_session,
                 user_id=actor_id,
             )
-            if actor is None:
-                raise ConsistencyReviewStateError("consistency_review_actor_not_found")
             membership = await consistency_review_repository.get_project_member_for_project(
                 read_session,
                 project_id=project_id,
                 user_id=actor_id,
             )
-            if membership is None:
-                raise ConsistencyReviewStateError(
-                    "consistency_review_actor_membership_not_found"
-                )
-            if membership.role not in _ALLOWED_ROLES:
-                raise ConsistencyReviewStateError(
-                    "consistency_review_actor_permission_denied"
-                )
+            _assert_actor_permission(actor=actor, membership=membership)
         except BaseException:
             await read_session.rollback()
             raise
         else:
             await read_session.rollback()
+
+
+def _assert_actor_permission(
+    *,
+    actor: object | None,
+    membership: object | None,
+) -> None:
+    if actor is None:
+        raise ConsistencyReviewStateError("consistency_review_actor_not_found")
+    if membership is None:
+        raise ConsistencyReviewStateError(
+            "consistency_review_actor_membership_not_found"
+        )
+    if membership.role not in _ALLOWED_ROLES:
+        raise ConsistencyReviewStateError(
+            "consistency_review_actor_permission_denied"
+        )
+
+
+async def _reauthorize_actor_in_transaction(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    actor_id: uuid.UUID,
+) -> None:
+    actor = await consistency_review_repository.get_active_user_by_id_for_update(
+        session,
+        user_id=actor_id,
+    )
+    membership = (
+        await consistency_review_repository.get_project_member_for_project_for_update(
+            session,
+            project_id=project_id,
+            user_id=actor_id,
+        )
+    )
+    _assert_actor_permission(actor=actor, membership=membership)
 
 
 def _resolve_authoritative_target(
@@ -398,7 +426,34 @@ def _assert_application_snapshot_matches(
         _immutable_mismatch()
     if current_application.source_result_manifest_hash != application.source_result_manifest_hash:
         _immutable_mismatch()
+    if current_application.plan_manifest_hash != application.plan_manifest_hash:
+        _immutable_mismatch()
+    if current_application.execution_identity_hash != application.execution_identity_hash:
+        _immutable_mismatch()
     if current_application.result_manifest_hash != application.result_manifest_hash:
+        _immutable_mismatch()
+    if current_application.prompt_contract_hash != application.prompt_contract_hash:
+        _immutable_mismatch()
+    if current_application.provider != application.provider:
+        _immutable_mismatch()
+    if current_application.requested_model != application.requested_model:
+        _immutable_mismatch()
+    if current_application.executor_name != application.executor_name:
+        _immutable_mismatch()
+    if current_application.executor_version != application.executor_version:
+        _immutable_mismatch()
+    if current_application.batch_count != application.batch_count:
+        _immutable_mismatch()
+    if current_application.executed_batch_count != application.executed_batch_count:
+        _immutable_mismatch()
+    if (
+        current_application.skipped_empty_batch_count
+        != application.skipped_empty_batch_count
+    ):
+        _immutable_mismatch()
+    if current_application.inference_run_count != application.inference_run_count:
+        _immutable_mismatch()
+    if current_application.assessment_count != application.assessment_count:
         _immutable_mismatch()
 
 
@@ -686,6 +741,11 @@ async def _load_validated_chain_in_session(
         current_assessment,
         authoritative_assessment=authoritative_assessment,
         consistency_check_application_id=request.consistency_check_application_id,
+    )
+    await _reauthorize_actor_in_transaction(
+        session,
+        project_id=request.project_id,
+        actor_id=request.actor_id,
     )
     current_members = await consistency_review_repository.list_candidate_member_records(
         session,

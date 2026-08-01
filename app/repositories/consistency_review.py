@@ -34,6 +34,22 @@ async def get_active_user_by_id(
     return result.scalar_one_or_none()
 
 
+async def get_active_user_by_id_for_update(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+) -> User | None:
+    result = await session.execute(
+        select(User)
+        .where(
+            User.id == user_id,
+            User.status == "active",
+        )
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_project_member_for_project(
     session: AsyncSession,
     *,
@@ -45,6 +61,23 @@ async def get_project_member_for_project(
             ProjectMember.project_id == project_id,
             ProjectMember.user_id == user_id,
         )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_project_member_for_project_for_update(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> ProjectMember | None:
+    result = await session.execute(
+        select(ProjectMember)
+        .where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user_id,
+        )
+        .with_for_update()
     )
     return result.scalar_one_or_none()
 
