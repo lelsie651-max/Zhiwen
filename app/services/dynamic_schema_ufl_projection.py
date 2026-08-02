@@ -410,6 +410,100 @@ def _build_projected_field(
     )
 
 
+def authenticate_dynamic_schema_ufl_projected_field(
+    field: DynamicSchemaUFLProjectedField,
+    *,
+    record_subject_key: str,
+    subject_kind: str | None,
+) -> DynamicSchemaUFLProjectedField:
+    _require_projection_uuid(field.field_id)
+    _require_projection_uuid(field.schema_version_id)
+    if isinstance(field.display_order, bool) or not isinstance(field.display_order, int):
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    if field.cardinality not in {
+        DynamicSchemaFieldCardinality.ONE.value,
+        DynamicSchemaFieldCardinality.MANY.value,
+    }:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    if field.expected_value_type not in {
+        value_type.value for value_type in DynamicSchemaFieldValueType
+    }:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    matched_fact_count = _require_projection_count(field.matched_fact_count)
+    semantic_value_count = _require_projection_count(field.semantic_value_count)
+    field_definition = dynamic_schema_projection_service.DynamicSchemaFieldDefinitionSnapshot(
+        field_id=field.field_id,
+        schema_version_id=field.schema_version_id,
+        field_key=field.field_key,
+        label=field.label,
+        description=field.description,
+        predicate_key=field.predicate_key,
+        scope_key=field.scope_key,
+        expected_value_type=field.expected_value_type,
+        cardinality=field.cardinality,
+        is_required=field.is_required,
+        is_title=field.is_title,
+        is_summary=field.is_summary,
+        is_hidden=field.is_hidden,
+        group_key=field.group_key,
+        display_order=field.display_order,
+        display_config=field.display_config,
+        validation_rules=field.validation_rules,
+        created_at=field.created_at,
+    )
+    seen_fact_ids: set[uuid.UUID] = set()
+    for fact in field.matched_facts:
+        _require_projection_uuid(fact.fact_id)
+        if fact.fact_id in seen_fact_ids:
+            raise DynamicSchemaUFLProjectionInvariantError(
+                "dynamic_schema_ufl_projection_projection_invalid"
+            )
+        seen_fact_ids.add(fact.fact_id)
+        if fact.subject_key != record_subject_key:
+            raise DynamicSchemaUFLProjectionInvariantError(
+                "dynamic_schema_ufl_projection_projection_invalid"
+            )
+        if subject_kind is not None and fact.subject_kind != subject_kind:
+            raise DynamicSchemaUFLProjectionInvariantError(
+                "dynamic_schema_ufl_projection_projection_invalid"
+            )
+    expected_field = _build_projected_field(
+        field=field_definition,
+        subject_facts=field.matched_facts,
+    )
+    if expected_field.matched_facts != field.matched_facts:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    if expected_field.matched_fact_count != matched_fact_count:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    if expected_field.semantic_value_count != semantic_value_count:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    if expected_field.is_missing != field.is_missing:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    if expected_field.type_compatible != field.type_compatible:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    if expected_field.issues != field.issues:
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    return field
+
+
 def _build_record(
     *,
     subject_key: str,
@@ -550,97 +644,16 @@ def authenticate_dynamic_schema_ufl_projection(
         recomputed_record_required_missing_field_keys: list[str] = []
         recomputed_record_issue_count = 0
         for field in record.fields:
-            _require_projection_uuid(field.field_id)
-            _require_projection_uuid(field.schema_version_id)
-            if isinstance(field.display_order, bool) or not isinstance(field.display_order, int):
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            if field.cardinality not in {
-                DynamicSchemaFieldCardinality.ONE.value,
-                DynamicSchemaFieldCardinality.MANY.value,
-            }:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            if field.expected_value_type not in {
-                value_type.value for value_type in DynamicSchemaFieldValueType
-            }:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            matched_fact_count = _require_projection_count(field.matched_fact_count)
-            semantic_value_count = _require_projection_count(field.semantic_value_count)
             if field.field_key in seen_field_keys:
                 raise DynamicSchemaUFLProjectionInvariantError(
                     "dynamic_schema_ufl_projection_projection_invalid"
                 )
             seen_field_keys.add(field.field_key)
-
-            field_definition = dynamic_schema_projection_service.DynamicSchemaFieldDefinitionSnapshot(
-                field_id=field.field_id,
-                schema_version_id=field.schema_version_id,
-                field_key=field.field_key,
-                label=field.label,
-                description=field.description,
-                predicate_key=field.predicate_key,
-                scope_key=field.scope_key,
-                expected_value_type=field.expected_value_type,
-                cardinality=field.cardinality,
-                is_required=field.is_required,
-                is_title=field.is_title,
-                is_summary=field.is_summary,
-                is_hidden=field.is_hidden,
-                group_key=field.group_key,
-                display_order=field.display_order,
-                display_config=field.display_config,
-                validation_rules=field.validation_rules,
-                created_at=field.created_at,
+            authenticate_dynamic_schema_ufl_projected_field(
+                field,
+                record_subject_key=record.subject_key,
+                subject_kind=projection.subject_kind,
             )
-            seen_fact_ids: set[uuid.UUID] = set()
-            for fact in field.matched_facts:
-                _require_projection_uuid(fact.fact_id)
-                if fact.fact_id in seen_fact_ids:
-                    raise DynamicSchemaUFLProjectionInvariantError(
-                        "dynamic_schema_ufl_projection_projection_invalid"
-                    )
-                seen_fact_ids.add(fact.fact_id)
-                if fact.subject_key != record.subject_key:
-                    raise DynamicSchemaUFLProjectionInvariantError(
-                        "dynamic_schema_ufl_projection_projection_invalid"
-                    )
-                if fact.subject_kind != projection.subject_kind:
-                    raise DynamicSchemaUFLProjectionInvariantError(
-                        "dynamic_schema_ufl_projection_projection_invalid"
-                    )
-            expected_field = _build_projected_field(
-                field=field_definition,
-                subject_facts=field.matched_facts,
-            )
-            if expected_field.matched_facts != field.matched_facts:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            if expected_field.matched_fact_count != matched_fact_count:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            if expected_field.semantic_value_count != semantic_value_count:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            if expected_field.is_missing != field.is_missing:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            if expected_field.type_compatible != field.type_compatible:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
-            if expected_field.issues != field.issues:
-                raise DynamicSchemaUFLProjectionInvariantError(
-                    "dynamic_schema_ufl_projection_projection_invalid"
-                )
             recomputed_projected_field_count += 1
             recomputed_record_issue_count += len(field.issues)
             if "required_missing" in field.issues:

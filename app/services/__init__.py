@@ -39,6 +39,7 @@ from app.services.dynamic_schema_ufl_projection import (
     DynamicSchemaUFLProjectionError,
     DynamicSchemaUFLProjectionInvariantError,
     DynamicSchemaUFLProjectionStateError,
+    authenticate_dynamic_schema_ufl_projected_field,
     authenticate_dynamic_schema_ufl_projection,
     normalize_dynamic_schema_ufl_subject_keys,
     project_orchestration_ufl_to_dynamic_schema,
@@ -173,24 +174,31 @@ def __getattr__(name: str):
         "DynamicSchemaReviewProjectionError",
         "DynamicSchemaReviewProjectionStateError",
         "DynamicSchemaReviewProjectionInvariantError",
+        "authenticate_dynamic_schema_review_projection",
         "project_reviewed_orchestration_ufl_to_dynamic_schema",
         "EffectiveFactValueProjectionError",
         "EffectiveFactValueProjectionStateError",
         "EffectiveFactValueProjectionInvariantError",
         "get_effective_fact_value_projection",
         "authenticate_effective_fact_value_projection",
+        "DynamicSchemaKnowledgeViewError",
+        "DynamicSchemaKnowledgeViewStateError",
+        "DynamicSchemaKnowledgeViewInvariantError",
+        "build_dynamic_schema_knowledge_view",
     }:
         exported = {}
         if name in {
             "DynamicSchemaReviewProjectionError",
             "DynamicSchemaReviewProjectionStateError",
             "DynamicSchemaReviewProjectionInvariantError",
+            "authenticate_dynamic_schema_review_projection",
             "project_reviewed_orchestration_ufl_to_dynamic_schema",
         }:
             from app.services.dynamic_schema_review_projection import (
                 DynamicSchemaReviewProjectionError,
                 DynamicSchemaReviewProjectionInvariantError,
                 DynamicSchemaReviewProjectionStateError,
+                authenticate_dynamic_schema_review_projection,
                 project_reviewed_orchestration_ufl_to_dynamic_schema,
             )
 
@@ -204,6 +212,9 @@ def __getattr__(name: str):
                     ),
                     "DynamicSchemaReviewProjectionInvariantError": (
                         DynamicSchemaReviewProjectionInvariantError
+                    ),
+                    "authenticate_dynamic_schema_review_projection": (
+                        authenticate_dynamic_schema_review_projection
                     ),
                     "project_reviewed_orchestration_ufl_to_dynamic_schema": (
                         project_reviewed_orchestration_ufl_to_dynamic_schema
@@ -244,6 +255,35 @@ def __getattr__(name: str):
                     ),
                 }
             )
+        if name in {
+            "DynamicSchemaKnowledgeViewError",
+            "DynamicSchemaKnowledgeViewStateError",
+            "DynamicSchemaKnowledgeViewInvariantError",
+            "build_dynamic_schema_knowledge_view",
+        }:
+            from app.services.dynamic_schema_knowledge_view import (
+                DynamicSchemaKnowledgeViewError,
+                DynamicSchemaKnowledgeViewInvariantError,
+                DynamicSchemaKnowledgeViewStateError,
+                build_dynamic_schema_knowledge_view,
+            )
+
+            exported.update(
+                {
+                    "DynamicSchemaKnowledgeViewError": (
+                        DynamicSchemaKnowledgeViewError
+                    ),
+                    "DynamicSchemaKnowledgeViewStateError": (
+                        DynamicSchemaKnowledgeViewStateError
+                    ),
+                    "DynamicSchemaKnowledgeViewInvariantError": (
+                        DynamicSchemaKnowledgeViewInvariantError
+                    ),
+                    "build_dynamic_schema_knowledge_view": (
+                        build_dynamic_schema_knowledge_view
+                    ),
+                }
+            )
         return exported[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -267,6 +307,9 @@ __all__ = [
     "DynamicSchemaUFLProjectionError",
     "DynamicSchemaUFLProjectionStateError",
     "DynamicSchemaUFLProjectionInvariantError",
+    "DynamicSchemaKnowledgeViewError",
+    "DynamicSchemaKnowledgeViewStateError",
+    "DynamicSchemaKnowledgeViewInvariantError",
     "EffectiveFactValueProjectionError",
     "EffectiveFactValueProjectionStateError",
     "EffectiveFactValueProjectionInvariantError",
@@ -299,6 +342,7 @@ __all__ = [
     "project_dynamic_schema_version",
     "project_current_dynamic_schema",
     "project_orchestration_ufl_to_dynamic_schema",
+    "authenticate_dynamic_schema_ufl_projected_field",
     "authenticate_dynamic_schema_ufl_projection",
     "normalize_dynamic_schema_ufl_subject_keys",
     "serialize_dynamic_schema_ufl_fact",
@@ -306,7 +350,9 @@ __all__ = [
     "serialize_dynamic_schema_ufl_projected_record",
     "get_effective_fact_value_projection",
     "authenticate_effective_fact_value_projection",
+    "authenticate_dynamic_schema_review_projection",
     "project_reviewed_orchestration_ufl_to_dynamic_schema",
+    "build_dynamic_schema_knowledge_view",
     "create_human_schema_draft",
     "propose_ai_schema_version",
     "FactProposalError",

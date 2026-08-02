@@ -521,6 +521,76 @@ def _base_projection() -> tuple[DynamicSchemaUFLProjection, dict[str, UFLFactSna
     }
 
 
+def _build_valid_review_projection(monkeypatch: pytest.MonkeyPatch) -> DynamicSchemaReviewProjection:
+    raw_projection, facts = _base_projection()
+    effective_projection = _effective_projection(
+        items=(
+            _effective_item(
+                fact=facts["select_one"],
+                resolution_status="resolved",
+                resolution_basis="human_selection",
+                effective_fact_value_ids=(_uuid("fv-select-one-b"),),
+                decision_kind="select_one",
+            ),
+            _effective_item(
+                fact=facts["keep_multiple"],
+                resolution_status="resolved",
+                resolution_basis="human_selection",
+                effective_fact_value_ids=(
+                    _uuid("fv-keep-multiple-b"),
+                    _uuid("fv-keep-multiple-a"),
+                ),
+                decision_kind="keep_multiple",
+            ),
+            _effective_item(
+                fact=facts["confirm_compatible"],
+                resolution_status="resolved",
+                resolution_basis="human_confirmed_compatibility",
+                effective_fact_value_ids=(
+                    _uuid("fv-confirm-compatible-a"),
+                    _uuid("fv-confirm-compatible-b"),
+                ),
+                decision_kind="confirm_compatible",
+            ),
+            _effective_item(
+                fact=facts["pending"],
+                resolution_status="pending_review",
+                resolution_basis="none",
+                effective_fact_value_ids=(),
+            ),
+            _effective_item(
+                fact=facts["deferred"],
+                resolution_status="deferred",
+                resolution_basis="none",
+                effective_fact_value_ids=(),
+                decision_kind="defer",
+            ),
+            _effective_item(
+                fact=facts["unreviewed"],
+                resolution_status="unreviewed_compatible",
+                resolution_basis="none",
+                effective_fact_value_ids=(),
+            ),
+        )
+    )
+    _install_sources(
+        monkeypatch,
+        raw_projection_factory=lambda _subject_keys: raw_projection,
+        authenticated_context=_authenticated_context(),
+        effective_projection=effective_projection,
+    )
+    return run_async(
+        review_projection_service.project_reviewed_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=raw_projection.project_id,
+            schema_id=raw_projection.schema_id,
+            schema_version_id=raw_projection.schema_version_id,
+            orchestration_id=raw_projection.orchestration_id,
+            consistency_check_application_id=_uuid("consistency-check-application"),
+        )
+    )
+
+
 def test_project_reviewed_orchestration_ufl_to_dynamic_schema_maps_review_states_and_preserves_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1201,3 +1271,217 @@ def test_project_reviewed_orchestration_ufl_to_dynamic_schema_calls_public_child
     )
 
     assert calls == ["raw", "effective"]
+
+
+def test_authenticate_dynamic_schema_review_projection_accepts_valid_projection_and_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = _build_valid_review_projection(monkeypatch)
+
+    authenticated = review_projection_service.authenticate_dynamic_schema_review_projection(
+        projection,
+        subject_keys=None,
+    )
+
+    assert authenticated == projection
+
+
+@pytest.mark.parametrize(
+    "mutate_projection",
+    [
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=(
+                        replace(
+                            projection.records[0].fields[0],
+                            reviewed_facts=(
+                                replace(
+                                    projection.records[0].fields[0].reviewed_facts[0],
+                                    candidate_id=_uuid("bad-candidate"),
+                                ),
+                            ),
+                        ),
+                    )
+                    + projection.records[0].fields[1:],
+                ),
+                projection.records[1],
+            ),
+        ),
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=projection.records[0].fields[:1]
+                    + (
+                        replace(
+                            projection.records[0].fields[1],
+                            reviewed_facts=(
+                                replace(
+                                    projection.records[0].fields[1].reviewed_facts[0],
+                                    current_decision_id=None,
+                                ),
+                            ),
+                        ),
+                    )
+                    + projection.records[0].fields[2:],
+                ),
+                projection.records[1],
+            ),
+        ),
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=projection.records[0].fields[:5]
+                    + (
+                        replace(
+                            projection.records[0].fields[5],
+                            reviewed_facts=(
+                                replace(
+                                    projection.records[0].fields[5].reviewed_facts[0],
+                                    current_decision_id=_uuid("bad-decision"),
+                                ),
+                            ),
+                        ),
+                    )
+                    + projection.records[0].fields[6:],
+                ),
+                projection.records[1],
+            ),
+        ),
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=projection.records[0].fields[:6]
+                    + (
+                        replace(
+                            projection.records[0].fields[6],
+                            reviewed_facts=(
+                                replace(
+                                    projection.records[0].fields[6].reviewed_facts[0],
+                                    current_decision_kind="select_one",
+                                ),
+                            ),
+                        ),
+                    )
+                    + projection.records[0].fields[7:],
+                ),
+                projection.records[1],
+            ),
+        ),
+    ],
+)
+def test_authenticate_dynamic_schema_review_projection_rejects_reviewed_fact_shape_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_projection,
+) -> None:
+    projection = _build_valid_review_projection(monkeypatch)
+    mutated_projection = mutate_projection(projection)
+    resigned_projection = replace(
+        mutated_projection,
+        reviewed_projection_manifest_hash=review_projection_service._build_manifest_hash(
+            projection=mutated_projection,
+            subject_keys_filter=None,
+        ),
+    )
+
+    with pytest.raises(
+        review_projection_service.DynamicSchemaReviewProjectionInvariantError,
+        match="dynamic_schema_review_projection_projection_invalid",
+    ):
+        review_projection_service.authenticate_dynamic_schema_review_projection(
+            resigned_projection,
+            subject_keys=None,
+        )
+
+
+def test_authenticate_dynamic_schema_review_projection_rejects_cross_field_fact_drift_even_if_manifest_is_resigned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = _build_valid_review_projection(monkeypatch)
+    mutated_projection = replace(
+        projection,
+        records=(
+            replace(
+                projection.records[0],
+                fields=projection.records[0].fields[:4]
+                + (
+                    replace(
+                        projection.records[0].fields[4],
+                        reviewed_facts=(
+                            replace(
+                                projection.records[0].fields[4].reviewed_facts[0],
+                                effective_fact_value_ids=(
+                                    _uuid("fv-confirm-compatible-a"),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                + projection.records[0].fields[5:],
+            ),
+            projection.records[1],
+        ),
+    )
+    resigned_projection = replace(
+        mutated_projection,
+        reviewed_projection_manifest_hash=review_projection_service._build_manifest_hash(
+            projection=mutated_projection,
+            subject_keys_filter=None,
+        ),
+    )
+
+    with pytest.raises(
+        review_projection_service.DynamicSchemaReviewProjectionInvariantError,
+        match="dynamic_schema_review_projection_projection_invalid",
+    ):
+        review_projection_service.authenticate_dynamic_schema_review_projection(
+            resigned_projection,
+            subject_keys=None,
+        )
+
+
+def test_project_reviewed_orchestration_ufl_to_dynamic_schema_calls_public_review_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_projection, _facts = _base_projection()
+    _install_sources(
+        monkeypatch,
+        raw_projection_factory=lambda _subject_keys: raw_projection,
+        authenticated_context=_authenticated_context(),
+        effective_projection=_effective_projection(items=()),
+    )
+    original_authenticate = (
+        review_projection_service.authenticate_dynamic_schema_review_projection
+    )
+    calls: list[int] = []
+
+    def tracking_authenticate(projection, *, subject_keys):
+        calls.append(1)
+        return original_authenticate(projection, subject_keys=subject_keys)
+
+    monkeypatch.setattr(
+        review_projection_service,
+        "authenticate_dynamic_schema_review_projection",
+        tracking_authenticate,
+    )
+
+    run_async(
+        review_projection_service.project_reviewed_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=raw_projection.project_id,
+            schema_id=raw_projection.schema_id,
+            schema_version_id=raw_projection.schema_version_id,
+            orchestration_id=raw_projection.orchestration_id,
+            consistency_check_application_id=_uuid("consistency-check-application"),
+        )
+    )
+
+    assert calls == [1]

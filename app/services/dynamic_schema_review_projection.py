@@ -55,6 +55,22 @@ def _require_sha256(value: object, *, error_code: str) -> str:
     return value
 
 
+def _require_projection_uuid(value: object) -> uuid.UUID:
+    if not isinstance(value, uuid.UUID):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    return value
+
+
+def _require_projection_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    return value
+
+
 def _normalize_subject_keys(subject_keys: object) -> list[str] | None:
     try:
         return raw_projection_service.normalize_dynamic_schema_ufl_subject_keys(
@@ -267,6 +283,119 @@ def _validate_fact_binding(
         )
 
 
+def _validate_reviewed_fact_shape(
+    reviewed_fact: DynamicSchemaReviewedFact,
+) -> frozenset[uuid.UUID]:
+    fact_value_ids = _collect_fact_value_ids(reviewed_fact.fact)
+    if reviewed_fact.review_state == "no_consistency_candidate":
+        if (
+            reviewed_fact.candidate_id is not None
+            or reviewed_fact.assessment_id is not None
+            or reviewed_fact.current_decision_id is not None
+            or reviewed_fact.current_decision_kind is not None
+        ):
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.resolution_basis != "none":
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.effective_fact_value_ids:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.requires_review:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        return fact_value_ids
+
+    _require_projection_uuid(reviewed_fact.candidate_id)
+    _require_projection_uuid(reviewed_fact.assessment_id)
+    if reviewed_fact.review_state == "resolved":
+        _require_projection_uuid(reviewed_fact.current_decision_id)
+        if reviewed_fact.requires_review:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.resolution_basis == "human_selection":
+            if reviewed_fact.current_decision_kind not in {"select_one", "keep_multiple"}:
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+        elif reviewed_fact.resolution_basis == "human_confirmed_compatibility":
+            if reviewed_fact.current_decision_kind != "confirm_compatible":
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+        else:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if not reviewed_fact.effective_fact_value_ids:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if len(set(reviewed_fact.effective_fact_value_ids)) != len(
+            reviewed_fact.effective_fact_value_ids
+        ):
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if any(
+            fact_value_id not in fact_value_ids
+            for fact_value_id in reviewed_fact.effective_fact_value_ids
+        ):
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        return fact_value_ids
+
+    if reviewed_fact.review_state in {"pending_review", "unreviewed_compatible"}:
+        if reviewed_fact.current_decision_id is not None or reviewed_fact.current_decision_kind is not None:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.resolution_basis != "none":
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.effective_fact_value_ids:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if not reviewed_fact.requires_review:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        return fact_value_ids
+
+    if reviewed_fact.review_state == "deferred":
+        _require_projection_uuid(reviewed_fact.current_decision_id)
+        if reviewed_fact.current_decision_kind != "defer":
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.resolution_basis != "none":
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if reviewed_fact.effective_fact_value_ids:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if not reviewed_fact.requires_review:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        return fact_value_ids
+
+    raise DynamicSchemaReviewProjectionInvariantError(
+        "dynamic_schema_review_projection_projection_invalid"
+    )
+
+
 def _build_reviewed_fact(
     *,
     fact: UFLFactSnapshot,
@@ -417,6 +546,249 @@ def _build_manifest_hash(
             "records": [_serialize_record(record) for record in projection.records],
         }
     )
+
+
+def authenticate_dynamic_schema_review_projection(
+    projection: DynamicSchemaReviewProjection,
+    *,
+    subject_keys: object,
+) -> DynamicSchemaReviewProjection:
+    if not isinstance(projection, DynamicSchemaReviewProjection):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    normalized_subject_keys = _normalize_subject_keys(subject_keys)
+    for value in (
+        projection.project_id,
+        projection.schema_id,
+        projection.schema_version_id,
+        projection.orchestration_id,
+        projection.extraction_run_id,
+        projection.consistency_check_application_id,
+        projection.source_consistency_application_id,
+    ):
+        _require_projection_uuid(value)
+    for value in (
+        projection.schema_definition_manifest_hash,
+        projection.ufl_source_manifest_hash,
+        projection.consistency_result_manifest_hash,
+        projection.raw_projection_manifest_hash,
+        projection.reviewed_projection_manifest_hash,
+    ):
+        _require_sha256(
+            value,
+            error_code="dynamic_schema_review_projection_projection_invalid",
+        )
+    if projection.algorithm_name != DYNAMIC_SCHEMA_REVIEW_PROJECTION_ALGORITHM_NAME:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if projection.algorithm_version != DYNAMIC_SCHEMA_REVIEW_PROJECTION_ALGORITHM_VERSION:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if projection.comparison_quality not in {"complete", "partial"}:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    record_count = _require_projection_count(projection.record_count)
+    unique_matched_fact_count = _require_projection_count(
+        projection.unique_matched_fact_count
+    )
+    resolved_fact_count = _require_projection_count(projection.resolved_fact_count)
+    review_required_fact_count = _require_projection_count(
+        projection.review_required_fact_count
+    )
+    no_candidate_fact_count = _require_projection_count(
+        projection.no_candidate_fact_count
+    )
+    field_review_required_count = _require_projection_count(
+        projection.field_review_required_count
+    )
+
+    seen_subject_keys: set[str] = set()
+    record_subject_keys: list[str] = []
+    unique_reviewed_facts: dict[uuid.UUID, DynamicSchemaReviewedFact] = {}
+    recomputed_field_review_required_count = 0
+    for record in projection.records:
+        subject_key = raw_projection_service.normalize_dynamic_schema_ufl_subject_keys(
+            [record.subject_key]
+        )[0]
+        if subject_key != record.subject_key:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if subject_key in seen_subject_keys:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        seen_subject_keys.add(subject_key)
+        record_subject_keys.append(subject_key)
+        record_issue_count = _require_projection_count(record.issue_count)
+        sorted_fields = tuple(
+            sorted(
+                record.fields,
+                key=lambda field: (
+                    field.source_field.display_order,
+                    field.source_field.field_key,
+                    field.source_field.field_id,
+                ),
+            )
+        )
+        if record.fields != sorted_fields:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        seen_field_keys: set[str] = set()
+        recomputed_required_missing_field_keys: list[str] = []
+        recomputed_record_issue_count = 0
+        for field in record.fields:
+            if field.source_field.field_key in seen_field_keys:
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            seen_field_keys.add(field.source_field.field_key)
+            subject_kinds = {
+                fact.subject_kind for fact in field.source_field.matched_facts
+            }
+            if len(subject_kinds) > 1:
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            try:
+                raw_projection_service.authenticate_dynamic_schema_ufl_projected_field(
+                    field.source_field,
+                    record_subject_key=record.subject_key,
+                    subject_kind=next(iter(subject_kinds), None),
+                )
+            except raw_projection_service.DynamicSchemaUFLProjectionInvariantError:
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                ) from None
+            if len(field.reviewed_facts) != len(field.source_field.matched_facts):
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            if tuple(reviewed_fact.fact for reviewed_fact in field.reviewed_facts) != field.source_field.matched_facts:
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            resolved_fact_field_count = _require_projection_count(field.resolved_fact_count)
+            review_required_fact_field_count = _require_projection_count(
+                field.review_required_fact_count
+            )
+            seen_field_fact_ids: set[uuid.UUID] = set()
+            recomputed_effective_fact_value_ids: list[uuid.UUID] = []
+            recomputed_resolved_fact_count = 0
+            recomputed_review_required_fact_count = 0
+            for reviewed_fact in field.reviewed_facts:
+                _validate_reviewed_fact_shape(reviewed_fact)
+                if reviewed_fact.fact.fact_id in seen_field_fact_ids:
+                    raise DynamicSchemaReviewProjectionInvariantError(
+                        "dynamic_schema_review_projection_projection_invalid"
+                    )
+                seen_field_fact_ids.add(reviewed_fact.fact.fact_id)
+                prior_reviewed_fact = unique_reviewed_facts.get(reviewed_fact.fact.fact_id)
+                if prior_reviewed_fact is None:
+                    unique_reviewed_facts[reviewed_fact.fact.fact_id] = reviewed_fact
+                elif prior_reviewed_fact != reviewed_fact:
+                    raise DynamicSchemaReviewProjectionInvariantError(
+                        "dynamic_schema_review_projection_projection_invalid"
+                    )
+                if reviewed_fact.review_state == "resolved":
+                    recomputed_resolved_fact_count += 1
+                    recomputed_effective_fact_value_ids.extend(
+                        reviewed_fact.effective_fact_value_ids
+                    )
+                if reviewed_fact.requires_review:
+                    recomputed_review_required_fact_count += 1
+            if resolved_fact_field_count != recomputed_resolved_fact_count:
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            if review_required_fact_field_count != recomputed_review_required_fact_count:
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            if field.review_required != (recomputed_review_required_fact_count > 0):
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            if field.effective_fact_value_ids != tuple(recomputed_effective_fact_value_ids):
+                raise DynamicSchemaReviewProjectionInvariantError(
+                    "dynamic_schema_review_projection_projection_invalid"
+                )
+            recomputed_record_issue_count += len(field.source_field.issues)
+            if "required_missing" in field.source_field.issues:
+                recomputed_required_missing_field_keys.append(field.source_field.field_key)
+            if field.review_required:
+                recomputed_field_review_required_count += 1
+        if record.required_missing_field_keys != tuple(
+            recomputed_required_missing_field_keys
+        ):
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        if record_issue_count != recomputed_record_issue_count:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+
+    if normalized_subject_keys is None:
+        if tuple(record_subject_keys) != tuple(sorted(record_subject_keys)):
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+    elif tuple(record_subject_keys) != tuple(normalized_subject_keys):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if record_count != len(projection.records):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    recomputed_unique_matched_fact_count = len(unique_reviewed_facts)
+    recomputed_resolved_fact_count = sum(
+        1
+        for reviewed_fact in unique_reviewed_facts.values()
+        if reviewed_fact.review_state == "resolved"
+    )
+    recomputed_review_required_fact_count = sum(
+        1 for reviewed_fact in unique_reviewed_facts.values() if reviewed_fact.requires_review
+    )
+    recomputed_no_candidate_fact_count = sum(
+        1
+        for reviewed_fact in unique_reviewed_facts.values()
+        if reviewed_fact.review_state == "no_consistency_candidate"
+    )
+    if unique_matched_fact_count != recomputed_unique_matched_fact_count:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if resolved_fact_count != recomputed_resolved_fact_count:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if review_required_fact_count != recomputed_review_required_fact_count:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if no_candidate_fact_count != recomputed_no_candidate_fact_count:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if field_review_required_count != recomputed_field_review_required_count:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if projection.reviewed_projection_manifest_hash != _build_manifest_hash(
+        projection=projection,
+        subject_keys_filter=normalized_subject_keys,
+    ):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    return projection
 
 
 async def project_reviewed_orchestration_ufl_to_dynamic_schema(
@@ -589,30 +961,33 @@ async def project_reviewed_orchestration_ufl_to_dynamic_schema(
         records=tuple(reviewed_records),
         reviewed_projection_manifest_hash="",
     )
-    return DynamicSchemaReviewProjection(
-        project_id=projection.project_id,
-        schema_id=projection.schema_id,
-        schema_version_id=projection.schema_version_id,
-        orchestration_id=projection.orchestration_id,
-        extraction_run_id=projection.extraction_run_id,
-        consistency_check_application_id=projection.consistency_check_application_id,
-        source_consistency_application_id=projection.source_consistency_application_id,
-        schema_definition_manifest_hash=projection.schema_definition_manifest_hash,
-        ufl_source_manifest_hash=projection.ufl_source_manifest_hash,
-        consistency_result_manifest_hash=projection.consistency_result_manifest_hash,
-        raw_projection_manifest_hash=projection.raw_projection_manifest_hash,
-        comparison_quality=projection.comparison_quality,
-        algorithm_name=projection.algorithm_name,
-        algorithm_version=projection.algorithm_version,
-        record_count=projection.record_count,
-        unique_matched_fact_count=projection.unique_matched_fact_count,
-        resolved_fact_count=projection.resolved_fact_count,
-        review_required_fact_count=projection.review_required_fact_count,
-        no_candidate_fact_count=projection.no_candidate_fact_count,
-        field_review_required_count=projection.field_review_required_count,
-        records=projection.records,
-        reviewed_projection_manifest_hash=_build_manifest_hash(
-            projection=projection,
-            subject_keys_filter=normalized_subject_keys,
+    return authenticate_dynamic_schema_review_projection(
+        DynamicSchemaReviewProjection(
+            project_id=projection.project_id,
+            schema_id=projection.schema_id,
+            schema_version_id=projection.schema_version_id,
+            orchestration_id=projection.orchestration_id,
+            extraction_run_id=projection.extraction_run_id,
+            consistency_check_application_id=projection.consistency_check_application_id,
+            source_consistency_application_id=projection.source_consistency_application_id,
+            schema_definition_manifest_hash=projection.schema_definition_manifest_hash,
+            ufl_source_manifest_hash=projection.ufl_source_manifest_hash,
+            consistency_result_manifest_hash=projection.consistency_result_manifest_hash,
+            raw_projection_manifest_hash=projection.raw_projection_manifest_hash,
+            comparison_quality=projection.comparison_quality,
+            algorithm_name=projection.algorithm_name,
+            algorithm_version=projection.algorithm_version,
+            record_count=projection.record_count,
+            unique_matched_fact_count=projection.unique_matched_fact_count,
+            resolved_fact_count=projection.resolved_fact_count,
+            review_required_fact_count=projection.review_required_fact_count,
+            no_candidate_fact_count=projection.no_candidate_fact_count,
+            field_review_required_count=projection.field_review_required_count,
+            records=projection.records,
+            reviewed_projection_manifest_hash=_build_manifest_hash(
+                projection=projection,
+                subject_keys_filter=normalized_subject_keys,
+            ),
         ),
+        subject_keys=subject_keys,
     )

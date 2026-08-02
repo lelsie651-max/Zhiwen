@@ -33,6 +33,12 @@ from app.schemas.dynamic_schema_review_projection import (
     DynamicSchemaReviewedField,
     DynamicSchemaReviewedRecord,
 )
+from app.schemas.dynamic_schema_knowledge_view import (
+    DynamicSchemaKnowledgeField,
+    DynamicSchemaKnowledgeRecord,
+    DynamicSchemaKnowledgeSection,
+    DynamicSchemaKnowledgeView,
+)
 from app.schemas.document import DocumentCreate, DocumentRead
 from app.schemas.document_content import (
     DocumentBlockRead,
@@ -178,6 +184,10 @@ __all__ = [
     "DynamicSchemaReviewedField",
     "DynamicSchemaReviewedRecord",
     "DynamicSchemaReviewProjection",
+    "DynamicSchemaKnowledgeField",
+    "DynamicSchemaKnowledgeSection",
+    "DynamicSchemaKnowledgeRecord",
+    "DynamicSchemaKnowledgeView",
     "DocumentCreate",
     "DocumentRead",
     "ExtractionRunRead",
