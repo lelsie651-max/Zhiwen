@@ -43,6 +43,39 @@ class BailianReviewToolInvariantError(BailianReviewToolError):
 
 
 _LOWER_HEX = frozenset("0123456789abcdef")
+_ALLOWED_REVIEW_STATES = frozenset(
+    {
+        "no_consistency_candidate",
+        "resolved",
+        "pending_review",
+        "deferred",
+        "unreviewed_compatible",
+    }
+)
+_LIST_REQUEST_IDENTITY_KEYS = frozenset(
+    {
+        "project_id",
+        "schema_id",
+        "schema_version_id",
+        "orchestration_id",
+        "consistency_check_application_id",
+        "state",
+        "limit",
+    }
+)
+_DETAIL_REQUEST_IDENTITY_KEYS = frozenset(
+    {
+        "project_id",
+        "schema_id",
+        "schema_version_id",
+        "orchestration_id",
+        "consistency_check_application_id",
+        "fact_id",
+    }
+)
+_VERSION_RECORD_REQUEST_IDENTITY_KEYS = frozenset(
+    {"project_id", "project_version_id", "subject_key"}
+)
 
 
 def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
@@ -105,6 +138,27 @@ def _require_sha256(value: object) -> str:
     return value
 
 
+def _require_payload_uuid(value: object) -> uuid.UUID:
+    if isinstance(value, uuid.UUID):
+        return value
+    if not isinstance(value, str):
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    try:
+        return uuid.UUID(value)
+    except (TypeError, ValueError):
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid") from None
+
+
+def _require_canonical_uuid_string(value: object) -> str:
+    if not isinstance(value, str):
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    parsed = _require_payload_uuid(value)
+    normalized = str(parsed)
+    if value != normalized:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    return normalized
+
+
 def _require_bool(value: object) -> bool:
     if not isinstance(value, bool):
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
@@ -143,12 +197,166 @@ def _freeze_json_array(value: object) -> tuple[object, ...]:
     return frozen
 
 
-def _review_item_state(reviewed_fact: DynamicSchemaReviewedFact) -> str:
-    if reviewed_fact.requires_review:
-        return "review_required"
-    if reviewed_fact.review_state == "resolved":
+def _require_exact_request_identity_keys(
+    request_identity: object,
+    *,
+    expected_keys: frozenset[str],
+) -> Mapping[str, object]:
+    identity_mapping = _require_mapping(request_identity)
+    if frozenset(identity_mapping.keys()) != expected_keys:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    return identity_mapping
+
+
+def _require_request_identity_uuid_string(
+    request_identity: Mapping[str, object],
+    *,
+    key: str,
+    expected_uuid: uuid.UUID,
+) -> None:
+    if _require_canonical_uuid_string(request_identity.get(key)) != str(expected_uuid):
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+
+
+def _authenticate_list_request_identity(
+    request_identity: object,
+    *,
+    response: BailianReviewItemsResponse,
+) -> Mapping[str, object]:
+    identity_mapping = _require_exact_request_identity_keys(
+        request_identity,
+        expected_keys=_LIST_REQUEST_IDENTITY_KEYS,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="project_id",
+        expected_uuid=response.project_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="schema_id",
+        expected_uuid=response.schema_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="schema_version_id",
+        expected_uuid=response.schema_version_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="orchestration_id",
+        expected_uuid=response.orchestration_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="consistency_check_application_id",
+        expected_uuid=response.consistency_check_application_id,
+    )
+    if identity_mapping.get("state") != response.state:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    if _require_int(identity_mapping.get("limit")) != response.limit:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    return identity_mapping
+
+
+def _authenticate_detail_request_identity(
+    request_identity: object,
+    *,
+    response: BailianReviewItemDetailResponse,
+) -> Mapping[str, object]:
+    identity_mapping = _require_exact_request_identity_keys(
+        request_identity,
+        expected_keys=_DETAIL_REQUEST_IDENTITY_KEYS,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="project_id",
+        expected_uuid=response.project_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="schema_id",
+        expected_uuid=response.schema_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="schema_version_id",
+        expected_uuid=response.schema_version_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="orchestration_id",
+        expected_uuid=response.orchestration_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="consistency_check_application_id",
+        expected_uuid=response.consistency_check_application_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="fact_id",
+        expected_uuid=response.fact_id,
+    )
+    return identity_mapping
+
+
+def _authenticate_version_record_request_identity(
+    request_identity: object,
+    *,
+    response: BailianVersionRecordResponse,
+) -> Mapping[str, object]:
+    identity_mapping = _require_exact_request_identity_keys(
+        request_identity,
+        expected_keys=_VERSION_RECORD_REQUEST_IDENTITY_KEYS,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="project_id",
+        expected_uuid=response.project_id,
+    )
+    _require_request_identity_uuid_string(
+        identity_mapping,
+        key="project_version_id",
+        expected_uuid=response.project_version_id,
+    )
+    subject_key = identity_mapping.get("subject_key")
+    if not isinstance(subject_key, str) or subject_key != response.subject_key:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    return identity_mapping
+
+
+def _classify_review_item_state(
+    *,
+    review_state: object,
+    resolution_basis: object,
+    requires_review: object,
+) -> str:
+    if review_state not in _ALLOWED_REVIEW_STATES:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    normalized_requires_review = _require_bool(requires_review)
+    if review_state == "no_consistency_candidate":
+        if resolution_basis != "none" or normalized_requires_review:
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        return "observation_only"
+    if review_state == "resolved":
+        if resolution_basis not in {
+            "human_selection",
+            "human_confirmed_compatibility",
+        } or normalized_requires_review:
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
         return "resolved"
-    return "observation_only"
+    if resolution_basis != "none" or not normalized_requires_review:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    return "review_required"
+
+
+def _review_item_state(reviewed_fact: DynamicSchemaReviewedFact) -> str:
+    return _classify_review_item_state(
+        review_state=reviewed_fact.review_state,
+        resolution_basis=reviewed_fact.resolution_basis,
+        requires_review=reviewed_fact.requires_review,
+    )
 
 
 def _evidence_count(reviewed_fact: DynamicSchemaReviewedFact) -> int:
@@ -282,8 +490,12 @@ def _freeze_payload_hash(
 def _rebuild_review_item_summary(
     item: BailianReviewItemSummary,
 ) -> BailianReviewItemSummary:
-    _require_uuid(item.fact_id, field_name="fact_id")
-    _require_bool(item.requires_review)
+    fact_id = _require_payload_uuid(item.fact_id)
+    _classify_review_item_state(
+        review_state=item.review_state,
+        resolution_basis=item.resolution_basis,
+        requires_review=item.requires_review,
+    )
     semantic_value_count = _require_int(item.semantic_value_count)
     fact_value_count = _require_int(item.fact_value_count)
     evidence_count = _require_int(item.evidence_count)
@@ -294,7 +506,7 @@ def _rebuild_review_item_summary(
     if len(set(item.matched_field_keys)) != len(item.matched_field_keys):
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     return BailianReviewItemSummary(
-        fact_id=item.fact_id,
+        fact_id=fact_id,
         subject_kind=item.subject_kind,
         subject_key=item.subject_key,
         predicate_key=item.predicate_key,
@@ -302,7 +514,7 @@ def _rebuild_review_item_summary(
         matched_field_keys=tuple(item.matched_field_keys),
         review_state=item.review_state,
         resolution_basis=item.resolution_basis,
-        requires_review=item.requires_review,
+        requires_review=_require_bool(item.requires_review),
         semantic_value_count=semantic_value_count,
         fact_value_count=fact_value_count,
         evidence_count=evidence_count,
@@ -314,7 +526,7 @@ def _build_payload_hash(
     *,
     tool_name: str,
     request_identity: Mapping[str, object],
- ) -> str:
+) -> str:
     return _freeze_payload_hash(
         payload_model,
         tool_name=tool_name,
@@ -334,6 +546,55 @@ def _thaw_json_value(value: object) -> object:
     return value
 
 
+def _validate_detail_value_groups(
+    value_groups: tuple[object, ...],
+    *,
+    semantic_value_count: int,
+    fact_value_count: int,
+) -> tuple[Mapping[str, object], ...]:
+    if semantic_value_count != len(value_groups):
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    frozen_groups: list[Mapping[str, object]] = []
+    seen_fact_value_ids: set[uuid.UUID] = set()
+    total_fact_value_count = 0
+    for value_group in value_groups:
+        group_mapping = _require_mapping(value_group)
+        _require_sha256(group_mapping.get("semantic_key_hash"))
+        fact_value_ids_raw = group_mapping.get("fact_value_ids")
+        values_raw = group_mapping.get("values")
+        evidences_raw = group_mapping.get("evidences")
+        if not isinstance(fact_value_ids_raw, tuple):
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        if not isinstance(values_raw, tuple) or not isinstance(evidences_raw, tuple):
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        group_fact_value_ids = tuple(
+            _require_payload_uuid(fact_value_id) for fact_value_id in fact_value_ids_raw
+        )
+        if len(set(group_fact_value_ids)) != len(group_fact_value_ids):
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        value_fact_value_ids: list[uuid.UUID] = []
+        for value in values_raw:
+            value_mapping = _require_mapping(value)
+            value_fact_value_ids.append(
+                _require_payload_uuid(value_mapping.get("fact_value_id"))
+            )
+        if len(set(value_fact_value_ids)) != len(value_fact_value_ids):
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        if tuple(value_fact_value_ids) != group_fact_value_ids:
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        for fact_value_id in group_fact_value_ids:
+            if fact_value_id in seen_fact_value_ids:
+                raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+            seen_fact_value_ids.add(fact_value_id)
+        for evidence in evidences_raw:
+            _require_mapping(evidence)
+        total_fact_value_count += len(group_fact_value_ids)
+        frozen_groups.append(group_mapping)
+    if total_fact_value_count != fact_value_count:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    return tuple(frozen_groups)
+
+
 def authenticate_bailian_review_items_response(
     response: BailianReviewItemsResponse,
     *,
@@ -348,50 +609,43 @@ def authenticate_bailian_review_items_response(
     _require_sha256(response.source_manifest_hash)
     _require_sha256(response.reviewed_projection_manifest_hash)
     _require_sha256(response.payload_hash)
+    if response.source_manifest_hash != response.reviewed_projection_manifest_hash:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     normalized_limit = _require_int(response.limit)
     normalized_item_count = _require_int(response.item_count)
     if not 1 <= normalized_limit <= 100 or normalized_item_count < 0:
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     if response.state not in {"review_required", "resolved", "observation_only", "all"}:
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    authenticated_request_identity = _authenticate_list_request_identity(
+        request_identity,
+        response=response,
+    )
     rebuilt_items = tuple(_rebuild_review_item_summary(item) for item in response.items)
     if normalized_item_count != len(rebuilt_items):
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     if len({item.fact_id for item in rebuilt_items}) != len(rebuilt_items):
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     for item in rebuilt_items:
-        if response.state != "all":
-            if (
-                response.state == "review_required"
-                and not item.requires_review
-            ):
-                raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
-            if response.state == "resolved" and (
-                item.requires_review or item.review_state != "resolved"
-            ):
-                raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
-            if response.state == "observation_only" and (
-                item.requires_review or item.review_state == "resolved"
-            ):
-                raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        if response.state != "all" and _classify_review_item_state(
+            review_state=item.review_state,
+            resolution_basis=item.resolution_basis,
+            requires_review=item.requires_review,
+        ) != response.state:
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     if rebuilt_items != _sort_review_items(rebuilt_items):
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     authenticated = BailianReviewItemsResponse.model_construct(
         source_manifest_hash=response.source_manifest_hash,
         payload_hash="",
-        project_id=_require_uuid(response.project_id, field_name="project_id"),
-        schema_id=_require_uuid(response.schema_id, field_name="schema_id"),
-        schema_version_id=_require_uuid(
+        project_id=_require_payload_uuid(response.project_id),
+        schema_id=_require_payload_uuid(response.schema_id),
+        schema_version_id=_require_payload_uuid(
             response.schema_version_id,
-            field_name="schema_version_id",
         ),
-        orchestration_id=_require_uuid(
-            response.orchestration_id,
-            field_name="orchestration_id",
-        ),
-        consistency_check_application_id=_require_uuid(
-            response.consistency_check_application_id,
-            field_name="consistency_check_application_id",
+        orchestration_id=_require_payload_uuid(response.orchestration_id),
+        consistency_check_application_id=_require_payload_uuid(
+            response.consistency_check_application_id
         ),
         reviewed_projection_manifest_hash=response.reviewed_projection_manifest_hash,
         state=response.state,
@@ -402,7 +656,7 @@ def authenticate_bailian_review_items_response(
     expected_payload_hash = _build_payload_hash(
         authenticated,
         tool_name="bailian_review_items",
-        request_identity=request_identity,
+        request_identity=authenticated_request_identity,
     )
     if expected_payload_hash != response.payload_hash:
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
@@ -424,6 +678,12 @@ def authenticate_bailian_review_item_detail_response(
     _require_sha256(response.reviewed_projection_manifest_hash)
     _require_sha256(response.identity_hash)
     _require_sha256(response.payload_hash)
+    if response.source_manifest_hash != response.reviewed_projection_manifest_hash:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    authenticated_request_identity = _authenticate_detail_request_identity(
+        request_identity,
+        response=response,
+    )
     semantic_value_count = _require_int(response.semantic_value_count)
     fact_value_count = _require_int(response.fact_value_count)
     if semantic_value_count < 0 or fact_value_count < 0:
@@ -432,72 +692,100 @@ def authenticate_bailian_review_item_detail_response(
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
     if not response.matched_field_keys:
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
-    _require_bool(response.requires_review)
+    normalized_requires_review = _require_bool(response.requires_review)
     frozen_value_groups = _freeze_json_array(response.value_groups)
-    semantic_group_total = len(frozen_value_groups)
-    fact_value_ids: set[str] = set()
-    fact_value_total = 0
-    for value_group in frozen_value_groups:
-        group_mapping = _require_mapping(value_group)
-        if "values" not in group_mapping or "evidences" not in group_mapping:
-            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
-        values = group_mapping["values"]
-        evidences = group_mapping["evidences"]
-        if not isinstance(values, tuple) or not isinstance(evidences, tuple):
-            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
-        for value in values:
-            value_mapping = _require_mapping(value)
-            fact_value_id = value_mapping.get("fact_value_id")
-            if not isinstance(fact_value_id, str):
-                raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
-            fact_value_ids.add(fact_value_id)
-            fact_value_total += 1
-        for evidence in evidences:
-            _require_mapping(evidence)
-    if semantic_group_total != semantic_value_count or fact_value_total != fact_value_count:
-        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    validated_value_groups = _validate_detail_value_groups(
+        frozen_value_groups,
+        semantic_value_count=semantic_value_count,
+        fact_value_count=fact_value_count,
+    )
+    detail_fact_value_ids = {
+        _require_payload_uuid(value_mapping["fact_value_id"])
+        for value_group in validated_value_groups
+        for value_mapping in (
+            _require_mapping(value)
+            for value in value_group["values"]
+        )
+    }
     effective_fact_value_ids = tuple(
-        _require_uuid(fact_value_id, field_name="effective_fact_value_id")
+        _require_payload_uuid(fact_value_id)
         for fact_value_id in response.effective_fact_value_ids
     )
     if len(set(effective_fact_value_ids)) != len(effective_fact_value_ids):
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
-    if any(str(fact_value_id) not in fact_value_ids for fact_value_id in effective_fact_value_ids):
+    if any(fact_value_id not in detail_fact_value_ids for fact_value_id in effective_fact_value_ids):
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    if response.review_state not in _ALLOWED_REVIEW_STATES:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    if response.review_state == "no_consistency_candidate":
+        if (
+            response.resolution_basis != "none"
+            or response.current_decision_id is not None
+            or response.current_decision_kind is not None
+            or effective_fact_value_ids
+            or normalized_requires_review
+        ):
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    elif response.review_state == "resolved":
+        current_decision_id = _require_payload_uuid(response.current_decision_id)
+        if normalized_requires_review:
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        if response.resolution_basis == "human_selection":
+            if response.current_decision_kind == "select_one":
+                if len(effective_fact_value_ids) != 1:
+                    raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+            elif response.current_decision_kind == "keep_multiple":
+                if not 2 <= len(effective_fact_value_ids) <= 200:
+                    raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+            else:
+                raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        elif response.resolution_basis == "human_confirmed_compatibility":
+            if response.current_decision_kind != "confirm_compatible" or not effective_fact_value_ids:
+                raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        else:
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    elif response.review_state in {"pending_review", "unreviewed_compatible"}:
+        if (
+            response.resolution_basis != "none"
+            or response.current_decision_id is not None
+            or response.current_decision_kind is not None
+            or effective_fact_value_ids
+            or not normalized_requires_review
+        ):
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    else:
+        if (
+            response.resolution_basis != "none"
+            or response.current_decision_kind != "defer"
+            or response.current_decision_id is None
+            or effective_fact_value_ids
+            or not normalized_requires_review
+        ):
+            raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+        _require_payload_uuid(response.current_decision_id)
     authenticated = BailianReviewItemDetailResponse.model_construct(
         source_manifest_hash=response.source_manifest_hash,
         payload_hash="",
-        project_id=_require_uuid(response.project_id, field_name="project_id"),
-        schema_id=_require_uuid(response.schema_id, field_name="schema_id"),
-        schema_version_id=_require_uuid(
-            response.schema_version_id,
-            field_name="schema_version_id",
+        project_id=_require_payload_uuid(response.project_id),
+        schema_id=_require_payload_uuid(response.schema_id),
+        schema_version_id=_require_payload_uuid(response.schema_version_id),
+        orchestration_id=_require_payload_uuid(response.orchestration_id),
+        extraction_run_id=_require_payload_uuid(response.extraction_run_id),
+        consistency_check_application_id=_require_payload_uuid(
+            response.consistency_check_application_id
         ),
-        orchestration_id=_require_uuid(
-            response.orchestration_id,
-            field_name="orchestration_id",
-        ),
-        extraction_run_id=_require_uuid(
-            response.extraction_run_id,
-            field_name="extraction_run_id",
-        ),
-        consistency_check_application_id=_require_uuid(
-            response.consistency_check_application_id,
-            field_name="consistency_check_application_id",
-        ),
-        source_consistency_application_id=_require_uuid(
-            response.source_consistency_application_id,
-            field_name="source_consistency_application_id",
+        source_consistency_application_id=_require_payload_uuid(
+            response.source_consistency_application_id
         ),
         reviewed_projection_manifest_hash=response.reviewed_projection_manifest_hash,
-        fact_id=_require_uuid(response.fact_id, field_name="fact_id"),
+        fact_id=_require_payload_uuid(response.fact_id),
         identity_hash=response.identity_hash,
         subject_kind=response.subject_kind,
         subject_key=response.subject_key,
         subject_entity_id=(
             None
             if response.subject_entity_id is None
-            else _require_uuid(response.subject_entity_id, field_name="subject_entity_id")
+            else _require_payload_uuid(response.subject_entity_id)
         ),
         predicate_key=response.predicate_key,
         scope_key=response.scope_key,
@@ -509,22 +797,17 @@ def authenticate_bailian_review_item_detail_response(
         current_decision_id=(
             None
             if response.current_decision_id is None
-            else _require_uuid(
-                response.current_decision_id,
-                field_name="current_decision_id",
-            )
+            else _require_payload_uuid(response.current_decision_id)
         ),
         current_decision_kind=response.current_decision_kind,
         effective_fact_value_ids=effective_fact_value_ids,
-        requires_review=response.requires_review,
-        value_groups=tuple(
-            _require_mapping(value_group) for value_group in frozen_value_groups
-        ),
+        requires_review=normalized_requires_review,
+        value_groups=validated_value_groups,
     )
     expected_payload_hash = _build_payload_hash(
         authenticated,
         tool_name="bailian_review_item_detail",
-        request_identity=request_identity,
+        request_identity=authenticated_request_identity,
     )
     if expected_payload_hash != response.payload_hash:
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
@@ -545,6 +828,12 @@ def authenticate_bailian_version_record_response(
     _require_sha256(response.source_manifest_hash)
     _require_sha256(response.knowledge_view_manifest_hash)
     _require_sha256(response.payload_hash)
+    if response.source_manifest_hash != response.knowledge_view_manifest_hash:
+        raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
+    authenticated_request_identity = _authenticate_version_record_request_identity(
+        request_identity,
+        response=response,
+    )
     version_no = _require_int(response.version_no)
     if version_no <= 0:
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
@@ -556,33 +845,19 @@ def authenticate_bailian_version_record_response(
     authenticated = BailianVersionRecordResponse.model_construct(
         source_manifest_hash=response.source_manifest_hash,
         payload_hash="",
-        project_id=_require_uuid(response.project_id, field_name="project_id"),
-        project_version_id=_require_uuid(
-            response.project_version_id,
-            field_name="project_version_id",
-        ),
+        project_id=_require_payload_uuid(response.project_id),
+        project_version_id=_require_payload_uuid(response.project_version_id),
         version_no=version_no,
         is_current=is_current,
-        schema_id=_require_uuid(response.schema_id, field_name="schema_id"),
-        schema_version_id=_require_uuid(
-            response.schema_version_id,
-            field_name="schema_version_id",
+        schema_id=_require_payload_uuid(response.schema_id),
+        schema_version_id=_require_payload_uuid(response.schema_version_id),
+        orchestration_id=_require_payload_uuid(response.orchestration_id),
+        extraction_run_id=_require_payload_uuid(response.extraction_run_id),
+        consistency_check_application_id=_require_payload_uuid(
+            response.consistency_check_application_id
         ),
-        orchestration_id=_require_uuid(
-            response.orchestration_id,
-            field_name="orchestration_id",
-        ),
-        extraction_run_id=_require_uuid(
-            response.extraction_run_id,
-            field_name="extraction_run_id",
-        ),
-        consistency_check_application_id=_require_uuid(
-            response.consistency_check_application_id,
-            field_name="consistency_check_application_id",
-        ),
-        source_consistency_application_id=_require_uuid(
-            response.source_consistency_application_id,
-            field_name="source_consistency_application_id",
+        source_consistency_application_id=_require_payload_uuid(
+            response.source_consistency_application_id
         ),
         knowledge_view_manifest_hash=response.knowledge_view_manifest_hash,
         subject_key=response.subject_key,
@@ -591,7 +866,7 @@ def authenticate_bailian_version_record_response(
     expected_payload_hash = _build_payload_hash(
         authenticated,
         tool_name="bailian_version_record",
-        request_identity=request_identity,
+        request_identity=authenticated_request_identity,
     )
     if expected_payload_hash != response.payload_hash:
         raise BailianReviewToolInvariantError("bailian_review_tool_payload_invalid")
