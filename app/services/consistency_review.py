@@ -208,11 +208,22 @@ def _validate_selection_shape(
 
 def _build_member_snapshot(
     members: Sequence[object],
+    *,
+    source_consistency_application_id: uuid.UUID,
+    source_consistency_candidate_id: uuid.UUID,
 ) -> tuple[ConsistencyReviewCandidateMemberRecord, ...]:
     return tuple(
         ConsistencyReviewCandidateMemberRecord(
-            consistency_application_id=member.consistency_application_id,
-            candidate_id=member.candidate_id,
+            consistency_application_id=getattr(
+                member,
+                "consistency_application_id",
+                source_consistency_application_id,
+            ),
+            candidate_id=getattr(
+                member,
+                "candidate_id",
+                source_consistency_candidate_id,
+            ),
             fact_value_id=member.fact_value_id,
             source_batch_id=member.source_batch_id,
             semantic_key_hash=member.semantic_key_hash,
@@ -387,7 +398,11 @@ def _resolve_authoritative_target(
         raise ConsistencyReviewInvariantError(
             "consistency_review_immutable_ledger_mismatch"
         )
-    return assessment, candidate, _build_member_snapshot(candidate.members)
+    return assessment, candidate, _build_member_snapshot(
+        candidate.members,
+        source_consistency_application_id=assessment.source_consistency_application_id,
+        source_consistency_candidate_id=assessment.source_consistency_candidate_id,
+    )
 
 
 def _validate_selected_fact_value_ids(

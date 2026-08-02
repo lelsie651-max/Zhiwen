@@ -936,6 +936,30 @@ def test_snapshot_json_preserves_fact_values_and_evidence_and_is_deeply_immutabl
         created.snapshot_json["records"][0] = "blocked"  # type: ignore[index]
 
 
+def test_create_project_version_stores_plain_json_payload_for_jsonb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+
+    run_async(project_version_service.create_project_version(session_factory, **_base_kwargs(store)))
+
+    orm_version = session_factory.sessions[0].created_orm_versions[0]
+    source_field = orm_version.snapshot_json["records"][0]["sections"][0]["fields"][0]["source_field"]
+    value_group = (
+        orm_version.snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"]["value_groups"][0]
+    )
+
+    assert isinstance(orm_version.snapshot_json, dict)
+    assert isinstance(source_field["display_config"], dict)
+    assert isinstance(source_field["validation_rules"], dict)
+    assert source_field["display_config"] == {"kind": "text"}
+    assert source_field["validation_rules"] == {"max_length": 100}
+    assert isinstance(value_group["value_json"], dict)
+    assert value_group["value_json"] == {"text": "Alice"}
+
+
 def test_authenticate_project_version_snapshot_returns_frozen_copy_for_mutable_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -150,6 +150,7 @@ from app.schemas.project_version import (
     ProjectVersionCreateResult,
     ProjectVersionSnapshot,
 )
+from app.schemas.bailian_demo_seed import BailianDemoSeedResult
 from app.schemas.processing_job import ProcessingJobRead
 from app.schemas.processing_job_executor import (
     ProcessingJobExecutionResult,
@@ -278,6 +279,7 @@ __all__ = [
     "ProjectMemberRead",
     "ProjectVersionSnapshot",
     "ProjectVersionCreateResult",
+    "BailianDemoSeedResult",
     "RevisionAdmissionResult",
     "RevisionAdmissionDecisionInput",
     "RevisionExtractionResult",

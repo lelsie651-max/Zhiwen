@@ -101,6 +101,11 @@ _NON_RETRYABLE_FAILURE_CODES = {
 }
 
 
+def _assign_uuid_if_missing(model: object) -> None:
+    if getattr(model, "id", None) is None:
+        model.id = uuid.uuid4()
+
+
 class FactExtractionOrchestrationError(Exception):
     """Base class for multi-batch fact extraction orchestration failures."""
 
@@ -938,6 +943,7 @@ async def prepare_fact_extraction_orchestration(
             started_at=None,
             completed_at=None,
         )
+        _assign_uuid_if_missing(orchestration)
         savepoint = await session.begin_nested()
         try:
             await orchestration_repository.create_orchestration(session, orchestration)
@@ -963,6 +969,8 @@ async def prepare_fact_extraction_orchestration(
                 )
                 for batch in plan.batches
             ]
+            for batch_row in batch_rows:
+                _assign_uuid_if_missing(batch_row)
             await orchestration_repository.create_orchestration_batches(session, batch_rows)
             await savepoint.commit()
         except IntegrityError as error:

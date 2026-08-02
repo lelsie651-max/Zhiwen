@@ -56,6 +56,11 @@ _RUN_IDENTITY_LIMITS = {
 }
 
 
+def _assign_uuid_if_missing(model: object) -> None:
+    if getattr(model, "id", None) is None:
+        model.id = uuid.uuid4()
+
+
 # --------------------------------------------------------------------------- #
 # Exceptions
 # --------------------------------------------------------------------------- #
@@ -322,6 +327,7 @@ async def create_inference_input_batch(
             character_count=character_count,
             snapshot_hash=snapshot_hash,
         )
+        _assign_uuid_if_missing(batch)
         batch.blocks = [
             InferenceInputBlock(
                 source_order=index,
@@ -341,6 +347,8 @@ async def create_inference_input_batch(
             )
             for index, block in enumerate(ordered_blocks)
         ]
+        for block in batch.blocks:
+            _assign_uuid_if_missing(block)
 
         await inference_repository.create_inference_batch_with_blocks(session, batch)
         await session.commit()
@@ -472,6 +480,7 @@ async def create_inference_run(
             max_output_tokens=max_tokens_value,
             attempt_count=0,
         )
+        _assign_uuid_if_missing(run)
 
         await inference_repository.create_inference_run(session, run)
         await session.commit()
@@ -596,6 +605,7 @@ async def prepare_inference_run(
             max_output_tokens=max_tokens_value,
             attempt_count=0,
         )
+        _assign_uuid_if_missing(run)
 
         savepoint = await session.begin_nested()
         try:

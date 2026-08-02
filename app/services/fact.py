@@ -9,6 +9,7 @@ import uuid
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.document_content import ExtractionRunOutcome, ExtractionRunStatus
 from app.models.entity import EntityStatus, normalize_entity_alias
@@ -126,6 +127,11 @@ class NormalizedFactValue:
 
 _FACT_IDENTITY_CONSTRAINT_NAME = "uq_facts_project_id_identity_hash"
 _AI_PROPOSAL_REPLAY_CONSTRAINT_NAME = "uq_fv_fact_ir_value_hash"
+
+
+def _assign_uuid_if_missing(model: object) -> None:
+    if getattr(model, "id", None) is None:
+        model.id = uuid.uuid4()
 
 
 async def propose_ai_fact_value(
@@ -279,6 +285,7 @@ async def propose_ai_fact_value_in_transaction(
         decided_by_id=None,
         decided_at=None,
     )
+    _assign_uuid_if_missing(fact_value)
     evidence_links = _build_evidence_links(
         fact_value_id=fact_value.id,
         evidences=payload.evidences,
@@ -289,8 +296,7 @@ async def propose_ai_fact_value_in_transaction(
         await fact_repository.create_fact_value(session, fact_value)
         if evidence_links:
             await fact_repository.create_fact_evidence_links(session, evidence_links)
-            fact_value.evidence_links.extend(evidence_links)
-        fact.values.append(fact_value)
+            set_committed_value(fact_value, "evidence_links", list(evidence_links))
     except IntegrityError as exc:
         constraint_name = _get_integrity_constraint_name(exc)
         if constraint_name != _AI_PROPOSAL_REPLAY_CONSTRAINT_NAME:
@@ -378,6 +384,7 @@ async def create_human_fact_value(
             decided_by_id=actor.id,
             decided_at=current_timestamp,
         )
+        _assign_uuid_if_missing(fact_value)
 
         await fact_repository.create_fact_value(session, fact_value)
         evidence_links = _build_evidence_links(
@@ -386,14 +393,13 @@ async def create_human_fact_value(
         )
         if evidence_links:
             await fact_repository.create_fact_evidence_links(session, evidence_links)
-            fact_value.evidence_links.extend(evidence_links)
+            set_committed_value(fact_value, "evidence_links", list(evidence_links))
 
         await _replace_current_value(
             session,
             fact=fact,
             new_current_value=fact_value,
         )
-        fact.values.append(fact_value)
         await session.commit()
         return fact_value
     except BaseException:
@@ -738,6 +744,7 @@ async def _get_or_create_fact_for_update(
             status=FactStatus.ACTIVE.value,
             created_by_id=created_by_id,
         )
+        _assign_uuid_if_missing(fact)
         await fact_repository.create_fact(session, fact)
     except IntegrityError as exc:
         constraint_name = _get_integrity_constraint_name(exc)
@@ -869,7 +876,7 @@ def _build_evidence_links(
     fact_value_id: uuid.UUID,
     evidences,
 ) -> list[FactEvidenceLink]:
-    return [
+    links = [
         FactEvidenceLink(
             fact_value_id=fact_value_id,
             evidence_id=evidence_input.evidence_id,
@@ -879,6 +886,9 @@ def _build_evidence_links(
         )
         for index, evidence_input in enumerate(evidences)
     ]
+    for link in links:
+        _assign_uuid_if_missing(link)
+    return links
 
 
 async def _get_replayed_ai_fact_value(

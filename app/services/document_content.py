@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.document_content import (
     DocumentBlock,
@@ -45,6 +46,11 @@ class SourceEvidenceReplayConflictError(ExtractionPersistenceError):
 
 
 _SOURCE_EVIDENCE_UNIQUE_CONSTRAINT = "uq_source_evidences_block_id_start_offset_end_offset"
+
+
+def _assign_uuid_if_missing(model: object) -> None:
+    if getattr(model, "id", None) is None:
+        model.id = uuid.uuid4()
 
 
 async def persist_extraction_result(
@@ -124,6 +130,7 @@ async def persist_extraction_result_in_transaction(
         started_at=started_at,
         completed_at=completed_at,
     )
+    _assign_uuid_if_missing(extraction_run)
 
     blocks = [
         DocumentBlock(
@@ -146,11 +153,14 @@ async def persist_extraction_result_in_transaction(
         )
         for block in extracted_document.blocks
     ]
+    for block in blocks:
+        _assign_uuid_if_missing(block)
 
     await document_content_repository.create_extraction_run(session, extraction_run)
     if blocks:
         await document_content_repository.create_document_blocks(session, blocks)
-    extraction_run.blocks.extend(blocks)
+        # Populate the returned aggregate without triggering async lazy loads.
+        set_committed_value(extraction_run, "blocks", list(blocks))
 
     return extraction_run
 
@@ -217,6 +227,7 @@ async def get_or_create_source_evidence_in_transaction(
             excerpt=excerpt,
             excerpt_hash=excerpt_hash,
         )
+        _assign_uuid_if_missing(evidence)
         await document_content_repository.create_source_evidence(session, evidence)
     except IntegrityError as exc:
         constraint_name = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)

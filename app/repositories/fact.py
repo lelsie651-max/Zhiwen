@@ -125,7 +125,7 @@ async def get_fact_value_for_update(
             FactValue.id == fact_value_id,
             Fact.project_id == project_id,
         )
-        .options(joinedload(FactValue.fact))
+        .options(selectinload(FactValue.fact))
         .with_for_update()
     )
     return result.scalar_one_or_none()
@@ -161,7 +161,7 @@ async def get_ai_fact_value_by_replay_key_for_update(
             FactValue.inference_run_id == inference_run_id,
             FactValue.value_hash == value_hash,
         )
-        .options(joinedload(FactValue.fact))
+        .options(selectinload(FactValue.fact))
         .with_for_update()
     )
     return result.scalar_one_or_none()

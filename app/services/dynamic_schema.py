@@ -5,6 +5,7 @@ import uuid
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.dynamic_schema import (
     DynamicSchema,
@@ -59,6 +60,11 @@ class DynamicSchemaStateCorruptionError(DynamicSchemaServiceError):
     """Raised when schema/version activation state is internally inconsistent."""
 
 
+def _assign_uuid_if_missing(model: object) -> None:
+    if getattr(model, "id", None) is None:
+        model.id = uuid.uuid4()
+
+
 async def create_human_schema_draft(
     session: AsyncSession,
     *,
@@ -87,13 +93,14 @@ async def create_human_schema_draft(
         activated_by_id=None,
         activated_at=None,
     )
+    _assign_uuid_if_missing(version)
 
     try:
         await dynamic_schema_repository.create_dynamic_schema_version(session, version)
         fields = _build_schema_fields(schema_version_id=version.id, version=payload.version)
         if fields:
             await dynamic_schema_repository.create_dynamic_schema_fields(session, fields)
-            version.fields.extend(fields)
+            set_committed_value(version, "fields", list(fields))
         await session.commit()
     except Exception:
         await session.rollback()
@@ -129,13 +136,14 @@ async def propose_ai_schema_version(
         activated_by_id=None,
         activated_at=None,
     )
+    _assign_uuid_if_missing(version)
 
     try:
         await dynamic_schema_repository.create_dynamic_schema_version(session, version)
         fields = _build_schema_fields(schema_version_id=version.id, version=payload.version)
         if fields:
             await dynamic_schema_repository.create_dynamic_schema_fields(session, fields)
-            version.fields.extend(fields)
+            set_committed_value(version, "fields", list(fields))
         await session.commit()
     except Exception:
         await session.rollback()
@@ -284,6 +292,7 @@ async def _get_or_create_schema_for_update(
             current_version_id=None,
             created_by_id=created_by_id,
         )
+        _assign_uuid_if_missing(schema)
         await dynamic_schema_repository.create_dynamic_schema(session, schema)
     except IntegrityError:
         await savepoint.rollback()
@@ -319,7 +328,7 @@ def _build_schema_fields(
     schema_version_id: uuid.UUID,
     version: DynamicSchemaVersionInput,
 ) -> list[DynamicSchemaField]:
-    return [
+    fields = [
         DynamicSchemaField(
             schema_version_id=schema_version_id,
             field_key=field.field_key,
@@ -340,6 +349,9 @@ def _build_schema_fields(
         )
         for field in version.fields
     ]
+    for field in fields:
+        _assign_uuid_if_missing(field)
+    return fields
 
 
 def _validate_activation_state(

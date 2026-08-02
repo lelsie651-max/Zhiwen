@@ -171,6 +171,10 @@ from app.services.processing_job_dispatch import dispatch_revision_extraction_jo
 
 def __getattr__(name: str):
     if name in {
+        "BailianDemoSeedError",
+        "BailianDemoSeedInconsistentError",
+        "BailianDemoSeedStateError",
+        "seed_bailian_demo",
         "DynamicSchemaReviewProjectionError",
         "DynamicSchemaReviewProjectionStateError",
         "DynamicSchemaReviewProjectionInvariantError",
@@ -196,6 +200,27 @@ def __getattr__(name: str):
         "get_project_version_snapshot",
     }:
         exported = {}
+        if name in {
+            "BailianDemoSeedError",
+            "BailianDemoSeedInconsistentError",
+            "BailianDemoSeedStateError",
+            "seed_bailian_demo",
+        }:
+            from app.services.bailian_demo_seed import (
+                BailianDemoSeedError,
+                BailianDemoSeedInconsistentError,
+                BailianDemoSeedStateError,
+                seed_bailian_demo,
+            )
+
+            exported.update(
+                {
+                    "BailianDemoSeedError": BailianDemoSeedError,
+                    "BailianDemoSeedInconsistentError": BailianDemoSeedInconsistentError,
+                    "BailianDemoSeedStateError": BailianDemoSeedStateError,
+                    "seed_bailian_demo": seed_bailian_demo,
+                }
+            )
         if name in {
             "DynamicSchemaReviewProjectionError",
             "DynamicSchemaReviewProjectionStateError",

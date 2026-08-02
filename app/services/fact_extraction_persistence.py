@@ -60,6 +60,11 @@ _APPLICATION_CONSTRAINT = "uq_feba_inference_run_id"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _assign_uuid_if_missing(model: object) -> None:
+    if getattr(model, "id", None) is None:
+        model.id = uuid.uuid4()
+
+
 class FactExtractionPersistenceError(Exception):
     """Base class for completed batch persistence failures."""
 
@@ -788,6 +793,7 @@ async def _prepare_batch_application(
         entity_resolution_policy_name=ENTITY_RESOLUTION_POLICY_NAME,
         entity_resolution_policy_version=ENTITY_RESOLUTION_POLICY_VERSION,
     )
+    _assign_uuid_if_missing(application)
 
     savepoint = await session.begin_nested()
     try:

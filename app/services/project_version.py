@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import re
 import uuid
 from typing import Any
@@ -183,6 +184,16 @@ def _freeze_snapshot_json(snapshot_json: object) -> Mapping[str, object]:
     if not isinstance(frozen, Mapping):
         raise ProjectVersionInvariantError("project_version_snapshot_invalid")
     return frozen
+
+
+def _thaw_snapshot_json(snapshot_json: object) -> dict[str, object]:
+    try:
+        thawed = json.loads(_canonical_bytes(snapshot_json).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ProjectVersionInvariantError("project_version_snapshot_invalid") from None
+    if not isinstance(thawed, dict):
+        raise ProjectVersionInvariantError("project_version_snapshot_invalid")
+    return thawed
 
 
 def _canonical_bytes(payload: object) -> bytes:
@@ -1357,6 +1368,7 @@ async def create_project_version(
                 )
             ) + 1
             created_at = datetime.now(timezone.utc)
+            storage_snapshot_json = _thaw_snapshot_json(prepared.snapshot_json)
             project_version = ProjectVersion(
                 id=project_version_id,
                 project_id=project_id,
@@ -1380,7 +1392,7 @@ async def create_project_version(
                 knowledge_view_algorithm_name=prepared.knowledge_view_algorithm_name,
                 knowledge_view_algorithm_version=prepared.knowledge_view_algorithm_version,
                 snapshot_format_version=SNAPSHOT_FORMAT_VERSION,
-                snapshot_json=prepared.snapshot_json,
+                snapshot_json=storage_snapshot_json,
                 snapshot_json_hash=prepared.snapshot_json_hash,
                 version_manifest_hash=_prepared_manifest_hash(
                     prepared,
