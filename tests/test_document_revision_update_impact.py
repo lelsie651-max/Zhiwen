@@ -1078,6 +1078,145 @@ def test_get_document_revision_update_impact_hash_changes_when_source_manifest_o
     assert baseline.impact_manifest_hash != changed_quality.impact_manifest_hash
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("fact_count", "document_revision_update_impact_fact_count_mismatch"),
+        (
+            "review_required_count",
+            "document_revision_update_impact_review_required_count_mismatch",
+        ),
+        ("kind_count", "document_revision_update_impact_kind_count_mismatch"),
+        ("manifest", "document_revision_update_impact_manifest_mismatch"),
+    ],
+)
+def test_authenticate_document_revision_update_impact_projection_rejects_count_or_manifest_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    fixture = _fixture()
+    _install_dependencies(
+        monkeypatch,
+        fact_diff=fixture["fact_diff"],
+        authenticated_context=fixture["authenticated_context"],
+        effective_projection=fixture["effective_projection"],
+    )
+    impact = _call(SessionFactory(), fixture)
+    if mutation == "fact_count":
+        impact = replace(impact, fact_count=999)
+    elif mutation == "review_required_count":
+        impact = replace(impact, review_required_count=999)
+    elif mutation == "kind_count":
+        impact = replace(impact, modified_count=999)
+    else:
+        impact = replace(impact, impact_manifest_hash="0" * 64)
+
+    with pytest.raises(
+        impact_service.DocumentRevisionUpdateImpactInvariantError,
+        match=expected_code,
+    ):
+        impact_service.authenticate_document_revision_update_impact_projection(impact)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("nonzero_empty", "document_revision_update_impact_fact_count_mismatch"),
+        ("duplicate_fact", "document_revision_update_impact_duplicate_fact_id"),
+        ("invalid_mapping", "document_revision_update_impact_kind_mapping_invalid"),
+        (
+            "non_bool_requires_review",
+            "document_revision_update_impact_requires_review_invalid",
+        ),
+        (
+            "invalid_requires_review",
+            "document_revision_update_impact_requires_review_invalid",
+        ),
+        ("invalid_shape", "document_revision_update_impact_fact_shape_invalid"),
+    ],
+)
+def test_authenticate_document_revision_update_impact_projection_rejects_item_shape_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    fixture = _fixture()
+    _install_dependencies(
+        monkeypatch,
+        fact_diff=fixture["fact_diff"],
+        authenticated_context=fixture["authenticated_context"],
+        effective_projection=fixture["effective_projection"],
+    )
+    impact = _call(SessionFactory(), fixture)
+    if mutation == "nonzero_empty":
+        impact = replace(
+            impact,
+            items=(),
+            fact_count=1,
+            review_required_count=1,
+            unchanged_resolved_count=0,
+            unchanged_no_review_context_count=0,
+            unchanged_unresolved_count=0,
+            modified_count=1,
+            added_count=0,
+            removed_count=0,
+            impact_manifest_hash="0" * 64,
+        )
+    elif mutation == "duplicate_fact":
+        duplicate_item = replace(impact.items[1], fact_id=impact.items[0].fact_id)
+        impact = replace(
+            impact,
+            items=(impact.items[0], duplicate_item, *impact.items[2:]),
+            impact_manifest_hash="0" * 64,
+        )
+    elif mutation == "invalid_mapping":
+        impact = replace(
+            impact,
+            items=(
+                replace(impact.items[0], fact_change_kind="modified"),
+                *impact.items[1:],
+            ),
+            impact_manifest_hash="0" * 64,
+        )
+    elif mutation == "non_bool_requires_review":
+        impact = replace(
+            impact,
+            items=(
+                *impact.items[:3],
+                replace(impact.items[3], requires_review=1),
+                *impact.items[4:],
+            ),
+            impact_manifest_hash="0" * 64,
+        )
+    elif mutation == "invalid_requires_review":
+        impact = replace(
+            impact,
+            items=(
+                *impact.items[:3],
+                replace(impact.items[3], requires_review=False),
+                *impact.items[4:],
+            ),
+            impact_manifest_hash="0" * 64,
+        )
+    else:
+        impact = replace(
+            impact,
+            items=(
+                *impact.items[:4],
+                replace(impact.items[4], base_fact=impact.items[4].target_fact),
+                impact.items[5],
+            ),
+            impact_manifest_hash="0" * 64,
+        )
+
+    with pytest.raises(
+        impact_service.DocumentRevisionUpdateImpactInvariantError,
+        match=expected_code,
+    ):
+        impact_service.authenticate_document_revision_update_impact_projection(impact)
+
+
 def test_get_document_revision_update_impact_returns_empty_projection_for_zero_fact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

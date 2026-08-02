@@ -1840,6 +1840,28 @@ def _build_batch_result(batch: FactExtractionOrchestrationBatch) -> FactExtracti
     )
 
 
+def _build_orchestration_result(
+    *,
+    orchestration: FactExtractionOrchestration,
+    batches: Sequence[FactExtractionOrchestrationBatch],
+) -> FactExtractionOrchestrationResult:
+    return FactExtractionOrchestrationResult(
+        orchestration_id=orchestration.id,
+        attempt_no=orchestration.attempt_no,
+        request_hash=orchestration.request_hash,
+        plan_hash=orchestration.plan_hash,
+        status=FactExtractionOrchestrationStatus(orchestration.status),
+        batch_count=orchestration.batch_count,
+        completed_batch_count=orchestration.completed_batch_count,
+        failed_batch_count=orchestration.failed_batch_count,
+        proposal_count=orchestration.proposal_count,
+        created_count=orchestration.created_count,
+        reused_count=orchestration.reused_count,
+        withheld_count=orchestration.withheld_count,
+        batches=tuple(_build_batch_result(batch) for batch in batches),
+    )
+
+
 async def _maybe_run_terminal_consistency_postprocessing(
     session_factory: Callable[[], AsyncSession],
     *,
@@ -1931,24 +1953,70 @@ async def _read_completed_orchestration_result(
             authenticated_applications=authenticated_applications,
         )
         await session.commit()
-        return FactExtractionOrchestrationResult(
-            orchestration_id=orchestration.id,
-            attempt_no=orchestration.attempt_no,
-            request_hash=orchestration.request_hash,
-            plan_hash=orchestration.plan_hash,
-            status=FactExtractionOrchestrationStatus(orchestration.status),
-            batch_count=orchestration.batch_count,
-            completed_batch_count=orchestration.completed_batch_count,
-            failed_batch_count=orchestration.failed_batch_count,
-            proposal_count=orchestration.proposal_count,
-            created_count=orchestration.created_count,
-            reused_count=orchestration.reused_count,
-            withheld_count=orchestration.withheld_count,
-            batches=tuple(_build_batch_result(batch) for batch in batches),
+        return _build_orchestration_result(
+            orchestration=orchestration,
+            batches=batches,
         )
     except BaseException:
         await session.rollback()
         raise
+
+
+async def authenticate_terminal_fact_extraction_orchestration(
+    session_factory: Callable[[], AsyncSession],
+    *,
+    project_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+    orchestration_id: uuid.UUID,
+) -> FactExtractionOrchestrationResult:
+    project_id = _require_uuid(project_id, field_name="project_id")
+    extraction_run_id = _require_uuid(extraction_run_id, field_name="extraction_run_id")
+    orchestration_id = _require_uuid(orchestration_id, field_name="orchestration_id")
+
+    async with session_factory() as session:
+        try:
+            orchestration = await orchestration_repository.get_orchestration(
+                session,
+                orchestration_id=orchestration_id,
+            )
+            if orchestration is None:
+                raise FactExtractionOrchestrationStateError("orchestration not found")
+            if orchestration.project_id != project_id:
+                raise FactExtractionOrchestrationStateError("orchestration project mismatch")
+            if orchestration.extraction_run_id != extraction_run_id:
+                raise FactExtractionOrchestrationStateError(
+                    "orchestration extraction run mismatch"
+                )
+            batches = await orchestration_repository.list_batches_for_orchestration(
+                session,
+                orchestration_id=orchestration_id,
+            )
+            application_ids = [
+                batch.application_id
+                for batch in batches
+                if batch.application_id is not None
+            ]
+            applications = await orchestration_repository.list_applications(
+                session,
+                application_ids=application_ids,
+            )
+            applications_by_id = {application.id: application for application in applications}
+            authenticated_applications = _load_authenticated_completed_applications(
+                orchestration=orchestration,
+                batches=batches,
+                applications_by_id=applications_by_id,
+            )
+            validate_terminal_orchestration_state(
+                orchestration=orchestration,
+                batches=batches,
+                authenticated_applications=authenticated_applications,
+            )
+            return _build_orchestration_result(
+                orchestration=orchestration,
+                batches=batches,
+            )
+        finally:
+            await session.rollback()
 
 
 async def _finalize_orchestration(

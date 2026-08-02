@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -23,6 +24,7 @@ from app.services import fact_value_duplicate_grouping as duplicate_grouping_ser
 
 DOCUMENT_REVISION_UPDATE_IMPACT_ALGORITHM_NAME = "document_revision_update_impact"
 DOCUMENT_REVISION_UPDATE_IMPACT_ALGORITHM_VERSION = "1.0.0"
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class DocumentRevisionUpdateImpactError(Exception):
@@ -51,6 +53,14 @@ class _BaseEffectiveContext:
 def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
     if not isinstance(value, uuid.UUID):
         raise DocumentRevisionUpdateImpactStateError(
+            f"document_revision_update_impact_{field_name}_invalid"
+        )
+    return value
+
+
+def _require_sha256(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
+        raise DocumentRevisionUpdateImpactInvariantError(
             f"document_revision_update_impact_{field_name}_invalid"
         )
     return value
@@ -211,6 +221,140 @@ def _build_manifest_hash(
             "items": [_serialize_item(item) for item in impact.items],
         }
     )
+
+
+def authenticate_document_revision_update_impact_projection(
+    impact: DocumentRevisionUpdateImpact,
+) -> DocumentRevisionUpdateImpact:
+    if impact.impact_algorithm_name != DOCUMENT_REVISION_UPDATE_IMPACT_ALGORITHM_NAME:
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_algorithm_identity_invalid"
+        )
+    if impact.impact_algorithm_version != DOCUMENT_REVISION_UPDATE_IMPACT_ALGORITHM_VERSION:
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_algorithm_identity_invalid"
+        )
+    _require_comparison_quality(impact.comparison_quality)
+    _require_sha256(
+        impact.block_diff_manifest_hash,
+        field_name="block_diff_manifest_hash",
+    )
+    _require_sha256(
+        impact.fact_diff_manifest_hash,
+        field_name="fact_diff_manifest_hash",
+    )
+    _require_sha256(
+        impact.base_consistency_result_manifest_hash,
+        field_name="base_consistency_result_manifest_hash",
+    )
+    _require_sha256(
+        impact.impact_manifest_hash,
+        field_name="impact_manifest_hash",
+    )
+    if impact.fact_count != len(impact.items):
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_fact_count_mismatch"
+        )
+
+    fact_ids_seen: set[uuid.UUID] = set()
+    review_required_count = 0
+    counts = {
+        "unchanged_resolved": 0,
+        "unchanged_no_review_context": 0,
+        "unchanged_unresolved": 0,
+        "modified": 0,
+        "added": 0,
+        "removed": 0,
+    }
+    valid_unchanged_impacts = {
+        "unchanged_resolved",
+        "unchanged_no_review_context",
+        "unchanged_unresolved",
+    }
+    for item in impact.items:
+        if item.fact_id in fact_ids_seen:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_duplicate_fact_id"
+            )
+        fact_ids_seen.add(item.fact_id)
+        if not isinstance(item.requires_review, bool):
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_requires_review_invalid"
+            )
+        if item.fact_change_kind == "unchanged":
+            if item.impact_kind not in valid_unchanged_impacts:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_kind_mapping_invalid"
+                )
+        elif item.fact_change_kind != item.impact_kind:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_kind_mapping_invalid"
+            )
+        expected_requires_review = item.impact_kind in {
+            "unchanged_unresolved",
+            "modified",
+            "added",
+            "removed",
+        }
+        if item.requires_review is not expected_requires_review:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_requires_review_invalid"
+            )
+        if item.fact_change_kind in {"unchanged", "modified"}:
+            if item.base_fact is None or item.target_fact is None:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_fact_shape_invalid"
+                )
+        elif item.fact_change_kind == "added":
+            if item.base_fact is not None or item.target_fact is None:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_fact_shape_invalid"
+                )
+        elif item.fact_change_kind == "removed":
+            if item.base_fact is None or item.target_fact is not None:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_fact_shape_invalid"
+                )
+        else:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_kind_mapping_invalid"
+            )
+        if item.base_fact is not None and item.base_fact.fact_id != item.fact_id:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_fact_shape_invalid"
+            )
+        if item.target_fact is not None and item.target_fact.fact_id != item.fact_id:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_fact_shape_invalid"
+            )
+        review_required_count += 1 if item.requires_review else 0
+        counts[item.impact_kind] += 1
+
+    if impact.review_required_count != review_required_count:
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_review_required_count_mismatch"
+        )
+    if (
+        impact.unchanged_resolved_count != counts["unchanged_resolved"]
+        or impact.unchanged_no_review_context_count
+        != counts["unchanged_no_review_context"]
+        or impact.unchanged_unresolved_count != counts["unchanged_unresolved"]
+        or impact.modified_count != counts["modified"]
+        or impact.added_count != counts["added"]
+        or impact.removed_count != counts["removed"]
+    ):
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_kind_count_mismatch"
+        )
+    if sum(counts.values()) != impact.fact_count:
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_kind_count_mismatch"
+        )
+    if _build_manifest_hash(impact=impact) != impact.impact_manifest_hash:
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_manifest_mismatch"
+        )
+    return impact
 
 
 def _build_effective_context_map(
@@ -575,7 +719,8 @@ async def get_document_revision_update_impact(
         impact_manifest_hash="",
     )
     impact_manifest_hash = _build_manifest_hash(impact=impact)
-    return DocumentRevisionUpdateImpact(
+    return authenticate_document_revision_update_impact_projection(
+        DocumentRevisionUpdateImpact(
         project_id=impact.project_id,
         document_id=impact.document_id,
         base_revision_id=impact.base_revision_id,
@@ -602,4 +747,5 @@ async def get_document_revision_update_impact(
         removed_count=impact.removed_count,
         items=impact.items,
         impact_manifest_hash=impact_manifest_hash,
+        )
     )

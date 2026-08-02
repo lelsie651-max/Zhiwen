@@ -17,6 +17,7 @@ from app.schemas.document_revision_update_workflow import (
 from app.schemas.fact_extraction_orchestration import FactExtractionOrchestrationStatus
 from app.schemas.fact_extraction_plan import FactExtractionPlan
 from app.services import consistency_pipeline as pipeline_service
+from app.services import fact_extraction_orchestration as orchestration_service
 from app.services import document_revision_update_impact as impact_service
 from app.services.llm import LLMClient
 
@@ -147,7 +148,32 @@ def _validate_pipeline_result(
     return pipeline_result
 
 
-def _validate_impact_result(
+def _validate_authenticated_terminal_orchestration(
+    terminal_orchestration,
+    *,
+    expected_orchestration_id: uuid.UUID,
+    expected_status: FactExtractionOrchestrationStatus,
+):
+    if not isinstance(expected_status, FactExtractionOrchestrationStatus):
+        raise DocumentRevisionUpdateWorkflowInvariantError(
+            "document_revision_update_workflow_target_extraction_status_invalid"
+        )
+    if terminal_orchestration.orchestration_id != expected_orchestration_id:
+        raise DocumentRevisionUpdateWorkflowInvariantError(
+            "document_revision_update_workflow_terminal_orchestration_source_mismatch"
+        )
+    if not isinstance(terminal_orchestration.status, FactExtractionOrchestrationStatus):
+        raise DocumentRevisionUpdateWorkflowInvariantError(
+            "document_revision_update_workflow_terminal_orchestration_status_invalid"
+        )
+    if terminal_orchestration.status != expected_status:
+        raise DocumentRevisionUpdateWorkflowInvariantError(
+            "document_revision_update_workflow_terminal_orchestration_status_mismatch"
+        )
+    return terminal_orchestration
+
+
+def _validate_authenticated_impact_source(
     impact: DocumentRevisionUpdateImpact,
     *,
     project_id: uuid.UUID,
@@ -175,16 +201,6 @@ def _validate_impact_result(
         raise DocumentRevisionUpdateWorkflowInvariantError(
             "document_revision_update_workflow_impact_source_mismatch"
         )
-    _require_comparison_quality(impact.comparison_quality)
-    _require_sha256(
-        impact.impact_manifest_hash,
-        field_name="impact_manifest_hash",
-    )
-    _require_non_negative_int(impact.fact_count, field_name="fact_count")
-    _require_non_negative_int(
-        impact.review_required_count,
-        field_name="review_required_count",
-    )
     return impact
 
 
@@ -255,6 +271,16 @@ async def run_document_revision_update_workflow(
             consistency_requested_model=consistency_requested_model,
         )
     )
+    _validate_authenticated_terminal_orchestration(
+        await orchestration_service.authenticate_terminal_fact_extraction_orchestration(
+            session_factory,
+            project_id=project_id,
+            extraction_run_id=target_extraction_run_id,
+            orchestration_id=pipeline_result.extraction_orchestration_id,
+        ),
+        expected_orchestration_id=pipeline_result.extraction_orchestration_id,
+        expected_status=pipeline_result.extraction_status,
+    )
 
     if pipeline_result.extraction_status == FactExtractionOrchestrationStatus.FAILED:
         return DocumentRevisionUpdateWorkflowResult(
@@ -281,7 +307,7 @@ async def run_document_revision_update_workflow(
             skipped_reason="target_extraction_failed",
         )
 
-    impact = _validate_impact_result(
+    impact = impact_service.authenticate_document_revision_update_impact_projection(
         await impact_service.get_document_revision_update_impact(
             session_factory,
             project_id=project_id,
@@ -293,7 +319,10 @@ async def run_document_revision_update_workflow(
             base_orchestration_id=base_orchestration_id,
             target_orchestration_id=pipeline_result.extraction_orchestration_id,
             base_consistency_check_application_id=base_consistency_check_application_id,
-        ),
+        )
+    )
+    impact = _validate_authenticated_impact_source(
+        impact,
         project_id=project_id,
         document_id=document_id,
         base_revision_id=base_revision_id,

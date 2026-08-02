@@ -1439,6 +1439,66 @@ def test_terminal_validation_is_shared_by_read_and_finalize(monkeypatch) -> None
         run_async(orchestration_service._finalize_orchestration(session, orchestration_id=orchestration.id))
 
 
+def test_authenticate_terminal_fact_extraction_orchestration_rolls_back_without_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = SessionFactory()
+    orchestration = _make_orchestration(status="failed")
+    orchestration.completed_batch_count = 0
+    orchestration.failed_batch_count = orchestration.batch_count
+    batches = [
+        _make_batch(orchestration.id, batch_index=0, status="failed", attempt_count=1),
+        _make_batch(orchestration.id, batch_index=1, status="failed", attempt_count=1),
+        _make_batch(orchestration.id, batch_index=2, status="failed", attempt_count=1),
+    ]
+
+    async def fake_get_orchestration(*_args, **_kwargs):
+        return orchestration
+
+    async def fake_list_batches(*_args, **_kwargs):
+        return batches
+
+    async def fake_list_applications(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "get_orchestration",
+        fake_get_orchestration,
+    )
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "list_batches_for_orchestration",
+        fake_list_batches,
+    )
+    monkeypatch.setattr(
+        orchestration_service.orchestration_repository,
+        "list_applications",
+        fake_list_applications,
+    )
+    monkeypatch.setattr(
+        orchestration_service,
+        "_load_authenticated_completed_applications",
+        lambda **_kwargs: {},
+    )
+
+    result = run_async(
+        orchestration_service.authenticate_terminal_fact_extraction_orchestration(
+            factory,
+            project_id=orchestration.project_id,
+            extraction_run_id=orchestration.extraction_run_id,
+            orchestration_id=orchestration.id,
+        )
+    )
+
+    assert result.orchestration_id == orchestration.id
+    assert result.status == FactExtractionOrchestrationStatus.FAILED
+    assert factory.open_count == 0
+    assert len(factory.sessions) == 1
+    assert factory.sessions[0].commit_count == 0
+    assert factory.sessions[0].rollback_count == 1
+
+
 def test_finalize_batch_from_completed_application_locks_run_before_application(monkeypatch) -> None:
     session = FakeSession()
     orchestration = _make_orchestration(status="running")

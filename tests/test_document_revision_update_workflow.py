@@ -11,7 +11,12 @@ from app.schemas.document_revision_update_impact import DocumentRevisionUpdateIm
 from app.schemas.document_revision_update_workflow import (
     DocumentRevisionUpdateWorkflowResult,
 )
-from app.schemas.fact_extraction_orchestration import FactExtractionOrchestrationStatus
+from app.schemas.fact_extraction_orchestration import (
+    FactExtractionOrchestrationBatchResult,
+    FactExtractionOrchestrationBatchStatus,
+    FactExtractionOrchestrationResult,
+    FactExtractionOrchestrationStatus,
+)
 from app.services import document_revision_update_workflow as workflow_service
 
 
@@ -54,6 +59,47 @@ def _pipeline_result(
         assessment_count=assessment_count,
         consistency_created_new=consistency_created_new,
         skipped_reason=skipped_reason,
+    )
+
+
+def _terminal_result(
+    *,
+    orchestration_id: uuid.UUID,
+    status: FactExtractionOrchestrationStatus,
+) -> FactExtractionOrchestrationResult:
+    return FactExtractionOrchestrationResult(
+        orchestration_id=orchestration_id,
+        attempt_no=1,
+        request_hash="a" * 64,
+        plan_hash="b" * 64,
+        status=status,
+        batch_count=1,
+        completed_batch_count=1 if status == FactExtractionOrchestrationStatus.COMPLETED else 0,
+        failed_batch_count=1 if status == FactExtractionOrchestrationStatus.FAILED else 0,
+        proposal_count=0,
+        created_count=0,
+        reused_count=0,
+        withheld_count=0,
+        batches=(
+            FactExtractionOrchestrationBatchResult(
+                batch_index=0,
+                batch_plan_hash="c" * 64,
+                status=(
+                    FactExtractionOrchestrationBatchStatus.COMPLETED
+                    if status != FactExtractionOrchestrationStatus.FAILED
+                    else FactExtractionOrchestrationBatchStatus.FAILED
+                ),
+                attempt_count=1,
+                input_batch_id=None,
+                inference_run_id=None,
+                application_id=None,
+                proposal_count=0,
+                created_count=0,
+                reused_count=0,
+                withheld_count=0,
+                failure_code=None,
+            ),
+        ),
     )
 
 
@@ -124,6 +170,42 @@ def _workflow_kwargs() -> dict[str, object]:
         "consistency_provider": "agent2-provider",
         "consistency_requested_model": "agent2-model",
     }
+
+
+def _install_terminal_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    terminal_result: FactExtractionOrchestrationResult | Exception,
+) -> None:
+    async def fake_terminal_auth(_session_factory, **_kwargs):
+        if isinstance(terminal_result, Exception):
+            raise terminal_result
+        return terminal_result
+
+    monkeypatch.setattr(
+        workflow_service.orchestration_service,
+        "authenticate_terminal_fact_extraction_orchestration",
+        fake_terminal_auth,
+    )
+
+
+def _install_impact_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    authenticated_impact: DocumentRevisionUpdateImpact | Exception | None = None,
+) -> None:
+    def fake_authenticate(impact):
+        if isinstance(authenticated_impact, Exception):
+            raise authenticated_impact
+        if authenticated_impact is not None:
+            return authenticated_impact
+        return impact
+
+    monkeypatch.setattr(
+        workflow_service.impact_service,
+        "authenticate_document_revision_update_impact_projection",
+        fake_authenticate,
+    )
 
 
 def test_run_document_revision_update_workflow_completed_runs_pipeline_then_impact(
@@ -198,11 +280,19 @@ def test_run_document_revision_update_workflow_completed_runs_pipeline_then_impa
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
     )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.COMPLETED,
+        ),
+    )
     monkeypatch.setattr(
         workflow_service.impact_service,
         "get_document_revision_update_impact",
         fake_impact,
     )
+    _install_impact_auth(monkeypatch)
 
     result = run_async(
         workflow_service.run_document_revision_update_workflow(
@@ -277,11 +367,19 @@ def test_run_document_revision_update_workflow_partial_runs_impact_and_propagate
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
     )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.PARTIAL,
+        ),
+    )
     monkeypatch.setattr(
         workflow_service.impact_service,
         "get_document_revision_update_impact",
         fake_impact,
     )
+    _install_impact_auth(monkeypatch)
 
     result = run_async(
         workflow_service.run_document_revision_update_workflow(
@@ -316,6 +414,13 @@ def test_run_document_revision_update_workflow_failed_skips_impact_and_returns_s
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
     )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.FAILED,
+        ),
+    )
     monkeypatch.setattr(
         workflow_service.impact_service,
         "get_document_revision_update_impact",
@@ -339,6 +444,88 @@ def test_run_document_revision_update_workflow_failed_skips_impact_and_returns_s
     assert result.fact_count is None
     assert result.review_required_count is None
     assert result.skipped_reason == "target_extraction_failed"
+
+
+def test_run_document_revision_update_workflow_rejects_failed_pipeline_when_terminal_orchestration_source_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _workflow_kwargs()
+    target_orchestration_id = uuid.uuid4()
+
+    async def fake_pipeline(_session_factory, **_kwargs):
+        return _pipeline_result(
+            orchestration_id=target_orchestration_id,
+            extraction_status=FactExtractionOrchestrationStatus.FAILED,
+            skipped_reason="extraction_failed",
+        )
+
+    monkeypatch.setattr(
+        workflow_service.pipeline_service,
+        "run_fact_extraction_consistency_pipeline",
+        fake_pipeline,
+    )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=workflow_service.orchestration_service.FactExtractionOrchestrationStateError(
+            "orchestration project mismatch"
+        ),
+    )
+
+    with pytest.raises(
+        workflow_service.orchestration_service.FactExtractionOrchestrationStateError,
+        match="orchestration project mismatch",
+    ):
+        run_async(
+            workflow_service.run_document_revision_update_workflow(
+                ForbiddenSessionFactory(),
+                **kwargs,
+            )
+        )
+
+
+def test_run_document_revision_update_workflow_rejects_pipeline_and_terminal_status_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _workflow_kwargs()
+    target_orchestration_id = uuid.uuid4()
+
+    async def fake_pipeline(_session_factory, **_kwargs):
+        return _pipeline_result(
+            orchestration_id=target_orchestration_id,
+            extraction_status=FactExtractionOrchestrationStatus.PARTIAL,
+            grouping_application_id=uuid.uuid4(),
+            consistency_application_id=uuid.uuid4(),
+            consistency_check_application_id=uuid.uuid4(),
+            consistency_plan_manifest_hash="1" * 64,
+            consistency_execution_result_manifest_hash="2" * 64,
+            assessment_count=1,
+            consistency_created_new=True,
+            skipped_reason=None,
+        )
+
+    monkeypatch.setattr(
+        workflow_service.pipeline_service,
+        "run_fact_extraction_consistency_pipeline",
+        fake_pipeline,
+    )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.COMPLETED,
+        ),
+    )
+
+    with pytest.raises(
+        workflow_service.DocumentRevisionUpdateWorkflowInvariantError,
+        match="document_revision_update_workflow_terminal_orchestration_status_mismatch",
+    ):
+        run_async(
+            workflow_service.run_document_revision_update_workflow(
+                ForbiddenSessionFactory(),
+                **kwargs,
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -465,17 +652,27 @@ def test_run_document_revision_update_workflow_rejects_pipeline_shape_drift(
 
 
 @pytest.mark.parametrize(
-    ("mutation", "expected_code"),
+    ("mutation", "expected_code", "expected_exception"),
     [
-        ("project", "document_revision_update_workflow_impact_source_mismatch"),
-        ("target_orchestration", "document_revision_update_workflow_impact_source_mismatch"),
+        (
+            "project",
+            "document_revision_update_workflow_impact_source_mismatch",
+            workflow_service.DocumentRevisionUpdateWorkflowInvariantError,
+        ),
+        (
+            "target_orchestration",
+            "document_revision_update_workflow_impact_source_mismatch",
+            workflow_service.DocumentRevisionUpdateWorkflowInvariantError,
+        ),
         (
             "comparison_quality",
             "document_revision_update_workflow_comparison_quality_invalid",
+            workflow_service.impact_service.DocumentRevisionUpdateImpactInvariantError,
         ),
         (
             "impact_manifest_hash",
             "document_revision_update_workflow_impact_manifest_hash_invalid",
+            workflow_service.impact_service.DocumentRevisionUpdateImpactInvariantError,
         ),
     ],
 )
@@ -483,6 +680,7 @@ def test_run_document_revision_update_workflow_rejects_impact_shape_or_identity_
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
     expected_code: str,
+    expected_exception: type[Exception],
 ) -> None:
     kwargs = _workflow_kwargs()
     target_orchestration_id = uuid.uuid4()
@@ -571,16 +769,29 @@ def test_run_document_revision_update_workflow_rejects_impact_shape_or_identity_
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
     )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.COMPLETED,
+        ),
+    )
     monkeypatch.setattr(
         workflow_service.impact_service,
         "get_document_revision_update_impact",
         fake_impact,
     )
+    if mutation in {"comparison_quality", "impact_manifest_hash"}:
+        _install_impact_auth(
+            monkeypatch,
+            authenticated_impact=workflow_service.impact_service.DocumentRevisionUpdateImpactInvariantError(
+                expected_code
+            ),
+        )
+    else:
+        _install_impact_auth(monkeypatch)
 
-    with pytest.raises(
-        workflow_service.DocumentRevisionUpdateWorkflowError,
-        match=expected_code,
-    ):
+    with pytest.raises(expected_exception, match=expected_code):
         run_async(
             workflow_service.run_document_revision_update_workflow(
                 ForbiddenSessionFactory(),
@@ -637,11 +848,19 @@ def test_run_document_revision_update_workflow_repeated_calls_reuse_pipeline_and
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
     )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.COMPLETED,
+        ),
+    )
     monkeypatch.setattr(
         workflow_service.impact_service,
         "get_document_revision_update_impact",
         fake_impact,
     )
+    _install_impact_auth(monkeypatch)
 
     first = run_async(
         workflow_service.run_document_revision_update_workflow(
@@ -715,11 +934,19 @@ def test_run_document_revision_update_workflow_retries_after_impact_failure_with
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
     )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.COMPLETED,
+        ),
+    )
     monkeypatch.setattr(
         workflow_service.impact_service,
         "get_document_revision_update_impact",
         fake_impact,
     )
+    _install_impact_auth(monkeypatch)
 
     with pytest.raises(
         workflow_service.DocumentRevisionUpdateWorkflowStateError,
@@ -750,12 +977,13 @@ def test_run_document_revision_update_workflow_propagates_cancelled_error(
     stage: str,
 ) -> None:
     kwargs = _workflow_kwargs()
+    target_orchestration_id = uuid.uuid4()
 
     async def fake_pipeline(_session_factory, **_kwargs):
         if stage == "pipeline":
             raise asyncio.CancelledError()
         return _pipeline_result(
-            orchestration_id=uuid.uuid4(),
+            orchestration_id=target_orchestration_id,
             extraction_status=FactExtractionOrchestrationStatus.COMPLETED,
             grouping_application_id=uuid.uuid4(),
             consistency_application_id=uuid.uuid4(),
@@ -777,11 +1005,20 @@ def test_run_document_revision_update_workflow_propagates_cancelled_error(
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
     )
+    if stage != "pipeline":
+        _install_terminal_auth(
+            monkeypatch,
+            terminal_result=_terminal_result(
+                orchestration_id=target_orchestration_id,
+                status=FactExtractionOrchestrationStatus.COMPLETED,
+            ),
+        )
     monkeypatch.setattr(
         workflow_service.impact_service,
         "get_document_revision_update_impact",
         fake_impact,
     )
+    _install_impact_auth(monkeypatch)
 
     with pytest.raises(asyncio.CancelledError):
         run_async(
@@ -819,6 +1056,13 @@ def test_run_document_revision_update_workflow_does_not_leak_sensitive_sentinel(
         workflow_service.pipeline_service,
         "run_fact_extraction_consistency_pipeline",
         fake_pipeline,
+    )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=uuid.uuid4(),
+            status=FactExtractionOrchestrationStatus.COMPLETED,
+        ),
     )
     monkeypatch.setattr(
         workflow_service.impact_service,

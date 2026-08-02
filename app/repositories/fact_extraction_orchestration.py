@@ -90,6 +90,19 @@ async def get_orchestration_for_update(
     return result.scalar_one_or_none()
 
 
+async def get_orchestration(
+    session: AsyncSession,
+    *,
+    orchestration_id: uuid.UUID,
+) -> FactExtractionOrchestration | None:
+    result = await session.execute(
+        select(FactExtractionOrchestration).where(
+            FactExtractionOrchestration.id == orchestration_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def list_orchestrations_by_request_for_update(
     session: AsyncSession,
     *,
