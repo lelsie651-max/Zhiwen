@@ -838,6 +838,7 @@ def _build_authenticated_application_snapshot(
         entity_resolution_policy_name=application.entity_resolution_policy_name,
         entity_resolution_policy_version=application.entity_resolution_policy_version,
         items=persisted_items,
+        result_hash=application.result_hash,
     )
 
 

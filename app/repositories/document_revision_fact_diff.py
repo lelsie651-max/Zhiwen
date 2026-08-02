@@ -6,7 +6,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.document_content import DocumentBlock, SourceEvidence
+from app.models.document_content import DocumentBlock, ExtractionRun, SourceEvidence
 from app.models.fact import Fact, FactEvidenceLink, FactValue, FactValueSourceKind
 from app.models.fact_extraction_application import FactExtractionBatchApplication
 from app.models.fact_extraction_orchestration import (
@@ -57,6 +57,12 @@ class DocumentRevisionFactDiffSourceRow:
     block_table_index: int | None
     block_row_index: int | None
     block_raw_text: str | None
+    application_id: uuid.UUID | None = None
+    language_code: str | None = None
+    confidence: float | None = None
+    evidence_role: str | None = None
+    evidence_is_primary: bool | None = None
+    document_revision_id: uuid.UUID | None = None
 
 
 async def list_document_revision_fact_diff_source_rows(
@@ -78,6 +84,7 @@ async def list_document_revision_fact_diff_source_rows(
             FactValue.extraction_run_id.label("extraction_run_id"),
             FactValue.inference_run_id.label("inference_run_id"),
             FactExtractionOrchestrationBatch.id.label("source_batch_id"),
+            FactExtractionBatchApplication.id.label("application_id"),
             FactExtractionBatchApplication.project_id.label("application_project_id"),
             FactExtractionBatchApplication.extraction_run_id.label(
                 "application_extraction_run_id"
@@ -96,11 +103,16 @@ async def list_document_revision_fact_diff_source_rows(
             FactValue.value_json.label("value_json"),
             FactValue.normalized_value_text.label("normalized_value_text"),
             FactValue.value_hash.label("fact_value_hash"),
+            FactValue.language_code.label("language_code"),
+            FactValue.confidence.label("confidence"),
             FactValue.referenced_entity_id.label("referenced_entity_id"),
             FactEvidenceLink.id.label("evidence_link_id"),
             FactEvidenceLink.source_order.label("evidence_link_source_order"),
             SourceEvidence.id.label("evidence_id"),
+            FactEvidenceLink.role.label("evidence_role"),
+            FactEvidenceLink.is_primary.label("evidence_is_primary"),
             DocumentBlock.id.label("document_block_id"),
+            ExtractionRun.revision_id.label("document_revision_id"),
             SourceEvidence.start_offset.label("evidence_start_offset"),
             SourceEvidence.end_offset.label("evidence_end_offset"),
             SourceEvidence.excerpt.label("evidence_excerpt"),
@@ -132,6 +144,7 @@ async def list_document_revision_fact_diff_source_rows(
         .outerjoin(FactEvidenceLink, FactEvidenceLink.fact_value_id == FactValue.id)
         .outerjoin(SourceEvidence, FactEvidenceLink.evidence_id == SourceEvidence.id)
         .outerjoin(DocumentBlock, SourceEvidence.block_id == DocumentBlock.id)
+        .outerjoin(ExtractionRun, DocumentBlock.extraction_run_id == ExtractionRun.id)
         .where(
             FactExtractionOrchestrationBatch.orchestration_id == orchestration_id,
             FactExtractionOrchestrationBatch.status == "completed",
@@ -167,6 +180,7 @@ async def list_document_revision_fact_diff_source_rows(
             extraction_run_id=row.extraction_run_id,
             inference_run_id=row.inference_run_id,
             source_batch_id=row.source_batch_id,
+            application_id=row.application_id,
             application_project_id=row.application_project_id,
             application_extraction_run_id=row.application_extraction_run_id,
             application_inference_run_id=row.application_inference_run_id,
@@ -177,11 +191,16 @@ async def list_document_revision_fact_diff_source_rows(
             value_json=row.value_json,
             normalized_value_text=row.normalized_value_text,
             fact_value_hash=row.fact_value_hash,
+            language_code=row.language_code,
+            confidence=row.confidence,
             referenced_entity_id=row.referenced_entity_id,
             evidence_link_id=row.evidence_link_id,
             evidence_link_source_order=row.evidence_link_source_order,
             evidence_id=row.evidence_id,
+            evidence_role=row.evidence_role,
+            evidence_is_primary=row.evidence_is_primary,
             document_block_id=row.document_block_id,
+            document_revision_id=row.document_revision_id,
             evidence_start_offset=row.evidence_start_offset,
             evidence_end_offset=row.evidence_end_offset,
             evidence_excerpt=row.evidence_excerpt,

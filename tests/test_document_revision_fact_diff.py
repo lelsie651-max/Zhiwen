@@ -301,6 +301,7 @@ def _row(
     orchestration_project_id: uuid.UUID | None = None,
     orchestration_extraction_run_id: uuid.UUID | None = None,
     batch_current_inference_run_id: uuid.UUID | None = None,
+    application_id: uuid.UUID | None = None,
     subject_kind: str = "subject",
     subject_key: str | None = None,
     predicate_key: str | None = None,
@@ -308,6 +309,11 @@ def _row(
     subject_entity_id: uuid.UUID | None = None,
     value_type: str = "string",
     referenced_entity_id: uuid.UUID | None = None,
+    language_code: str | None = None,
+    confidence: float | None = None,
+    evidence_role: str = "supporting",
+    evidence_is_primary: bool = True,
+    document_revision_id: uuid.UUID | None = None,
 ) -> fact_diff_service.document_revision_fact_diff_repository.DocumentRevisionFactDiffSourceRow:
     actual_subject_key = subject_key or f"subject-{fact_id}"
     actual_predicate_key = predicate_key or f"predicate-{fact_id}"
@@ -338,6 +344,7 @@ def _row(
         extraction_run_id=extraction_run_id,
         inference_run_id=inference_run_id,
         source_batch_id=source_batch_id,
+        application_id=application_id or _uuid(f"application-{fact_value_id}"),
         application_project_id=application_project_id or project_id,
         application_extraction_run_id=application_extraction_run_id or extraction_run_id,
         application_inference_run_id=application_inference_run_id or inference_run_id,
@@ -348,11 +355,16 @@ def _row(
         value_json=normalized_value.value_json,
         normalized_value_text=normalized_value.normalized_value_text,
         fact_value_hash=normalized_value.value_hash,
+        language_code=language_code,
+        confidence=confidence,
         referenced_entity_id=normalized_value.referenced_entity_id,
         evidence_link_id=evidence_link_id,
         evidence_link_source_order=0,
         evidence_id=evidence_id,
+        evidence_role=evidence_role,
+        evidence_is_primary=evidence_is_primary,
         document_block_id=document_block_id,
+        document_revision_id=document_revision_id or _uuid(f"revision-{extraction_run_id}"),
         evidence_start_offset=0,
         evidence_end_offset=len(excerpt),
         evidence_excerpt=excerpt,
@@ -380,8 +392,9 @@ def _application_snapshot(
     subject_entity_id: uuid.UUID | None = None,
     referenced_entity_id: uuid.UUID | None = None,
 ) -> AuthenticatedCompletedFactExtractionApplicationSnapshot:
+    application_id = _uuid(f"application-{fact_value_id}")
     return AuthenticatedCompletedFactExtractionApplicationSnapshot(
-        application_id=uuid.uuid4(),
+        application_id=application_id,
         project_id=project_id,
         extraction_run_id=extraction_run_id,
         inference_run_id=inference_run_id,
@@ -400,6 +413,7 @@ def _application_snapshot(
                 evidence_ids=evidence_ids,
             ),
         ),
+        result_hash="d" * 64,
     )
 
 

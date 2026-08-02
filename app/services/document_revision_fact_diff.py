@@ -80,6 +80,69 @@ class _CertifiedFactValue:
     referenced_entity_id: uuid.UUID | None
 
 
+@dataclass(frozen=True, slots=True)
+class AuthenticatedFactSourceEvidence:
+    evidence_link_id: uuid.UUID
+    evidence_id: uuid.UUID
+    document_revision_id: uuid.UUID
+    document_block_id: uuid.UUID
+    locator: DocumentRevisionFactDiffEvidenceLocator
+    excerpt: str
+    excerpt_hash: str
+    content_hash: str
+    role: str
+    is_primary: bool
+    source_order: int
+    block_source_order: int
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedFactSourceValue:
+    fact_value_id: uuid.UUID
+    source_batch_id: uuid.UUID
+    source_application_id: uuid.UUID
+    proposal_index: int
+    normalized_value_text: str
+    value_hash: str
+    language_code: str | None
+    confidence: float | None
+    evidences: tuple[AuthenticatedFactSourceEvidence, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedFactSourceValueGroup:
+    semantic_key_hash: str
+    value_type: str
+    value_json: Any | None
+    referenced_entity_id: uuid.UUID | None
+    fact_value_ids: tuple[uuid.UUID, ...]
+    values: tuple[AuthenticatedFactSourceValue, ...]
+    evidences: tuple[AuthenticatedFactSourceEvidence, ...]
+    earliest_block_source_order: int
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedFactSourceFact:
+    fact: DocumentRevisionFactDiffFactSnapshot
+    value_groups: tuple[AuthenticatedFactSourceValueGroup, ...]
+    semantic_key_hashes: frozenset[str]
+    earliest_block_source_order: int
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthenticatedEvidenceEnvelope:
+    snapshot: AuthenticatedFactSourceEvidence
+    block_source_order: int
+    evidence_link_source_order: int
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthenticatedValueEnvelope:
+    snapshot: AuthenticatedFactSourceValue
+    application_order: int
+    proposal_index: int
+
+
 def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
     if not isinstance(value, uuid.UUID):
         raise DocumentRevisionFactDiffStateError(
@@ -119,19 +182,33 @@ def _build_authoritative_application_item_map(
     source_snapshot: duplicate_grouping_service.AuthenticatedDuplicateGroupingSourceSnapshot,
 ) -> dict[
     uuid.UUID,
-    duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedPersistedFactProposalItem,
+    tuple[
+        int,
+        duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedCompletedFactExtractionApplicationSnapshot,
+        duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedPersistedFactProposalItem,
+    ],
 ]:
     item_by_fact_value_id: dict[
         uuid.UUID,
-        duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedPersistedFactProposalItem,
+        tuple[
+            int,
+            duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedCompletedFactExtractionApplicationSnapshot,
+            duplicate_grouping_service.fact_extraction_persistence_service.AuthenticatedPersistedFactProposalItem,
+        ],
     ] = {}
-    for application_snapshot in source_snapshot.application_snapshots:
+    for application_order, application_snapshot in enumerate(
+        source_snapshot.application_snapshots
+    ):
         for item in application_snapshot.items:
             if item.fact_value_id in item_by_fact_value_id:
                 raise DocumentRevisionFactDiffInvariantError(
                     "document_revision_fact_diff_fact_value_source_mismatch"
                 )
-            item_by_fact_value_id[item.fact_value_id] = item
+            item_by_fact_value_id[item.fact_value_id] = (
+                application_order,
+                application_snapshot,
+                item,
+            )
     return item_by_fact_value_id
 
 
@@ -391,13 +468,12 @@ def _rows_by_fact_value_id(
     return grouped
 
 
-def _build_fact_side_snapshots(
+def build_authenticated_fact_source_facts(
     *,
     rows: Sequence[DocumentRevisionFactDiffSourceRow],
     source_snapshot: duplicate_grouping_service.AuthenticatedDuplicateGroupingSourceSnapshot,
-    block_change_by_block_id: dict[uuid.UUID, str],
     expected_run_id: uuid.UUID,
-) -> dict[uuid.UUID, _FactSideSnapshot]:
+) -> dict[uuid.UUID, AuthenticatedFactSourceFact]:
     candidate_by_fact_value_id = {
         candidate.fact_value_id: candidate for candidate in source_snapshot.candidates
     }
@@ -438,6 +514,7 @@ def _build_fact_side_snapshots(
                 or row.extraction_run_id != stable_row.extraction_run_id
                 or row.inference_run_id != stable_row.inference_run_id
                 or row.source_batch_id != stable_row.source_batch_id
+                or row.application_id != stable_row.application_id
                 or row.application_project_id != stable_row.application_project_id
                 or row.application_extraction_run_id
                 != stable_row.application_extraction_run_id
@@ -450,6 +527,8 @@ def _build_fact_side_snapshots(
                 != stable_row.batch_current_inference_run_id
                 or row.value_type != stable_row.value_type
                 or row.value_json != stable_row.value_json
+                or row.language_code != stable_row.language_code
+                or row.confidence != stable_row.confidence
                 or row.referenced_entity_id != stable_row.referenced_entity_id
             ):
                 raise DocumentRevisionFactDiffInvariantError(
@@ -460,14 +539,19 @@ def _build_fact_side_snapshots(
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_value_source_mismatch"
             )
-        authoritative_item = authoritative_item_by_fact_value_id.get(fact_value_id)
-        if authoritative_item is None:
+        authoritative_entry = authoritative_item_by_fact_value_id.get(fact_value_id)
+        if authoritative_entry is None:
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_value_source_mismatch"
             )
+        application_order, application_snapshot, authoritative_item = authoritative_entry
         if stable_row.fact_project_id != source_snapshot.state.project_id:
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_fact_project_mismatch"
+            )
+        if stable_row.application_id != application_snapshot.application_id:
+            raise DocumentRevisionFactDiffInvariantError(
+                "document_revision_fact_diff_fact_value_source_mismatch"
             )
         if stable_row.application_project_id != source_snapshot.state.project_id:
             raise DocumentRevisionFactDiffInvariantError(
@@ -539,14 +623,17 @@ def _build_fact_side_snapshots(
                 "document_revision_fact_diff_fact_identity_mismatch"
             )
 
-        evidence_ids_seen: set[uuid.UUID] = set()
+        evidence_link_ids_seen: set[uuid.UUID] = set()
         evidence_link_ids_in_order: list[uuid.UUID] = []
-        evidence_envelopes: list[_EvidenceSnapshotEnvelope] = []
+        evidence_envelopes: list[_AuthenticatedEvidenceEnvelope] = []
         for row in fact_value_rows:
             if (
                 row.evidence_link_id is None
                 or row.evidence_id is None
+                or row.evidence_role is None
+                or row.evidence_is_primary is None
                 or row.document_block_id is None
+                or row.document_revision_id is None
                 or row.evidence_link_source_order is None
                 or row.evidence_start_offset is None
                 or row.evidence_end_offset is None
@@ -557,6 +644,10 @@ def _build_fact_side_snapshots(
                 or row.block_location_key is None
                 or row.block_raw_text is None
             ):
+                raise DocumentRevisionFactDiffInvariantError(
+                    "document_revision_fact_diff_evidence_missing"
+                )
+            if not isinstance(row.evidence_is_primary, bool):
                 raise DocumentRevisionFactDiffInvariantError(
                     "document_revision_fact_diff_evidence_missing"
                 )
@@ -573,22 +664,18 @@ def _build_fact_side_snapshots(
                 raise DocumentRevisionFactDiffInvariantError(
                     "document_revision_fact_diff_evidence_excerpt_hash_mismatch"
                 )
-            block_change_kind = block_change_by_block_id.get(row.document_block_id)
-            if block_change_kind is None:
-                raise DocumentRevisionFactDiffInvariantError(
-                    "document_revision_fact_diff_block_mapping_missing"
-                )
-            if row.evidence_link_id in evidence_ids_seen:
+            if row.evidence_link_id in evidence_link_ids_seen:
                 raise DocumentRevisionFactDiffInvariantError(
                     "document_revision_fact_diff_evidence_duplicate"
                 )
-            evidence_ids_seen.add(row.evidence_link_id)
+            evidence_link_ids_seen.add(row.evidence_link_id)
             evidence_link_ids_in_order.append(row.evidence_link_id)
             evidence_envelopes.append(
-                _EvidenceSnapshotEnvelope(
-                    snapshot=DocumentRevisionFactDiffEvidenceSnapshot(
+                _AuthenticatedEvidenceEnvelope(
+                    snapshot=AuthenticatedFactSourceEvidence(
                         evidence_link_id=row.evidence_link_id,
                         evidence_id=row.evidence_id,
+                        document_revision_id=row.document_revision_id,
                         document_block_id=row.document_block_id,
                         locator=DocumentRevisionFactDiffEvidenceLocator(
                             location_key=row.block_location_key,
@@ -600,13 +687,17 @@ def _build_fact_side_snapshots(
                         ),
                         excerpt=row.evidence_excerpt,
                         excerpt_hash=row.evidence_excerpt_hash,
-                        block_change_kind=block_change_kind,
+                        content_hash=_sha256_text(row.block_raw_text),
+                        role=row.evidence_role,
+                        is_primary=row.evidence_is_primary,
+                        source_order=row.evidence_link_source_order,
+                        block_source_order=row.block_source_order,
                     ),
                     block_source_order=row.block_source_order,
                     evidence_link_source_order=row.evidence_link_source_order,
                 )
             )
-        if set(evidence_link_ids_in_order) != set(candidate.evidence_link_ids):
+        if tuple(evidence_link_ids_in_order) != candidate.evidence_link_ids:
             raise DocumentRevisionFactDiffInvariantError(
                 "document_revision_fact_diff_evidence_link_set_mismatch"
             )
@@ -628,7 +719,7 @@ def _build_fact_side_snapshots(
                 "value_type": certified_value.value_type,
                 "value_json": certified_value.value_json,
                 "referenced_entity_id": certified_value.referenced_entity_id,
-                "fact_value_ids": [],
+                "values": [],
                 "evidences": [],
             }
             groups_for_fact[semantic_key_hash] = group_entry
@@ -641,14 +732,49 @@ def _build_fact_side_snapshots(
                 "document_revision_fact_diff_semantic_group_mismatch"
             )
 
-        group_entry["fact_value_ids"].append(fact_value_id)
+        ordered_value_evidences = tuple(
+            item.snapshot
+            for item in sorted(
+                evidence_envelopes,
+                key=lambda item: (
+                    item.block_source_order,
+                    item.evidence_link_source_order,
+                    str(item.snapshot.evidence_link_id),
+                ),
+            )
+        )
+        group_entry["values"].append(
+            _AuthenticatedValueEnvelope(
+                snapshot=AuthenticatedFactSourceValue(
+                    fact_value_id=fact_value_id,
+                    source_batch_id=stable_row.source_batch_id,
+                    source_application_id=application_snapshot.application_id,
+                    proposal_index=authoritative_item.proposal_index,
+                    normalized_value_text=certified_value.normalized_value_text,
+                    value_hash=certified_value.value_hash,
+                    language_code=stable_row.language_code,
+                    confidence=stable_row.confidence,
+                    evidences=ordered_value_evidences,
+                ),
+                application_order=application_order,
+                proposal_index=authoritative_item.proposal_index,
+            )
+        )
         group_entry["evidences"].extend(evidence_envelopes)
 
-    fact_side_snapshots: dict[uuid.UUID, _FactSideSnapshot] = {}
+    fact_side_snapshots: dict[uuid.UUID, AuthenticatedFactSourceFact] = {}
     for fact_id, groups in value_group_items_by_fact_id.items():
-        value_group_envelopes: list[_ValueGroupEnvelope] = []
+        value_groups: list[AuthenticatedFactSourceValueGroup] = []
         for semantic_key_hash in sorted(groups):
             group_entry = groups[semantic_key_hash]
+            value_items = sorted(
+                group_entry["values"],
+                key=lambda item: (
+                    item.application_order,
+                    item.proposal_index,
+                    str(item.snapshot.fact_value_id),
+                ),
+            )
             evidence_items = sorted(
                 group_entry["evidences"],
                 key=lambda item: (
@@ -668,29 +794,86 @@ def _build_fact_side_snapshots(
                         "document_revision_fact_diff_evidence_duplicate"
                     )
                 seen_link_ids.add(evidence_item.snapshot.evidence_link_id)
-            value_group_envelopes.append(
-                _ValueGroupEnvelope(
-                    snapshot=DocumentRevisionFactDiffValueGroup(
-                        semantic_key_hash=semantic_key_hash,
-                        value_type=group_entry["value_type"],
-                        value_json=group_entry["value_json"],
-                        referenced_entity_id=group_entry["referenced_entity_id"],
-                        fact_value_ids=tuple(
-                            sorted(group_entry["fact_value_ids"], key=str)
-                        ),
-                        evidences=tuple(item.snapshot for item in evidence_items),
-                    ),
+            value_groups.append(
+                AuthenticatedFactSourceValueGroup(
+                    semantic_key_hash=semantic_key_hash,
+                    value_type=group_entry["value_type"],
+                    value_json=group_entry["value_json"],
+                    referenced_entity_id=group_entry["referenced_entity_id"],
+                    fact_value_ids=tuple(item.snapshot.fact_value_id for item in value_items),
+                    values=tuple(item.snapshot for item in value_items),
+                    evidences=tuple(item.snapshot for item in evidence_items),
                     earliest_block_source_order=evidence_items[0].block_source_order,
                 )
             )
         earliest_block_source_order = min(
-            group.earliest_block_source_order for group in value_group_envelopes
+            group.earliest_block_source_order for group in value_groups
         )
-        fact_side_snapshots[fact_id] = _FactSideSnapshot(
+        fact_side_snapshots[fact_id] = AuthenticatedFactSourceFact(
             fact=fact_snapshot_by_id[fact_id],
-            value_groups=tuple(value_group_envelopes),
+            value_groups=tuple(value_groups),
             semantic_key_hashes=frozenset(groups),
             earliest_block_source_order=earliest_block_source_order,
+        )
+    return fact_side_snapshots
+
+
+def _build_fact_side_snapshots(
+    *,
+    rows: Sequence[DocumentRevisionFactDiffSourceRow],
+    source_snapshot: duplicate_grouping_service.AuthenticatedDuplicateGroupingSourceSnapshot,
+    block_change_by_block_id: dict[uuid.UUID, str],
+    expected_run_id: uuid.UUID,
+) -> dict[uuid.UUID, _FactSideSnapshot]:
+    authenticated_facts = build_authenticated_fact_source_facts(
+        rows=rows,
+        source_snapshot=source_snapshot,
+        expected_run_id=expected_run_id,
+    )
+    fact_side_snapshots: dict[uuid.UUID, _FactSideSnapshot] = {}
+    for fact_id, authenticated_fact in authenticated_facts.items():
+        value_group_envelopes: list[_ValueGroupEnvelope] = []
+        for value_group in authenticated_fact.value_groups:
+            diff_evidences: list[_EvidenceSnapshotEnvelope] = []
+            for evidence in value_group.evidences:
+                block_change_kind = block_change_by_block_id.get(evidence.document_block_id)
+                if block_change_kind is None:
+                    raise DocumentRevisionFactDiffInvariantError(
+                        "document_revision_fact_diff_block_mapping_missing"
+                    )
+                diff_evidences.append(
+                    _EvidenceSnapshotEnvelope(
+                        snapshot=DocumentRevisionFactDiffEvidenceSnapshot(
+                            evidence_link_id=evidence.evidence_link_id,
+                            evidence_id=evidence.evidence_id,
+                            document_block_id=evidence.document_block_id,
+                            locator=evidence.locator,
+                            excerpt=evidence.excerpt,
+                            excerpt_hash=evidence.excerpt_hash,
+                            block_change_kind=block_change_kind,
+                        ),
+                        block_source_order=evidence.block_source_order,
+                        evidence_link_source_order=evidence.source_order,
+                    )
+                )
+            value_group_envelopes.append(
+                _ValueGroupEnvelope(
+                    snapshot=DocumentRevisionFactDiffValueGroup(
+                        semantic_key_hash=value_group.semantic_key_hash,
+                        value_type=value_group.value_type,
+                        value_json=value_group.value_json,
+                        referenced_entity_id=value_group.referenced_entity_id,
+                        fact_value_ids=tuple(sorted(value_group.fact_value_ids, key=str)),
+                        evidences=tuple(item.snapshot for item in diff_evidences),
+                    ),
+                    earliest_block_source_order=value_group.earliest_block_source_order,
+                )
+            )
+        fact_side_snapshots[fact_id] = _FactSideSnapshot(
+            fact=authenticated_fact.fact,
+            value_groups=tuple(value_group_envelopes),
+            semantic_key_hashes=authenticated_fact.semantic_key_hashes,
+            earliest_block_source_order=authenticated_fact.earliest_block_source_order,
         )
     return fact_side_snapshots
 

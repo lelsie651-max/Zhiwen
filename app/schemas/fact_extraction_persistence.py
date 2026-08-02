@@ -163,3 +163,4 @@ class AuthenticatedCompletedFactExtractionApplicationSnapshot:
     entity_resolution_policy_name: str
     entity_resolution_policy_version: str
     items: tuple[AuthenticatedPersistedFactProposalItem, ...]
+    result_hash: str | None = None
