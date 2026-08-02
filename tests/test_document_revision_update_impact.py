@@ -461,6 +461,15 @@ def _call(service_session_factory: SessionFactory, fixture: dict[str, object]):
     )
 
 
+def _resign_impact(
+    impact: impact_service.DocumentRevisionUpdateImpact,
+) -> impact_service.DocumentRevisionUpdateImpact:
+    return replace(
+        impact,
+        impact_manifest_hash=impact_service._build_manifest_hash(impact=impact),
+    )
+
+
 def test_get_document_revision_update_impact_maps_six_kinds_and_preserves_fact_diff_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -564,17 +573,23 @@ def test_get_document_revision_update_impact_marks_unchanged_unresolved_contexts
                 review_status=review_status,
                 resolution_status=resolution_status,
                 resolution_basis="none",
-                current_decision_id=None,
-                current_decision_kind=None,
+                current_decision_id=(
+                    None
+                    if review_status != "deferred"
+                    else _uuid("decision-deferred-unresolved")
+                ),
+                current_decision_kind=(
+                    None if review_status != "deferred" else "defer"
+                ),
                 effective_fact_value_ids=(),
-                    candidate_members=(
-                        _candidate_member(_uuid("base-fv-unresolved")),
-                    ),
+                candidate_members=(
+                    _candidate_member(_uuid("base-fv-unresolved")),
+                ),
             ),
         ),
         fact_count=1,
         resolved_count=0,
-            pending_count=0 if review_status == "deferred" else 1,
+        pending_count=0 if review_status == "deferred" else 1,
         deferred_count=1 if review_status == "deferred" else 0,
     )
     _install_dependencies(
@@ -1032,8 +1047,8 @@ def test_get_document_revision_update_impact_hash_changes_when_source_manifest_o
                 review_status="deferred",
                 resolution_status="deferred",
                 resolution_basis="none",
-                current_decision_id=None,
-                current_decision_kind=None,
+                current_decision_id=_uuid("decision-deferred-hash"),
+                current_decision_kind="defer",
                 effective_fact_value_ids=(),
                 candidate_members=(
                     _candidate_member(_uuid("base-fv-unresolved")),
@@ -1209,6 +1224,262 @@ def test_authenticate_document_revision_update_impact_projection_rejects_item_sh
             ),
             impact_manifest_hash="0" * 64,
         )
+
+    with pytest.raises(
+        impact_service.DocumentRevisionUpdateImpactInvariantError,
+        match=expected_code,
+    ):
+        impact_service.authenticate_document_revision_update_impact_projection(impact)
+
+
+@pytest.mark.parametrize(
+    ("review_status", "resolution_status", "resolution_basis", "decision_kind", "effective_ids"),
+    [
+        ("reviewed", "resolved", "human_selection", "select_one", (_uuid("base-fv-resolved"),)),
+        ("pending_review", "pending_review", "none", None, ()),
+        ("deferred", "deferred", "none", "defer", ()),
+        ("not_required", "unreviewed_compatible", "none", None, ()),
+    ],
+)
+def test_authenticate_document_revision_update_impact_projection_accepts_valid_base_review_context_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    review_status: str,
+    resolution_status: str,
+    resolution_basis: str,
+    decision_kind: str | None,
+    effective_ids: tuple[uuid.UUID, ...],
+) -> None:
+    fixture = _fixture()
+    _install_dependencies(
+        monkeypatch,
+        fact_diff=fixture["fact_diff"],
+        authenticated_context=fixture["authenticated_context"],
+        effective_projection=fixture["effective_projection"],
+    )
+    impact = _call(SessionFactory(), fixture)
+    target_index = 0 if resolution_status == "resolved" else 2
+    decision_id = None if decision_kind is None else _uuid(f"decision-{resolution_status}")
+    impact = replace(
+        impact,
+        items=(
+            *impact.items[:target_index],
+            replace(
+                impact.items[target_index],
+                base_review_status=review_status,
+                base_resolution_status=resolution_status,
+                base_resolution_basis=resolution_basis,
+                base_current_decision_id=decision_id,
+                base_current_decision_kind=decision_kind,
+                base_effective_fact_value_ids=effective_ids,
+            ),
+            *impact.items[target_index + 1 :],
+        ),
+    )
+    impact = _resign_impact(impact)
+
+    assert (
+        impact_service.authenticate_document_revision_update_impact_projection(impact)
+        == impact
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        (
+            "pending_as_resolved",
+            "document_revision_update_impact_base_review_context_invalid",
+        ),
+        (
+            "resolved_as_unresolved",
+            "document_revision_update_impact_base_review_context_invalid",
+        ),
+        (
+            "no_review_context_with_assessment",
+            "document_revision_update_impact_base_review_context_invalid",
+        ),
+        (
+            "decision_basis_mismatch",
+            "document_revision_update_impact_base_review_context_invalid",
+        ),
+        (
+            "effective_duplicate",
+            "document_revision_update_impact_base_effective_fact_value_invalid",
+        ),
+        (
+            "effective_unknown",
+            "document_revision_update_impact_base_effective_fact_value_invalid",
+        ),
+        (
+            "effective_not_in_group",
+            "document_revision_update_impact_base_effective_fact_value_invalid",
+        ),
+        (
+            "added_with_base_context",
+            "document_revision_update_impact_base_review_context_invalid",
+        ),
+        (
+            "base_none_with_groups",
+            "document_revision_update_impact_fact_shape_invalid",
+        ),
+        (
+            "target_none_with_groups",
+            "document_revision_update_impact_fact_shape_invalid",
+        ),
+    ],
+)
+def test_authenticate_document_revision_update_impact_projection_rejects_semantic_context_drift_even_with_resigned_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    fixture = _fixture()
+    _install_dependencies(
+        monkeypatch,
+        fact_diff=fixture["fact_diff"],
+        authenticated_context=fixture["authenticated_context"],
+        effective_projection=fixture["effective_projection"],
+    )
+    impact = _call(SessionFactory(), fixture)
+
+    if mutation == "pending_as_resolved":
+        impact = replace(
+            impact,
+            items=(
+                *impact.items[:2],
+                replace(
+                    impact.items[2],
+                    impact_kind="unchanged_resolved",
+                    requires_review=False,
+                ),
+                *impact.items[3:],
+            ),
+            review_required_count=3,
+            unchanged_resolved_count=2,
+            unchanged_unresolved_count=0,
+        )
+    elif mutation == "resolved_as_unresolved":
+        impact = replace(
+            impact,
+            items=(
+                replace(
+                    impact.items[0],
+                    impact_kind="unchanged_unresolved",
+                    requires_review=True,
+                ),
+                *impact.items[1:],
+            ),
+            review_required_count=5,
+            unchanged_resolved_count=0,
+            unchanged_unresolved_count=2,
+        )
+    elif mutation == "no_review_context_with_assessment":
+        impact = replace(
+            impact,
+            items=(
+                impact.items[0],
+                replace(
+                    impact.items[1],
+                    base_assessment_id=_uuid("fake-assessment"),
+                ),
+                *impact.items[2:],
+            ),
+        )
+    elif mutation == "decision_basis_mismatch":
+        impact = replace(
+            impact,
+            items=(
+                replace(
+                    impact.items[0],
+                    base_resolution_basis="human_confirmed_compatibility",
+                    base_current_decision_kind="select_one",
+                ),
+                *impact.items[1:],
+            ),
+        )
+    elif mutation == "effective_duplicate":
+        impact = replace(
+            impact,
+            items=(
+                replace(
+                    impact.items[0],
+                    base_effective_fact_value_ids=(
+                        _uuid("base-fv-resolved"),
+                        _uuid("base-fv-resolved"),
+                    ),
+                ),
+                *impact.items[1:],
+            ),
+        )
+    elif mutation == "effective_unknown":
+        impact = replace(
+            impact,
+            items=(
+                replace(
+                    impact.items[0],
+                    base_effective_fact_value_ids=(_uuid("unknown-effective"),),
+                ),
+                *impact.items[1:],
+            ),
+        )
+    elif mutation == "effective_not_in_group":
+        impact = replace(
+            impact,
+            items=(
+                replace(
+                    impact.items[0],
+                    base_value_groups=(
+                        impact.items[0].base_value_groups[0],
+                        _value_group("other", "base-fv-other"),
+                    ),
+                    base_effective_fact_value_ids=(_uuid("base-fv-missing"),),
+                ),
+                *impact.items[1:],
+            ),
+        )
+    elif mutation == "added_with_base_context":
+        impact = replace(
+            impact,
+            items=(
+                *impact.items[:4],
+                replace(
+                    impact.items[4],
+                    base_assessment_id=_uuid("added-context"),
+                    base_review_status="reviewed",
+                    base_resolution_status="resolved",
+                    base_resolution_basis="human_selection",
+                    base_current_decision_id=_uuid("added-decision"),
+                    base_current_decision_kind="select_one",
+                    base_effective_fact_value_ids=(_uuid("target-fv-added"),),
+                ),
+                impact.items[5],
+            ),
+        )
+    elif mutation == "base_none_with_groups":
+        impact = replace(
+            impact,
+            items=(
+                *impact.items[:4],
+                replace(
+                    impact.items[4],
+                    base_value_groups=(_value_group("unexpected-base", "fake-base-fv"),),
+                ),
+                impact.items[5],
+            ),
+        )
+    else:
+        impact = replace(
+            impact,
+            items=(
+                *impact.items[:5],
+                replace(
+                    impact.items[5],
+                    target_value_groups=(_value_group("unexpected-target", "fake-target-fv"),),
+                ),
+            ),
+        )
+
+    impact = _resign_impact(impact)
 
     with pytest.raises(
         impact_service.DocumentRevisionUpdateImpactInvariantError,

@@ -223,6 +223,133 @@ def _build_manifest_hash(
     )
 
 
+def _collect_fact_value_ids(
+    value_groups: tuple[DocumentRevisionFactDiffValueGroup, ...],
+) -> set[uuid.UUID]:
+    fact_value_ids: set[uuid.UUID] = set()
+    for value_group in value_groups:
+        for fact_value_id in value_group.fact_value_ids:
+            if fact_value_id in fact_value_ids:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_base_fact_value_duplicate"
+                )
+            fact_value_ids.add(fact_value_id)
+    return fact_value_ids
+
+
+def _is_no_base_review_context(item: DocumentRevisionUpdateImpactItem) -> bool:
+    return (
+        item.base_assessment_id is None
+        and item.base_review_status is None
+        and item.base_resolution_status is None
+        and item.base_resolution_basis is None
+        and item.base_current_decision_id is None
+        and item.base_current_decision_kind is None
+        and item.base_effective_fact_value_ids == ()
+    )
+
+
+def _validate_base_review_context(
+    item: DocumentRevisionUpdateImpactItem,
+    *,
+    base_fact_value_ids: set[uuid.UUID],
+) -> bool:
+    if _is_no_base_review_context(item):
+        return False
+    if not isinstance(item.base_assessment_id, uuid.UUID):
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_base_review_context_invalid"
+        )
+    resolution_status = item.base_resolution_status
+    review_status = item.base_review_status
+    resolution_basis = item.base_resolution_basis
+    decision_id = item.base_current_decision_id
+    decision_kind = item.base_current_decision_kind
+    effective_fact_value_ids = item.base_effective_fact_value_ids
+
+    effective_ids_seen: set[uuid.UUID] = set()
+    for fact_value_id in effective_fact_value_ids:
+        if fact_value_id in effective_ids_seen:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_effective_fact_value_invalid"
+            )
+        effective_ids_seen.add(fact_value_id)
+        if fact_value_id not in base_fact_value_ids:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_effective_fact_value_invalid"
+            )
+
+    if resolution_status == "resolved":
+        if review_status != "reviewed":
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        if resolution_basis not in {
+            "human_selection",
+            "human_confirmed_compatibility",
+        }:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        if not isinstance(decision_id, uuid.UUID):
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        if resolution_basis == "human_selection":
+            if decision_kind not in {"select_one", "keep_multiple"}:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_base_review_context_invalid"
+                )
+        elif decision_kind != "confirm_compatible":
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        if not effective_fact_value_ids:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        return True
+    if resolution_status == "deferred":
+        if (
+            review_status != "deferred"
+            or resolution_basis != "none"
+            or not isinstance(decision_id, uuid.UUID)
+            or decision_kind != "defer"
+            or effective_fact_value_ids != ()
+        ):
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        return True
+    if resolution_status == "pending_review":
+        if (
+            review_status != "pending_review"
+            or resolution_basis != "none"
+            or decision_id is not None
+            or decision_kind is not None
+            or effective_fact_value_ids != ()
+        ):
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        return True
+    if resolution_status == "unreviewed_compatible":
+        if (
+            review_status != "not_required"
+            or resolution_basis != "none"
+            or decision_id is not None
+            or decision_kind is not None
+            or effective_fact_value_ids != ()
+        ):
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
+            )
+        return True
+    raise DocumentRevisionUpdateImpactInvariantError(
+        "document_revision_update_impact_base_review_context_invalid"
+    )
+
+
 def authenticate_document_revision_update_impact_projection(
     impact: DocumentRevisionUpdateImpact,
 ) -> DocumentRevisionUpdateImpact:
@@ -326,6 +453,53 @@ def authenticate_document_revision_update_impact_projection(
         if item.target_fact is not None and item.target_fact.fact_id != item.fact_id:
             raise DocumentRevisionUpdateImpactInvariantError(
                 "document_revision_update_impact_fact_shape_invalid"
+            )
+        if item.base_fact is None:
+            if item.base_value_groups != ():
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_fact_shape_invalid"
+                )
+            if not _is_no_base_review_context(item):
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_base_review_context_invalid"
+                )
+            has_base_review_context = False
+            base_fact_value_ids: set[uuid.UUID] = set()
+        else:
+            base_fact_value_ids = _collect_fact_value_ids(item.base_value_groups)
+            has_base_review_context = _validate_base_review_context(
+                item,
+                base_fact_value_ids=base_fact_value_ids,
+            )
+        if item.target_fact is None and item.target_value_groups != ():
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_fact_shape_invalid"
+            )
+        if item.impact_kind == "unchanged_no_review_context":
+            if has_base_review_context:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_base_review_context_invalid"
+                )
+        elif item.impact_kind == "unchanged_resolved":
+            if (
+                not has_base_review_context
+                or item.base_resolution_status != "resolved"
+            ):
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_base_review_context_invalid"
+                )
+        elif item.impact_kind == "unchanged_unresolved":
+            if (
+                not has_base_review_context
+                or item.base_resolution_status
+                not in {"pending_review", "deferred", "unreviewed_compatible"}
+            ):
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_base_review_context_invalid"
+                )
+        elif item.impact_kind == "added" and has_base_review_context:
+            raise DocumentRevisionUpdateImpactInvariantError(
+                "document_revision_update_impact_base_review_context_invalid"
             )
         review_required_count += 1 if item.requires_review else 0
         counts[item.impact_kind] += 1

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import uuid
 
 import pytest
 
 from app.schemas.consistency_check import ConsistencyCheckPlannerConfig
 from app.schemas.consistency_pipeline import FactExtractionConsistencyPipelineResult
-from app.schemas.document_revision_update_impact import DocumentRevisionUpdateImpact
+from app.schemas.document_revision_fact_diff import (
+    DocumentRevisionFactDiffFactSnapshot,
+    DocumentRevisionFactDiffValueGroup,
+)
+from app.schemas.document_revision_update_impact import (
+    DocumentRevisionUpdateImpact,
+    DocumentRevisionUpdateImpactItem,
+)
 from app.schemas.document_revision_update_workflow import (
     DocumentRevisionUpdateWorkflowResult,
 )
@@ -205,6 +213,30 @@ def _install_impact_auth(
         workflow_service.impact_service,
         "authenticate_document_revision_update_impact_projection",
         fake_authenticate,
+    )
+
+
+def _fact_snapshot(seed: str) -> DocumentRevisionFactDiffFactSnapshot:
+    fact_id = uuid.uuid5(uuid.NAMESPACE_URL, f"fact-{seed}")
+    return DocumentRevisionFactDiffFactSnapshot(
+        fact_id=fact_id,
+        identity_hash="a" * 64,
+        subject_kind="subject",
+        subject_key=f"subject-{seed}",
+        predicate_key=f"predicate-{seed}",
+        scope_key=None,
+        subject_entity_id=None,
+    )
+
+
+def _value_group(seed: str, *fact_value_ids: uuid.UUID) -> DocumentRevisionFactDiffValueGroup:
+    return DocumentRevisionFactDiffValueGroup(
+        semantic_key_hash="b" * 64,
+        value_type="string",
+        value_json=f"value-{seed}",
+        referenced_entity_id=None,
+        fact_value_ids=fact_value_ids,
+        evidences=(),
     )
 
 
@@ -792,6 +824,116 @@ def test_run_document_revision_update_workflow_rejects_impact_shape_or_identity_
         _install_impact_auth(monkeypatch)
 
     with pytest.raises(expected_exception, match=expected_code):
+        run_async(
+            workflow_service.run_document_revision_update_workflow(
+                ForbiddenSessionFactory(),
+                **kwargs,
+            )
+        )
+
+
+def test_run_document_revision_update_workflow_rejects_resigned_semantically_invalid_impact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _workflow_kwargs()
+    target_orchestration_id = uuid.uuid4()
+    base_fact = _fact_snapshot("workflow-base")
+    target_fact = _fact_snapshot("workflow-base")
+    base_fact_value_id = uuid.uuid4()
+    invalid_impact = DocumentRevisionUpdateImpact(
+        project_id=kwargs["project_id"],
+        document_id=kwargs["document_id"],
+        base_revision_id=kwargs["base_revision_id"],
+        target_revision_id=kwargs["target_revision_id"],
+        base_extraction_run_id=kwargs["base_extraction_run_id"],
+        target_extraction_run_id=kwargs["target_extraction_run_id"],
+        base_orchestration_id=kwargs["base_orchestration_id"],
+        target_orchestration_id=target_orchestration_id,
+        base_consistency_check_application_id=kwargs["base_consistency_check_application_id"],
+        base_source_consistency_application_id=uuid.uuid4(),
+        comparison_quality="complete",
+        block_diff_manifest_hash="a" * 64,
+        fact_diff_manifest_hash="b" * 64,
+        base_consistency_result_manifest_hash="c" * 64,
+        impact_algorithm_name="document_revision_update_impact",
+        impact_algorithm_version="1.0.0",
+        fact_count=1,
+        review_required_count=0,
+        unchanged_resolved_count=1,
+        unchanged_no_review_context_count=0,
+        unchanged_unresolved_count=0,
+        modified_count=0,
+        added_count=0,
+        removed_count=0,
+        items=(
+            DocumentRevisionUpdateImpactItem(
+                fact_id=base_fact.fact_id,
+                fact_change_kind="unchanged",
+                impact_kind="unchanged_resolved",
+                requires_review=False,
+                base_assessment_id=uuid.uuid4(),
+                base_review_status="pending_review",
+                base_resolution_status="pending_review",
+                base_resolution_basis="none",
+                base_current_decision_id=None,
+                base_current_decision_kind=None,
+                base_effective_fact_value_ids=(),
+                base_fact=base_fact,
+                base_value_groups=(
+                    _value_group("workflow-base", base_fact_value_id),
+                ),
+                target_fact=target_fact,
+                target_value_groups=(),
+            ),
+        ),
+        impact_manifest_hash="",
+    )
+    invalid_impact = replace(
+        invalid_impact,
+        impact_manifest_hash=workflow_service.impact_service._build_manifest_hash(
+            impact=invalid_impact
+        ),
+    )
+
+    async def fake_pipeline(_session_factory, **_kwargs):
+        return _pipeline_result(
+            orchestration_id=target_orchestration_id,
+            extraction_status=FactExtractionOrchestrationStatus.COMPLETED,
+            grouping_application_id=uuid.uuid4(),
+            consistency_application_id=uuid.uuid4(),
+            consistency_check_application_id=uuid.uuid4(),
+            consistency_plan_manifest_hash="1" * 64,
+            consistency_execution_result_manifest_hash="2" * 64,
+            assessment_count=1,
+            consistency_created_new=False,
+            skipped_reason=None,
+        )
+
+    async def fake_impact(_session_factory, **_kwargs):
+        return invalid_impact
+
+    monkeypatch.setattr(
+        workflow_service.pipeline_service,
+        "run_fact_extraction_consistency_pipeline",
+        fake_pipeline,
+    )
+    _install_terminal_auth(
+        monkeypatch,
+        terminal_result=_terminal_result(
+            orchestration_id=target_orchestration_id,
+            status=FactExtractionOrchestrationStatus.COMPLETED,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow_service.impact_service,
+        "get_document_revision_update_impact",
+        fake_impact,
+    )
+
+    with pytest.raises(
+        workflow_service.impact_service.DocumentRevisionUpdateImpactInvariantError,
+        match="document_revision_update_impact_base_review_context_invalid",
+    ):
         run_async(
             workflow_service.run_document_revision_update_workflow(
                 ForbiddenSessionFactory(),
