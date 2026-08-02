@@ -161,6 +161,38 @@ from app.services.processing_job import (
 )
 from app.services.processing_job_executor import execute_revision_extraction_job
 from app.services.processing_job_dispatch import dispatch_revision_extraction_job
+
+
+def __getattr__(name: str):
+    if name in {
+        "DynamicSchemaReviewProjectionError",
+        "DynamicSchemaReviewProjectionStateError",
+        "DynamicSchemaReviewProjectionInvariantError",
+        "project_reviewed_orchestration_ufl_to_dynamic_schema",
+    }:
+        from app.services.dynamic_schema_review_projection import (
+            DynamicSchemaReviewProjectionError,
+            DynamicSchemaReviewProjectionInvariantError,
+            DynamicSchemaReviewProjectionStateError,
+            project_reviewed_orchestration_ufl_to_dynamic_schema,
+        )
+
+        exported = {
+            "DynamicSchemaReviewProjectionError": DynamicSchemaReviewProjectionError,
+            "DynamicSchemaReviewProjectionStateError": (
+                DynamicSchemaReviewProjectionStateError
+            ),
+            "DynamicSchemaReviewProjectionInvariantError": (
+                DynamicSchemaReviewProjectionInvariantError
+            ),
+            "project_reviewed_orchestration_ufl_to_dynamic_schema": (
+                project_reviewed_orchestration_ufl_to_dynamic_schema
+            ),
+        }
+        return exported[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "ExtractionPersistenceError",
     "ExtractionRevisionNotFoundError",
@@ -180,6 +212,9 @@ __all__ = [
     "DynamicSchemaUFLProjectionError",
     "DynamicSchemaUFLProjectionStateError",
     "DynamicSchemaUFLProjectionInvariantError",
+    "DynamicSchemaReviewProjectionError",
+    "DynamicSchemaReviewProjectionStateError",
+    "DynamicSchemaReviewProjectionInvariantError",
     "DynamicSchemaPermissionError",
     "DynamicSchemaProjectNotFoundError",
     "DynamicSchemaIdentityMismatchError",
@@ -206,6 +241,7 @@ __all__ = [
     "project_dynamic_schema_version",
     "project_current_dynamic_schema",
     "project_orchestration_ufl_to_dynamic_schema",
+    "project_reviewed_orchestration_ufl_to_dynamic_schema",
     "create_human_schema_draft",
     "propose_ai_schema_version",
     "FactProposalError",

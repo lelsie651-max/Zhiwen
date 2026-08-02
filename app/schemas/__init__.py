@@ -27,6 +27,12 @@ from app.schemas.dynamic_schema_ufl_projection import (
     DynamicSchemaUFLProjectedRecord,
     DynamicSchemaUFLProjection,
 )
+from app.schemas.dynamic_schema_review_projection import (
+    DynamicSchemaReviewProjection,
+    DynamicSchemaReviewedFact,
+    DynamicSchemaReviewedField,
+    DynamicSchemaReviewedRecord,
+)
 from app.schemas.document import DocumentCreate, DocumentRead
 from app.schemas.document_content import (
     DocumentBlockRead,
@@ -168,6 +174,10 @@ __all__ = [
     "DynamicSchemaUFLProjectedField",
     "DynamicSchemaUFLProjectedRecord",
     "DynamicSchemaUFLProjection",
+    "DynamicSchemaReviewedFact",
+    "DynamicSchemaReviewedField",
+    "DynamicSchemaReviewedRecord",
+    "DynamicSchemaReviewProjection",
     "DocumentCreate",
     "DocumentRead",
     "ExtractionRunRead",
