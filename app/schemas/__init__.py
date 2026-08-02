@@ -146,6 +146,10 @@ from app.schemas.ingestion_validation import (
 )
 from app.schemas.project import ProjectCreate, ProjectRead
 from app.schemas.project_member import ProjectMemberCreate, ProjectMemberRead
+from app.schemas.project_version import (
+    ProjectVersionCreateResult,
+    ProjectVersionSnapshot,
+)
 from app.schemas.processing_job import ProcessingJobRead
 from app.schemas.processing_job_executor import (
     ProcessingJobExecutionResult,
@@ -272,6 +276,8 @@ __all__ = [
     "ProjectRead",
     "ProjectMemberCreate",
     "ProjectMemberRead",
+    "ProjectVersionSnapshot",
+    "ProjectVersionCreateResult",
     "RevisionAdmissionResult",
     "RevisionAdmissionDecisionInput",
     "RevisionExtractionResult",

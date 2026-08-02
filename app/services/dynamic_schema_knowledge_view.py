@@ -223,6 +223,42 @@ def _serialize_record(record: DynamicSchemaKnowledgeRecord) -> dict[str, object]
     }
 
 
+def _serialize_view(
+    view: DynamicSchemaKnowledgeView,
+) -> dict[str, object]:
+    return {
+        "project_id": str(view.project_id),
+        "schema_id": str(view.schema_id),
+        "schema_version_id": str(view.schema_version_id),
+        "orchestration_id": str(view.orchestration_id),
+        "extraction_run_id": str(view.extraction_run_id),
+        "consistency_check_application_id": str(
+            view.consistency_check_application_id
+        ),
+        "source_consistency_application_id": str(
+            view.source_consistency_application_id
+        ),
+        "schema_definition_manifest_hash": view.schema_definition_manifest_hash,
+        "ufl_source_manifest_hash": view.ufl_source_manifest_hash,
+        "consistency_result_manifest_hash": view.consistency_result_manifest_hash,
+        "raw_projection_manifest_hash": view.raw_projection_manifest_hash,
+        "reviewed_projection_manifest_hash": view.reviewed_projection_manifest_hash,
+        "comparison_quality": view.comparison_quality,
+        "algorithm_name": view.algorithm_name,
+        "algorithm_version": view.algorithm_version,
+        "record_count": view.record_count,
+        "section_count": view.section_count,
+        "field_count": view.field_count,
+        "missing_field_count": view.missing_field_count,
+        "review_required_field_count": view.review_required_field_count,
+        "resolved_field_count": view.resolved_field_count,
+        "observation_only_field_count": view.observation_only_field_count,
+        "mixed_field_count": view.mixed_field_count,
+        "records": [_serialize_record(record) for record in view.records],
+        "knowledge_view_manifest_hash": view.knowledge_view_manifest_hash,
+    }
+
+
 def _build_manifest_hash(
     *,
     view: DynamicSchemaKnowledgeView,
@@ -265,6 +301,18 @@ def _build_manifest_hash(
             "records": [_serialize_record(record) for record in view.records],
         }
     )
+
+
+def serialize_dynamic_schema_knowledge_view(
+    view: DynamicSchemaKnowledgeView,
+    *,
+    subject_keys: object,
+) -> dict[str, object]:
+    authenticated_view = authenticate_dynamic_schema_knowledge_view(
+        view,
+        subject_keys=subject_keys,
+    )
+    return _serialize_view(authenticated_view)
 
 
 def authenticate_dynamic_schema_knowledge_view(

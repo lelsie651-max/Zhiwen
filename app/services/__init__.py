@@ -187,6 +187,13 @@ def __getattr__(name: str):
         "DynamicSchemaKnowledgeViewInvariantError",
         "authenticate_dynamic_schema_knowledge_view",
         "build_dynamic_schema_knowledge_view",
+        "serialize_dynamic_schema_knowledge_view",
+        "ProjectVersionError",
+        "ProjectVersionStateError",
+        "ProjectVersionInvariantError",
+        "authenticate_project_version_snapshot",
+        "create_project_version",
+        "get_project_version_snapshot",
     }:
         exported = {}
         if name in {
@@ -268,6 +275,7 @@ def __getattr__(name: str):
             "DynamicSchemaKnowledgeViewInvariantError",
             "authenticate_dynamic_schema_knowledge_view",
             "build_dynamic_schema_knowledge_view",
+            "serialize_dynamic_schema_knowledge_view",
         }:
             from app.services.dynamic_schema_knowledge_view import (
                 DynamicSchemaKnowledgeViewError,
@@ -275,6 +283,7 @@ def __getattr__(name: str):
                 DynamicSchemaKnowledgeViewStateError,
                 authenticate_dynamic_schema_knowledge_view,
                 build_dynamic_schema_knowledge_view,
+                serialize_dynamic_schema_knowledge_view,
             )
 
             exported.update(
@@ -294,6 +303,38 @@ def __getattr__(name: str):
                     "build_dynamic_schema_knowledge_view": (
                         build_dynamic_schema_knowledge_view
                     ),
+                    "serialize_dynamic_schema_knowledge_view": (
+                        serialize_dynamic_schema_knowledge_view
+                    ),
+                }
+            )
+        if name in {
+            "ProjectVersionError",
+            "ProjectVersionStateError",
+            "ProjectVersionInvariantError",
+            "authenticate_project_version_snapshot",
+            "create_project_version",
+            "get_project_version_snapshot",
+        }:
+            from app.services.project_version import (
+                ProjectVersionError,
+                ProjectVersionInvariantError,
+                ProjectVersionStateError,
+                authenticate_project_version_snapshot,
+                create_project_version,
+                get_project_version_snapshot,
+            )
+
+            exported.update(
+                {
+                    "ProjectVersionError": ProjectVersionError,
+                    "ProjectVersionStateError": ProjectVersionStateError,
+                    "ProjectVersionInvariantError": ProjectVersionInvariantError,
+                    "authenticate_project_version_snapshot": (
+                        authenticate_project_version_snapshot
+                    ),
+                    "create_project_version": create_project_version,
+                    "get_project_version_snapshot": get_project_version_snapshot,
                 }
             )
         return exported[name]
@@ -368,6 +409,13 @@ __all__ = [
     "project_reviewed_orchestration_ufl_to_dynamic_schema",
     "authenticate_dynamic_schema_knowledge_view",
     "build_dynamic_schema_knowledge_view",
+    "serialize_dynamic_schema_knowledge_view",
+    "ProjectVersionError",
+    "ProjectVersionStateError",
+    "ProjectVersionInvariantError",
+    "authenticate_project_version_snapshot",
+    "create_project_version",
+    "get_project_version_snapshot",
     "create_human_schema_draft",
     "propose_ai_schema_version",
     "FactProposalError",
