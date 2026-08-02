@@ -10,6 +10,7 @@ import pytest
 from app.schemas.consistency_check_persistence import (
     ConsistencyCheckApplicationLedgerRecord,
 )
+from app.schemas.consistency_projection import ConsistencyReviewProjectionMember
 from app.schemas.document_revision_fact_diff import (
     DocumentRevisionFactDiff,
     DocumentRevisionFactDiffFactSnapshot,
@@ -83,6 +84,19 @@ def _value_group(seed: str, *fact_value_seeds: str) -> DocumentRevisionFactDiffV
     )
 
 
+def _candidate_member(fact_value_id: uuid.UUID) -> ConsistencyReviewProjectionMember:
+    return ConsistencyReviewProjectionMember(
+        fact_value_id=fact_value_id,
+        value_type="string",
+        value_json=f"value-{fact_value_id}",
+        normalized_value_text=f"normalized-{fact_value_id}",
+        referenced_entity_id=None,
+        selected_by_current_decision=False,
+        current_selection_order=None,
+        evidences=(),
+    )
+
+
 def _effective_item(
     *,
     fact_id: uuid.UUID,
@@ -93,6 +107,7 @@ def _effective_item(
     effective_fact_value_ids: tuple[uuid.UUID, ...],
     current_decision_seed: str | None = None,
     current_decision_kind: str | None = None,
+    candidate_members: tuple[ConsistencyReviewProjectionMember, ...] = (),
 ) -> EffectiveFactValueProjectionItem:
     return EffectiveFactValueProjectionItem(
         fact_id=fact_id,
@@ -107,7 +122,7 @@ def _effective_item(
         ),
         current_decision_kind=current_decision_kind,
         effective_fact_value_ids=effective_fact_value_ids,
-        candidate_members=(),
+        candidate_members=candidate_members,
     )
 
 
@@ -118,12 +133,13 @@ def _authenticated_context(
     base_orchestration_id: uuid.UUID,
     base_extraction_run_id: uuid.UUID,
     result_manifest_hash: str,
+    source_consistency_application_id: uuid.UUID,
 ) -> AuthenticatedConsistencyCheckLedgerProjectionContext:
     return AuthenticatedConsistencyCheckLedgerProjectionContext(
         application=ConsistencyCheckApplicationLedgerRecord(
             id=consistency_check_application_id,
             project_id=project_id,
-            consistency_application_id=_uuid("source-consistency-app"),
+            consistency_application_id=source_consistency_application_id,
             orchestration_id=_uuid("consistency-orchestration"),
             source_result_manifest_hash="s" * 64,
             plan_manifest_hash="p" * 64,
@@ -144,7 +160,7 @@ def _authenticated_context(
         authenticated_source=AuthenticatedFactValueConsistencyCandidateApplication(
             project_id=project_id,
             application=FactValueConsistencyCandidateApplicationLedger(
-                id=_uuid("fvcc-app"),
+                id=source_consistency_application_id,
                 duplicate_grouping_application_id=_uuid("duplicate-grouping-app"),
                 orchestration_id=base_orchestration_id,
                 extraction_run_id=base_extraction_run_id,
@@ -189,6 +205,7 @@ def _fixture() -> dict[str, object]:
     base_orchestration_id = _uuid("base-orchestration")
     target_orchestration_id = _uuid("target-orchestration")
     base_consistency_check_application_id = _uuid("base-consistency-check-app")
+    source_consistency_application_id = _uuid("fvcc-app")
     result_manifest_hash = "a" * 64
 
     fact_resolved = _fact("resolved")
@@ -282,7 +299,7 @@ def _fixture() -> dict[str, object]:
     effective_projection = EffectiveFactValueProjection(
         project_id=project_id,
         consistency_check_application_id=base_consistency_check_application_id,
-        source_consistency_application_id=_uuid("source-consistency-app"),
+        source_consistency_application_id=source_consistency_application_id,
         result_manifest_hash=result_manifest_hash,
         fact_count=3,
         resolved_count=2,
@@ -295,9 +312,12 @@ def _fixture() -> dict[str, object]:
                 review_status="reviewed",
                 resolution_status="resolved",
                 resolution_basis="human_selection",
-                effective_fact_value_ids=(_uuid("base-effective-resolved"),),
+                effective_fact_value_ids=(_uuid("base-fv-resolved"),),
                 current_decision_seed="resolved",
                 current_decision_kind="select_one",
+                candidate_members=(
+                    _candidate_member(_uuid("base-fv-resolved")),
+                ),
             ),
             _effective_item(
                 fact_id=fact_unresolved.fact_id,
@@ -306,6 +326,9 @@ def _fixture() -> dict[str, object]:
                 resolution_status="pending_review",
                 resolution_basis="none",
                 effective_fact_value_ids=(),
+                candidate_members=(
+                    _candidate_member(_uuid("base-fv-unresolved")),
+                ),
             ),
             _effective_item(
                 fact_id=fact_modified.fact_id,
@@ -313,9 +336,12 @@ def _fixture() -> dict[str, object]:
                 review_status="reviewed",
                 resolution_status="resolved",
                 resolution_basis="human_selection",
-                effective_fact_value_ids=(_uuid("base-effective-modified"),),
+                effective_fact_value_ids=(_uuid("base-fv-modified"),),
                 current_decision_seed="modified",
                 current_decision_kind="select_one",
+                candidate_members=(
+                    _candidate_member(_uuid("base-fv-modified")),
+                ),
             ),
         ),
     )
@@ -325,6 +351,7 @@ def _fixture() -> dict[str, object]:
         base_orchestration_id=base_orchestration_id,
         base_extraction_run_id=base_extraction_run_id,
         result_manifest_hash=result_manifest_hash,
+        source_consistency_application_id=source_consistency_application_id,
     )
     return {
         "project_id": project_id,
@@ -484,12 +511,17 @@ def test_get_document_revision_update_impact_maps_six_kinds_and_preserves_fact_d
     assert first.modified_count == 1
     assert first.added_count == 1
     assert first.removed_count == 1
+    assert first.comparison_quality == "complete"
+    assert (
+        first.base_source_consistency_application_id
+        == fixture["authenticated_context"].application.consistency_application_id
+    )
     resolved_item = first.items[0]
     assert resolved_item.base_assessment_id == _uuid("assessment-resolved")
     assert resolved_item.base_current_decision_kind == "select_one"
-    assert resolved_item.base_effective_fact_value_ids == (_uuid("base-effective-resolved"),)
+    assert resolved_item.base_effective_fact_value_ids == (_uuid("base-fv-resolved"),)
     modified_item = first.items[3]
-    assert modified_item.base_effective_fact_value_ids == (_uuid("base-effective-modified"),)
+    assert modified_item.base_effective_fact_value_ids == (_uuid("base-fv-modified"),)
     assert modified_item.target_value_groups[0].fact_value_ids == (_uuid("target-fv-modified"),)
     removed_item = first.items[5]
     assert removed_item.impact_kind == "removed"
@@ -535,11 +567,14 @@ def test_get_document_revision_update_impact_marks_unchanged_unresolved_contexts
                 current_decision_id=None,
                 current_decision_kind=None,
                 effective_fact_value_ids=(),
+                    candidate_members=(
+                        _candidate_member(_uuid("base-fv-unresolved")),
+                    ),
             ),
         ),
         fact_count=1,
         resolved_count=0,
-        pending_count=1,
+            pending_count=0 if review_status == "deferred" else 1,
         deferred_count=1 if review_status == "deferred" else 0,
     )
     _install_dependencies(
@@ -640,9 +675,18 @@ def test_get_document_revision_update_impact_rejects_duplicate_or_unknown_base_e
                 replace(
                     fixture["effective_projection"].items[1],
                     fact_id=fixture["effective_projection"].items[0].fact_id,
+                    candidate_members=fixture["effective_projection"].items[0].candidate_members,
+                    effective_fact_value_ids=(),
+                    resolution_status="pending_review",
+                    resolution_basis="none",
+                    current_decision_id=None,
+                    current_decision_kind=None,
                 ),
             ),
             fact_count=2,
+            resolved_count=1,
+            pending_count=1,
+            deferred_count=0,
         )
     else:
         fixture["effective_projection"] = replace(
@@ -656,6 +700,290 @@ def test_get_document_revision_update_impact_rejects_duplicate_or_unknown_base_e
             fact_count=1,
             resolved_count=1,
             pending_count=0,
+        )
+    _install_dependencies(
+        monkeypatch,
+        fact_diff=fixture["fact_diff"],
+        authenticated_context=fixture["authenticated_context"],
+        effective_projection=fixture["effective_projection"],
+    )
+
+    with pytest.raises(
+        impact_service.DocumentRevisionUpdateImpactInvariantError,
+        match=expected_code,
+    ):
+        _call(SessionFactory(), fixture)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        (
+            "effective_not_in_base",
+            "document_revision_update_impact_effective_fact_value_source_mismatch",
+        ),
+        (
+            "candidate_not_in_base",
+            "document_revision_update_impact_candidate_member_source_mismatch",
+        ),
+        (
+            "effective_not_in_candidate",
+            "document_revision_update_impact_effective_fact_value_source_mismatch",
+        ),
+        (
+            "base_group_duplicate",
+            "document_revision_update_impact_base_fact_value_duplicate",
+        ),
+        (
+            "candidate_duplicate",
+            "document_revision_update_impact_candidate_member_duplicate",
+        ),
+        (
+            "effective_duplicate",
+            "document_revision_update_impact_effective_fact_value_duplicate",
+        ),
+    ],
+)
+def test_get_document_revision_update_impact_rejects_cross_projection_fact_value_binding_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    fixture = _fixture()
+    if mutation == "effective_not_in_base":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            items=(
+                replace(
+                    fixture["effective_projection"].items[0],
+                    effective_fact_value_ids=(_uuid("other-fv"),),
+                    candidate_members=(_candidate_member(_uuid("base-fv-resolved")),),
+                ),
+            ),
+            fact_count=1,
+            resolved_count=1,
+            pending_count=0,
+            deferred_count=0,
+        )
+        fixture["fact_diff"] = replace(
+            fixture["fact_diff"],
+            items=(fixture["fact_diff"].items[0],),
+            unchanged_count=1,
+            modified_count=0,
+            added_count=0,
+            removed_count=0,
+        )
+    elif mutation == "candidate_not_in_base":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            items=(
+                replace(
+                    fixture["effective_projection"].items[0],
+                    candidate_members=(_candidate_member(_uuid("other-fv")),),
+                    effective_fact_value_ids=(),
+                    resolution_status="pending_review",
+                    resolution_basis="none",
+                    current_decision_id=None,
+                    current_decision_kind=None,
+                ),
+            ),
+            fact_count=1,
+            resolved_count=0,
+            pending_count=1,
+            deferred_count=0,
+        )
+        fixture["fact_diff"] = replace(
+            fixture["fact_diff"],
+            items=(fixture["fact_diff"].items[0],),
+            unchanged_count=1,
+            modified_count=0,
+            added_count=0,
+            removed_count=0,
+        )
+    elif mutation == "effective_not_in_candidate":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            items=(
+                replace(
+                    fixture["effective_projection"].items[0],
+                    effective_fact_value_ids=(_uuid("base-fv-resolved"),),
+                    candidate_members=(_candidate_member(_uuid("base-fv-resolved-alt")),),
+                ),
+            ),
+            fact_count=1,
+            resolved_count=1,
+            pending_count=0,
+            deferred_count=0,
+        )
+        fixture["fact_diff"] = replace(
+            fixture["fact_diff"],
+            items=(
+                replace(
+                    fixture["fact_diff"].items[0],
+                    base_value_groups=(
+                        _value_group(
+                            "base-resolved-expanded",
+                            "base-fv-resolved",
+                            "base-fv-resolved-alt",
+                        ),
+                    ),
+                ),
+            ),
+            unchanged_count=1,
+            modified_count=0,
+            added_count=0,
+            removed_count=0,
+        )
+    elif mutation == "base_group_duplicate":
+        fixture["fact_diff"] = replace(
+            fixture["fact_diff"],
+            items=(
+                replace(
+                    fixture["fact_diff"].items[0],
+                    base_value_groups=(
+                        _value_group(
+                            "dup-a",
+                            "base-fv-resolved",
+                        ),
+                        _value_group(
+                            "dup-b",
+                            "base-fv-resolved",
+                        ),
+                    ),
+                ),
+            ),
+            unchanged_count=1,
+            modified_count=0,
+            added_count=0,
+            removed_count=0,
+        )
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            items=(fixture["effective_projection"].items[0],),
+            fact_count=1,
+            resolved_count=1,
+            pending_count=0,
+            deferred_count=0,
+        )
+    elif mutation == "candidate_duplicate":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            items=(
+                replace(
+                    fixture["effective_projection"].items[0],
+                    candidate_members=(
+                        _candidate_member(_uuid("base-fv-resolved")),
+                        _candidate_member(_uuid("base-fv-resolved")),
+                    ),
+                ),
+            ),
+            fact_count=1,
+            resolved_count=1,
+            pending_count=0,
+            deferred_count=0,
+        )
+        fixture["fact_diff"] = replace(
+            fixture["fact_diff"],
+            items=(fixture["fact_diff"].items[0],),
+            unchanged_count=1,
+            modified_count=0,
+            added_count=0,
+            removed_count=0,
+        )
+    else:
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            items=(
+                replace(
+                    fixture["effective_projection"].items[0],
+                    effective_fact_value_ids=(
+                        _uuid("base-fv-resolved"),
+                        _uuid("base-fv-resolved"),
+                    ),
+                ),
+            ),
+            fact_count=1,
+            resolved_count=1,
+            pending_count=0,
+            deferred_count=0,
+        )
+        fixture["fact_diff"] = replace(
+            fixture["fact_diff"],
+            items=(fixture["fact_diff"].items[0],),
+            unchanged_count=1,
+            modified_count=0,
+            added_count=0,
+            removed_count=0,
+        )
+    _install_dependencies(
+        monkeypatch,
+        fact_diff=fixture["fact_diff"],
+        authenticated_context=fixture["authenticated_context"],
+        effective_projection=fixture["effective_projection"],
+    )
+
+    with pytest.raises(
+        impact_service.DocumentRevisionUpdateImpactInvariantError,
+        match=expected_code,
+    ):
+        _call(SessionFactory(), fixture)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        (
+            "source_mismatch",
+            "document_revision_update_impact_effective_projection_source_mismatch",
+        ),
+        (
+            "fact_count",
+            "document_revision_update_impact_effective_projection_count_mismatch",
+        ),
+        (
+            "resolved_count",
+            "document_revision_update_impact_effective_projection_count_mismatch",
+        ),
+        (
+            "pending_count",
+            "document_revision_update_impact_effective_projection_count_mismatch",
+        ),
+        (
+            "deferred_count",
+            "document_revision_update_impact_effective_projection_count_mismatch",
+        ),
+    ],
+)
+def test_get_document_revision_update_impact_rejects_effective_projection_source_or_count_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    fixture = _fixture()
+    if mutation == "source_mismatch":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            source_consistency_application_id=_uuid("other-source-app"),
+        )
+    elif mutation == "fact_count":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            fact_count=99,
+        )
+    elif mutation == "resolved_count":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            resolved_count=99,
+        )
+    elif mutation == "pending_count":
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            pending_count=99,
+        )
+    else:
+        fixture["effective_projection"] = replace(
+            fixture["effective_projection"],
+            deferred_count=99,
         )
     _install_dependencies(
         monkeypatch,
@@ -703,6 +1031,13 @@ def test_get_document_revision_update_impact_hash_changes_when_source_manifest_o
                 fact_id=mutated["fact_diff"].items[2].base_fact.fact_id,
                 review_status="deferred",
                 resolution_status="deferred",
+                resolution_basis="none",
+                current_decision_id=None,
+                current_decision_kind=None,
+                effective_fact_value_ids=(),
+                candidate_members=(
+                    _candidate_member(_uuid("base-fv-unresolved")),
+                ),
             ),
         ),
         fact_count=1,
@@ -726,6 +1061,21 @@ def test_get_document_revision_update_impact_hash_changes_when_source_manifest_o
     )
     changed_item = _call(SessionFactory(), mutated)
     assert baseline.impact_manifest_hash != changed_item.impact_manifest_hash
+
+    mutated = _fixture()
+    mutated["fact_diff"] = replace(
+        mutated["fact_diff"],
+        comparison_quality="partial",
+    )
+    _install_dependencies(
+        monkeypatch,
+        fact_diff=mutated["fact_diff"],
+        authenticated_context=mutated["authenticated_context"],
+        effective_projection=mutated["effective_projection"],
+    )
+    changed_quality = _call(SessionFactory(), mutated)
+    assert changed_quality.comparison_quality == "partial"
+    assert baseline.impact_manifest_hash != changed_quality.impact_manifest_hash
 
 
 def test_get_document_revision_update_impact_returns_empty_projection_for_zero_fact(
@@ -760,6 +1110,7 @@ def test_get_document_revision_update_impact_returns_empty_projection_for_zero_f
     assert result.items == ()
     assert result.fact_count == 0
     assert result.review_required_count == 0
+    assert result.comparison_quality == "complete"
 
 
 def test_get_document_revision_update_impact_does_not_leak_sensitive_sentinel(

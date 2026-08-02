@@ -7,6 +7,7 @@ from typing import Literal
 from app.schemas.document_revision_fact_diff import (
     DocumentRevisionFactDiffChangeKind,
     DocumentRevisionFactDiffFactSnapshot,
+    DocumentRevisionFactDiffQuality,
     DocumentRevisionFactDiffValueGroup,
 )
 from app.schemas.effective_fact_value import (
@@ -55,6 +56,8 @@ class DocumentRevisionUpdateImpact:
     base_orchestration_id: uuid.UUID
     target_orchestration_id: uuid.UUID
     base_consistency_check_application_id: uuid.UUID
+    base_source_consistency_application_id: uuid.UUID
+    comparison_quality: DocumentRevisionFactDiffQuality
     block_diff_manifest_hash: str
     fact_diff_manifest_hash: str
     base_consistency_result_manifest_hash: str

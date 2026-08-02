@@ -7,6 +7,7 @@ from app.schemas.document_revision_fact_diff import (
     DocumentRevisionFactDiff,
     DocumentRevisionFactDiffFactSnapshot,
     DocumentRevisionFactDiffItem,
+    DocumentRevisionFactDiffQuality,
     DocumentRevisionFactDiffValueGroup,
 )
 from app.schemas.document_revision_update_impact import (
@@ -53,6 +54,29 @@ def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
             f"document_revision_update_impact_{field_name}_invalid"
         )
     return value
+
+
+def _require_comparison_quality(value: object) -> DocumentRevisionFactDiffQuality:
+    if value not in {"complete", "partial"}:
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_comparison_quality_invalid"
+        )
+    return value
+
+
+def _recompute_effective_projection_counts(
+    items: tuple[effective_fact_value_service.EffectiveFactValueProjectionItem, ...],
+) -> tuple[int, int, int, int]:
+    return (
+        len(items),
+        sum(1 for item in items if item.resolution_status == "resolved"),
+        sum(
+            1
+            for item in items
+            if item.resolution_status in {"pending_review", "unreviewed_compatible"}
+        ),
+        sum(1 for item in items if item.resolution_status == "deferred"),
+    )
 
 
 def _serialize_fact_snapshot(
@@ -157,6 +181,10 @@ def _build_manifest_hash(
             "base_consistency_check_application_id": str(
                 impact.base_consistency_check_application_id
             ),
+            "base_source_consistency_application_id": str(
+                impact.base_source_consistency_application_id
+            ),
+            "comparison_quality": impact.comparison_quality,
             "source_manifests": {
                 "block_diff_manifest_hash": impact.block_diff_manifest_hash,
                 "fact_diff_manifest_hash": impact.fact_diff_manifest_hash,
@@ -191,6 +219,7 @@ def _build_effective_context_map(
     effective_projection: effective_fact_value_service.EffectiveFactValueProjection,
     expected_project_id: uuid.UUID,
     expected_application_id: uuid.UUID,
+    expected_source_consistency_application_id: uuid.UUID,
     expected_result_manifest_hash: str,
 ) -> dict[uuid.UUID, _BaseEffectiveContext]:
     if effective_projection.project_id != expected_project_id:
@@ -201,14 +230,49 @@ def _build_effective_context_map(
         raise DocumentRevisionUpdateImpactInvariantError(
             "document_revision_update_impact_effective_projection_source_mismatch"
         )
+    if (
+        effective_projection.source_consistency_application_id
+        != expected_source_consistency_application_id
+    ):
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_effective_projection_source_mismatch"
+        )
     if effective_projection.result_manifest_hash != expected_result_manifest_hash:
         raise DocumentRevisionUpdateImpactInvariantError(
             "document_revision_update_impact_effective_projection_source_mismatch"
+        )
+    (
+        recomputed_fact_count,
+        recomputed_resolved_count,
+        recomputed_pending_count,
+        recomputed_deferred_count,
+    ) = _recompute_effective_projection_counts(effective_projection.items)
+    if (
+        effective_projection.fact_count != recomputed_fact_count
+        or effective_projection.resolved_count != recomputed_resolved_count
+        or effective_projection.pending_count != recomputed_pending_count
+        or effective_projection.deferred_count != recomputed_deferred_count
+    ):
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_effective_projection_count_mismatch"
         )
 
     base_fact_ids = {
         item.base_fact.fact_id for item in fact_diff.items if item.base_fact is not None
     }
+    base_fact_value_ids_by_fact_id: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for diff_item in fact_diff.items:
+        if diff_item.base_fact is None:
+            continue
+        fact_value_ids: set[uuid.UUID] = set()
+        for value_group in diff_item.base_value_groups:
+            for fact_value_id in value_group.fact_value_ids:
+                if fact_value_id in fact_value_ids:
+                    raise DocumentRevisionUpdateImpactInvariantError(
+                        "document_revision_update_impact_base_fact_value_duplicate"
+                    )
+                fact_value_ids.add(fact_value_id)
+        base_fact_value_ids_by_fact_id[diff_item.base_fact.fact_id] = fact_value_ids
     context_by_fact_id: dict[uuid.UUID, _BaseEffectiveContext] = {}
     for item in effective_projection.items:
         if item.fact_id in context_by_fact_id:
@@ -219,6 +283,33 @@ def _build_effective_context_map(
             raise DocumentRevisionUpdateImpactInvariantError(
                 "document_revision_update_impact_effective_context_unknown_fact"
             )
+        base_fact_value_ids = base_fact_value_ids_by_fact_id[item.fact_id]
+        candidate_member_ids: set[uuid.UUID] = set()
+        for member in item.candidate_members:
+            if member.fact_value_id in candidate_member_ids:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_candidate_member_duplicate"
+                )
+            candidate_member_ids.add(member.fact_value_id)
+            if member.fact_value_id not in base_fact_value_ids:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_candidate_member_source_mismatch"
+                )
+        effective_fact_value_ids_seen: set[uuid.UUID] = set()
+        for fact_value_id in item.effective_fact_value_ids:
+            if fact_value_id in effective_fact_value_ids_seen:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_effective_fact_value_duplicate"
+                )
+            effective_fact_value_ids_seen.add(fact_value_id)
+            if fact_value_id not in candidate_member_ids:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_effective_fact_value_source_mismatch"
+                )
+            if fact_value_id not in base_fact_value_ids:
+                raise DocumentRevisionUpdateImpactInvariantError(
+                    "document_revision_update_impact_effective_fact_value_source_mismatch"
+                )
         context_by_fact_id[item.fact_id] = _BaseEffectiveContext(
             assessment_id=item.assessment_id,
             review_status=item.review_status,
@@ -387,6 +478,13 @@ async def get_document_revision_update_impact(
         raise DocumentRevisionUpdateImpactInvariantError(
             "document_revision_update_impact_base_application_source_mismatch"
         )
+    if (
+        authenticated_application.application.consistency_application_id
+        != authenticated_application.authenticated_source.application.id
+    ):
+        raise DocumentRevisionUpdateImpactInvariantError(
+            "document_revision_update_impact_base_application_source_mismatch"
+        )
     source_application = authenticated_application.authenticated_source.application
     source_duplicate_grouping_application = (
         authenticated_application.authenticated_source.source_duplicate_grouping_application
@@ -418,6 +516,9 @@ async def get_document_revision_update_impact(
         effective_projection=effective_projection,
         expected_project_id=project_id,
         expected_application_id=base_consistency_check_application_id,
+        expected_source_consistency_application_id=(
+            authenticated_application.application.consistency_application_id
+        ),
         expected_result_manifest_hash=authenticated_application.application.result_manifest_hash,
     )
 
@@ -443,6 +544,10 @@ async def get_document_revision_update_impact(
         base_orchestration_id=base_orchestration_id,
         target_orchestration_id=target_orchestration_id,
         base_consistency_check_application_id=base_consistency_check_application_id,
+        base_source_consistency_application_id=(
+            authenticated_application.application.consistency_application_id
+        ),
+        comparison_quality=_require_comparison_quality(fact_diff.comparison_quality),
         block_diff_manifest_hash=fact_diff.block_diff_manifest_hash,
         fact_diff_manifest_hash=fact_diff.fact_diff_manifest_hash,
         base_consistency_result_manifest_hash=(
@@ -480,6 +585,8 @@ async def get_document_revision_update_impact(
         base_orchestration_id=impact.base_orchestration_id,
         target_orchestration_id=impact.target_orchestration_id,
         base_consistency_check_application_id=impact.base_consistency_check_application_id,
+        base_source_consistency_application_id=impact.base_source_consistency_application_id,
+        comparison_quality=impact.comparison_quality,
         block_diff_manifest_hash=impact.block_diff_manifest_hash,
         fact_diff_manifest_hash=impact.fact_diff_manifest_hash,
         base_consistency_result_manifest_hash=impact.base_consistency_result_manifest_hash,
