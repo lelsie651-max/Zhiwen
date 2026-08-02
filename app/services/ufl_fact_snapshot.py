@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +18,11 @@ from app.schemas.ufl_fact_snapshot import (
 )
 from app.services import document_revision_fact_diff as fact_diff_service
 from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
+from app.utils.deterministic_json import freeze_deterministic_json_value
+from app.utils.fact_value_metadata import (
+    validate_fact_value_confidence,
+    validate_fact_value_language_code,
+)
 
 
 ORCHESTRATION_UFL_FACT_SNAPSHOT_ALGORITHM_NAME = "orchestration_ufl_fact_snapshot"
@@ -44,10 +50,56 @@ def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
     return value
 
 
+def _require_invariant_uuid(value: object, *, error_code: str) -> uuid.UUID:
+    if not isinstance(value, uuid.UUID):
+        raise OrchestrationUFLFactSnapshotInvariantError(error_code)
+    return value
+
+
 def _require_sha256(value: object, *, error_code: str) -> str:
     if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
         raise OrchestrationUFLFactSnapshotInvariantError(error_code)
     return value
+
+
+def _require_nonnegative_int(value: object, *, error_code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise OrchestrationUFLFactSnapshotInvariantError(error_code)
+    return value
+
+
+def _freeze_value_json(value: Any) -> object:
+    try:
+        frozen = freeze_deterministic_json_value(value)
+        duplicate_grouping_service.canonicalize_deterministic_payload(frozen)
+    except (
+        ValueError,
+        TypeError,
+        duplicate_grouping_service.CrossBatchDuplicateGroupingError,
+        duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError,
+    ):
+        raise OrchestrationUFLFactSnapshotInvariantError(
+            "orchestration_ufl_fact_snapshot_value_json_invalid"
+        ) from None
+    return frozen
+
+
+def _validate_language_code(value: object | None) -> str | None:
+    try:
+        return validate_fact_value_language_code(value)
+    except ValueError:
+        raise OrchestrationUFLFactSnapshotInvariantError(
+            "orchestration_ufl_fact_snapshot_value_metadata_invalid"
+        ) from None
+
+
+def _validate_confidence(value: object | None) -> float | None:
+    try:
+        return validate_fact_value_confidence(value)
+    except ValueError:
+        raise OrchestrationUFLFactSnapshotInvariantError(
+            "orchestration_ufl_fact_snapshot_value_metadata_invalid"
+        ) from None
 
 
 def _serialize_locator(locator: UFLFactEvidenceLocator) -> dict[str, object]:
@@ -189,16 +241,36 @@ def _build_snapshot(
         value_groups: list[UFLFactValueGroupSnapshot] = []
         current_fact_value_count = 0
         for group in authenticated_fact.value_groups:
+            semantic_key_hash = _require_sha256(
+                group.semantic_key_hash,
+                error_code="orchestration_ufl_fact_snapshot_value_metadata_invalid",
+            )
+            frozen_value_json = _freeze_value_json(group.value_json)
             values = tuple(
                 UFLFactValueSnapshot(
-                    fact_value_id=value.fact_value_id,
-                    source_batch_id=value.source_batch_id,
-                    source_application_id=value.source_application_id,
-                    proposal_index=value.proposal_index,
+                    fact_value_id=_require_invariant_uuid(
+                        value.fact_value_id,
+                        error_code="orchestration_ufl_fact_snapshot_value_metadata_invalid",
+                    ),
+                    source_batch_id=_require_invariant_uuid(
+                        value.source_batch_id,
+                        error_code="orchestration_ufl_fact_snapshot_value_metadata_invalid",
+                    ),
+                    source_application_id=_require_invariant_uuid(
+                        value.source_application_id,
+                        error_code="orchestration_ufl_fact_snapshot_value_metadata_invalid",
+                    ),
+                    proposal_index=_require_nonnegative_int(
+                        value.proposal_index,
+                        error_code="orchestration_ufl_fact_snapshot_value_metadata_invalid",
+                    ),
                     normalized_value_text=value.normalized_value_text,
-                    value_hash=value.value_hash,
-                    language_code=value.language_code,
-                    confidence=value.confidence,
+                    value_hash=_require_sha256(
+                        value.value_hash,
+                        error_code="orchestration_ufl_fact_snapshot_value_metadata_invalid",
+                    ),
+                    language_code=_validate_language_code(value.language_code),
+                    confidence=_validate_confidence(value.confidence),
                 )
                 for value in group.values
             )
@@ -227,9 +299,9 @@ def _build_snapshot(
             )
             value_groups.append(
                 UFLFactValueGroupSnapshot(
-                    semantic_key_hash=group.semantic_key_hash,
+                    semantic_key_hash=semantic_key_hash,
                     value_type=group.value_type,
-                    value_json=group.value_json,
+                    value_json=frozen_value_json,
                     referenced_entity_id=group.referenced_entity_id,
                     fact_value_ids=group.fact_value_ids,
                     values=values,

@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 import hashlib
 import inspect
+from types import MappingProxyType
 import uuid
 
 import pytest
@@ -16,6 +17,10 @@ from app.schemas.fact_extraction_persistence import (
 )
 from app.schemas.fact_value_duplicate_grouping import DuplicateCandidate
 from app.services import ufl_fact_snapshot as ufl_fact_snapshot_service
+
+
+class CustomJSONValue:
+    pass
 
 
 def run_async(awaitable):
@@ -810,6 +815,367 @@ def test_get_orchestration_ufl_fact_snapshot_is_deterministic_and_manifest_chang
     )
 
     assert first.source_manifest_hash != changed.source_manifest_hash
+
+
+def test_get_orchestration_ufl_fact_snapshot_deep_freezes_value_json_and_detaches_from_fixture_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _rich_fixture()
+    nested_value_json = {
+        "profile": {
+            "aliases": ["alpha", "beta"],
+            "metrics": [1, {"score": 2.0}],
+        }
+    }
+    candidates = list(fixture["source_snapshot"].candidates)
+    candidates[0] = replace(
+        candidates[0],
+        value_type="object",
+        value_json=nested_value_json,
+    )
+    normalized_object_value = _normalized_fact_value(
+        value_type="object",
+        value_json=nested_value_json,
+    )
+    rows = list(fixture["rows"])
+    rows[0] = replace(
+        rows[0],
+        value_type="object",
+        value_json=nested_value_json,
+        normalized_value_text=normalized_object_value.normalized_value_text,
+        fact_value_hash=normalized_object_value.value_hash,
+    )
+    fixture["source_snapshot"] = replace(
+        fixture["source_snapshot"],
+        candidates=tuple(candidates),
+    )
+    factory = SessionFactory()
+    _install_sources(
+        monkeypatch,
+        source_snapshot=fixture["source_snapshot"],
+        rows=tuple(rows),
+    )
+
+    snapshot = run_async(
+        ufl_fact_snapshot_service.get_orchestration_ufl_fact_snapshot(
+            factory,
+            project_id=fixture["project_id"],
+            orchestration_id=fixture["orchestration_id"],
+        )
+    )
+
+    nested_value_json["profile"]["aliases"].append("gamma")
+    nested_value_json["profile"]["metrics"][1]["score"] = 3.0
+
+    frozen_value_json = next(
+        group.value_json
+        for group in snapshot.facts[1].value_groups
+        if group.value_type == "object"
+    )
+    assert isinstance(frozen_value_json, MappingProxyType)
+    assert isinstance(frozen_value_json["profile"], MappingProxyType)
+    assert isinstance(frozen_value_json["profile"]["aliases"], tuple)
+    assert frozen_value_json["profile"]["aliases"] == ("alpha", "beta")
+    assert frozen_value_json["profile"]["metrics"][1]["score"] == 2.0
+    with pytest.raises(TypeError):
+        frozen_value_json["profile"] = {}
+    with pytest.raises(TypeError):
+        frozen_value_json["profile"]["aliases"] += ("delta",)
+    with pytest.raises(AttributeError):
+        frozen_value_json["profile"]["aliases"].append("delta")
+
+
+@pytest.mark.parametrize(
+    "invalid_value_json",
+    [
+        {"bad": {"nan": float("nan")}},
+        {"bad": {"payload": b"bytes"}},
+        {"bad": {1: "value"}},
+        {"bad": {"nested": CustomJSONValue()}},
+    ],
+)
+def test_get_orchestration_ufl_fact_snapshot_rejects_invalid_nested_value_json(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_value_json: object,
+) -> None:
+    fixture = _rich_fixture()
+    authenticated_facts = ufl_fact_snapshot_service.fact_diff_service.build_authenticated_fact_source_facts(
+        rows=fixture["rows"],
+        source_snapshot=fixture["source_snapshot"],
+        expected_run_id=fixture["source_snapshot"].state.extraction_run_id,
+    )
+
+    mutated_fact = next(iter(authenticated_facts.values()))
+    mutated_group = replace(mutated_fact.value_groups[0], value_json=invalid_value_json)
+    malformed_facts = {
+        mutated_fact.fact.fact_id: replace(
+            mutated_fact,
+            value_groups=(mutated_group,) + mutated_fact.value_groups[1:],
+        )
+    }
+
+    monkeypatch.setattr(
+        ufl_fact_snapshot_service.fact_diff_service,
+        "build_authenticated_fact_source_facts",
+        lambda **_kwargs: malformed_facts,
+    )
+    factory = SessionFactory()
+    _install_sources(
+        monkeypatch,
+        source_snapshot=fixture["source_snapshot"],
+        rows=fixture["rows"],
+    )
+
+    with pytest.raises(
+        ufl_fact_snapshot_service.OrchestrationUFLFactSnapshotInvariantError,
+        match="orchestration_ufl_fact_snapshot_value_json_invalid",
+    ):
+        run_async(
+            ufl_fact_snapshot_service.get_orchestration_ufl_fact_snapshot(
+                factory,
+                project_id=fixture["project_id"],
+                orchestration_id=fixture["orchestration_id"],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("row_overrides", "application_overrides", "expected_code"),
+    [
+        ({"language_code": " zh-CN "}, None, "orchestration_ufl_fact_snapshot_value_metadata_invalid"),
+        ({"confidence": True}, None, "orchestration_ufl_fact_snapshot_value_metadata_invalid"),
+        ({"confidence": float("inf")}, None, "orchestration_ufl_fact_snapshot_value_metadata_invalid"),
+        (None, {"proposal_index": True}, "orchestration_ufl_fact_snapshot_value_metadata_invalid"),
+        (None, {"proposal_index": -1}, "orchestration_ufl_fact_snapshot_value_metadata_invalid"),
+    ],
+)
+def test_get_orchestration_ufl_fact_snapshot_rejects_invalid_value_metadata_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    row_overrides: dict | None,
+    application_overrides: dict | None,
+    expected_code: str,
+) -> None:
+    fixture = _rich_fixture()
+    rows = list(fixture["rows"])
+    if row_overrides is not None:
+        rows[0] = replace(rows[0], **row_overrides)
+    application_snapshots = list(fixture["source_snapshot"].application_snapshots)
+    if application_overrides is not None:
+        items = list(application_snapshots[1].items)
+        items[0] = replace(items[0], **{
+            key: value
+            for key, value in application_overrides.items()
+            if key == "proposal_index"
+        })
+        application_snapshots[1] = replace(
+            application_snapshots[1],
+            application_id=application_overrides.get(
+                "application_id",
+                application_snapshots[1].application_id,
+            ),
+            items=tuple(items),
+        )
+    fixture["source_snapshot"] = replace(
+        fixture["source_snapshot"],
+        application_snapshots=tuple(application_snapshots),
+    )
+    factory = SessionFactory()
+    _install_sources(
+        monkeypatch,
+        source_snapshot=fixture["source_snapshot"],
+        rows=tuple(rows),
+    )
+
+    with pytest.raises(
+        ufl_fact_snapshot_service.OrchestrationUFLFactSnapshotInvariantError,
+        match=expected_code,
+    ):
+        run_async(
+            ufl_fact_snapshot_service.get_orchestration_ufl_fact_snapshot(
+                factory,
+                project_id=fixture["project_id"],
+                orchestration_id=fixture["orchestration_id"],
+            )
+        )
+
+
+def test_get_orchestration_ufl_fact_snapshot_preserves_canonical_json_semantics_for_frozen_value_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _rich_fixture()
+    raw_value_json = {
+        "items": ["alpha", {"nested": [1, 2, 3]}],
+        "enabled": True,
+    }
+    candidates = list(fixture["source_snapshot"].candidates)
+    candidates[0] = replace(
+        candidates[0],
+        value_type="object",
+        value_json=raw_value_json,
+    )
+    normalized_object_value = _normalized_fact_value(
+        value_type="object",
+        value_json=raw_value_json,
+    )
+    rows = list(fixture["rows"])
+    rows[0] = replace(
+        rows[0],
+        value_type="object",
+        value_json=raw_value_json,
+        normalized_value_text=normalized_object_value.normalized_value_text,
+        fact_value_hash=normalized_object_value.value_hash,
+    )
+    fixture["source_snapshot"] = replace(
+        fixture["source_snapshot"],
+        candidates=tuple(candidates),
+    )
+    factory = SessionFactory()
+    _install_sources(
+        monkeypatch,
+        source_snapshot=fixture["source_snapshot"],
+        rows=tuple(rows),
+    )
+
+    snapshot = run_async(
+        ufl_fact_snapshot_service.get_orchestration_ufl_fact_snapshot(
+            factory,
+            project_id=fixture["project_id"],
+            orchestration_id=fixture["orchestration_id"],
+        )
+    )
+
+    frozen_value_json = next(
+        group.value_json
+        for group in snapshot.facts[1].value_groups
+        if group.value_type == "object"
+    )
+    assert (
+        ufl_fact_snapshot_service.duplicate_grouping_service.hash_deterministic_payload(
+            {"value_json": raw_value_json}
+        )
+        == ufl_fact_snapshot_service.duplicate_grouping_service.hash_deterministic_payload(
+            {"value_json": frozen_value_json}
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("value_type", "value_json"),
+    [
+        ("string", "same"),
+        ("list", ["alpha", {"nested": [1, 2]}]),
+        ("object", {"items": ["alpha", {"nested": [1, 2]}]}),
+    ],
+)
+def test_get_orchestration_ufl_fact_snapshot_keeps_manifest_deterministic_for_valid_value_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    value_type: str,
+    value_json: object,
+) -> None:
+    fixture = _rich_fixture()
+    candidates = list(fixture["source_snapshot"].candidates)
+    candidates[0] = replace(
+        candidates[0],
+        value_type=value_type,
+        value_json=value_json,
+    )
+    rows = list(fixture["rows"])
+    normalized_value = _normalized_fact_value(
+        value_type=value_type,
+        value_json=value_json,
+    )
+    rows[0] = replace(
+        rows[0],
+        value_type=normalized_value.value_type,
+        value_json=normalized_value.value_json,
+        normalized_value_text=normalized_value.normalized_value_text,
+        fact_value_hash=normalized_value.value_hash,
+    )
+    fixture["source_snapshot"] = replace(
+        fixture["source_snapshot"],
+        candidates=tuple(candidates),
+    )
+    factory = SessionFactory()
+    _install_sources(
+        monkeypatch,
+        source_snapshot=fixture["source_snapshot"],
+        rows=tuple(rows),
+    )
+
+    first = run_async(
+        ufl_fact_snapshot_service.get_orchestration_ufl_fact_snapshot(
+            factory,
+            project_id=fixture["project_id"],
+            orchestration_id=fixture["orchestration_id"],
+        )
+    )
+    second = run_async(
+        ufl_fact_snapshot_service.get_orchestration_ufl_fact_snapshot(
+            factory,
+            project_id=fixture["project_id"],
+            orchestration_id=fixture["orchestration_id"],
+        )
+    )
+
+    assert first.source_manifest_hash == second.source_manifest_hash
+
+
+@pytest.mark.parametrize(
+    ("group_overrides", "value_overrides"),
+    [
+        ({"semantic_key_hash": "BAD"}, None),
+        (None, {"value_hash": "BAD"}),
+        (None, {"source_application_id": "not-a-uuid"}),
+    ],
+)
+def test_get_orchestration_ufl_fact_snapshot_rejects_invalid_hash_shapes_in_authenticated_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    group_overrides: dict | None,
+    value_overrides: dict | None,
+) -> None:
+    fixture = _rich_fixture()
+    authenticated_facts = ufl_fact_snapshot_service.fact_diff_service.build_authenticated_fact_source_facts(
+        rows=fixture["rows"],
+        source_snapshot=fixture["source_snapshot"],
+        expected_run_id=fixture["source_snapshot"].state.extraction_run_id,
+    )
+    mutated_fact = next(iter(authenticated_facts.values()))
+    mutated_group = mutated_fact.value_groups[0]
+    if value_overrides is not None:
+        mutated_values = list(mutated_group.values)
+        mutated_values[0] = replace(mutated_values[0], **value_overrides)
+        mutated_group = replace(mutated_group, values=tuple(mutated_values))
+    if group_overrides is not None:
+        mutated_group = replace(mutated_group, **group_overrides)
+    malformed_facts = {
+        mutated_fact.fact.fact_id: replace(
+            mutated_fact,
+            value_groups=(mutated_group,) + mutated_fact.value_groups[1:],
+        )
+    }
+    monkeypatch.setattr(
+        ufl_fact_snapshot_service.fact_diff_service,
+        "build_authenticated_fact_source_facts",
+        lambda **_kwargs: malformed_facts,
+    )
+    factory = SessionFactory()
+    _install_sources(
+        monkeypatch,
+        source_snapshot=fixture["source_snapshot"],
+        rows=fixture["rows"],
+    )
+
+    with pytest.raises(
+        ufl_fact_snapshot_service.OrchestrationUFLFactSnapshotInvariantError,
+        match="orchestration_ufl_fact_snapshot_value_metadata_invalid",
+    ):
+        run_async(
+            ufl_fact_snapshot_service.get_orchestration_ufl_fact_snapshot(
+                factory,
+                project_id=fixture["project_id"],
+                orchestration_id=fixture["orchestration_id"],
+            )
+        )
 
 
 def test_get_orchestration_ufl_fact_snapshot_uses_shared_single_side_auth_and_stays_read_only(

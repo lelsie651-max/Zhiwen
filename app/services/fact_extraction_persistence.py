@@ -39,6 +39,10 @@ from app.services.inference import (
     build_inference_input_batch_snapshot_hash,
     build_inference_response_json_hash,
 )
+from app.utils.fact_value_metadata import (
+    validate_fact_value_confidence,
+    validate_fact_value_language_code,
+)
 
 if TYPE_CHECKING:
     from app.schemas.agent_fact_extraction import FactExtractionResponse, FactProposal
@@ -296,6 +300,38 @@ def _validate_resolution_consistency(
             raise FactExtractionApplicationReplayConflictError(
                 "withheld entity_ref must not carry referenced_entity_id"
             )
+
+
+def _validate_replayed_fact_value_metadata(
+    *,
+    fact_value: object,
+    proposal: FactProposal,
+) -> None:
+    try:
+        language_code = validate_fact_value_language_code(
+            getattr(fact_value, "language_code", None)
+        )
+    except ValueError:
+        raise FactExtractionApplicationReplayConflictError(
+            "application fact_value language_code mismatch"
+        ) from None
+    if language_code != proposal.language_code:
+        raise FactExtractionApplicationReplayConflictError(
+            "application fact_value language_code mismatch"
+        )
+
+    try:
+        confidence = validate_fact_value_confidence(
+            getattr(fact_value, "confidence", None)
+        )
+    except ValueError:
+        raise FactExtractionApplicationReplayConflictError(
+            "application fact_value confidence mismatch"
+        ) from None
+    if confidence != proposal.confidence:
+        raise FactExtractionApplicationReplayConflictError(
+            "application fact_value confidence mismatch"
+        )
 
 
 def _validate_persistence_context(
@@ -616,6 +652,10 @@ async def _validate_replayed_result_against_database(
             raise FactExtractionApplicationReplayConflictError("application fact_value fact_id mismatch")
         if fact_value.referenced_entity_id != item.referenced_entity_id:
             raise FactExtractionApplicationReplayConflictError("application referenced_entity_id mismatch")
+        _validate_replayed_fact_value_metadata(
+            fact_value=fact_value,
+            proposal=proposal,
+        )
         if fact_value.fact is None:
             raise FactExtractionApplicationReplayConflictError("application fact record is missing")
         if fact_value.fact.project_id != application.project_id:

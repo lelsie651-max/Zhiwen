@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import is_dataclass
-from datetime import date, datetime, time
-import math
-from types import MappingProxyType
+from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
@@ -38,6 +35,7 @@ from app.schemas.dynamic_schema_projection import (
     ProjectedValue,
 )
 from app.services import fact_value_duplicate_grouping as duplicate_grouping_service
+from app.utils.deterministic_json import freeze_deterministic_json_value
 
 
 DYNAMIC_SCHEMA_DEFINITION_SNAPSHOT_ALGORITHM_NAME = "dynamic_schema_definition_snapshot"
@@ -202,36 +200,12 @@ def _require_optional_aware_datetime(
 
 
 def _freeze_json_value(value: Any) -> object:
-    if value is None or isinstance(value, bool | int | str):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise DynamicSchemaDefinitionSnapshotInvariantError(
-                "dynamic_schema_definition_snapshot_json_config_invalid"
-            )
-        return value
-    if isinstance(value, Mapping):
-        normalized_items: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise DynamicSchemaDefinitionSnapshotInvariantError(
-                    "dynamic_schema_definition_snapshot_json_config_invalid"
-                )
-            normalized_items[key] = _freeze_json_value(item)
-        return MappingProxyType(normalized_items)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return tuple(_freeze_json_value(item) for item in value)
-    if isinstance(value, (bytes, bytearray, datetime, date, time)):
+    try:
+        return freeze_deterministic_json_value(value)
+    except ValueError:
         raise DynamicSchemaDefinitionSnapshotInvariantError(
             "dynamic_schema_definition_snapshot_json_config_invalid"
-        )
-    if is_dataclass(value):
-        raise DynamicSchemaDefinitionSnapshotInvariantError(
-            "dynamic_schema_definition_snapshot_json_config_invalid"
-        )
-    raise DynamicSchemaDefinitionSnapshotInvariantError(
-        "dynamic_schema_definition_snapshot_json_config_invalid"
-    )
+        ) from None
 
 
 def _validate_json_config(value: object) -> object:

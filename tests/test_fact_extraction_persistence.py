@@ -342,12 +342,13 @@ def patch_application_prepare(monkeypatch):
 
 def _build_replay_fixture(
     *,
+    response_json: dict | None = None,
     item_overrides: dict | None = None,
     fact_value_overrides: dict | None = None,
     fact_overrides: dict | None = None,
     link_overrides: dict[int, dict] | None = None,
 ):
-    context = build_context()
+    context = build_context(response_json=response_json)
     response = parse_fact_extraction_response_object(context.response_json)
     evidence_ids = (uuid.uuid4(), uuid.uuid4())
     item = {
@@ -447,6 +448,8 @@ def _build_replay_fixture(
         source_kind="ai",
         extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
         inference_run_id=context.inference_run_id,
+        language_code=response.facts[0].language_code,
+        confidence=response.facts[0].confidence,
         referenced_entity_id=(
             uuid.UUID(item["referenced_entity_id"]) if item["referenced_entity_id"] is not None else None
         ),
@@ -1802,6 +1805,8 @@ def test_authenticate_completed_fact_extraction_application_excludes_withheld_it
         source_kind="ai",
         extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
         inference_run_id=context.inference_run_id,
+        language_code=response.facts[0].language_code,
+        confidence=response.facts[0].confidence,
         referenced_entity_id=None,
         fact=SimpleNamespace(project_id=context.project_id, subject_entity_id=None),
         evidence_links=[
@@ -1849,6 +1854,115 @@ def test_authenticate_completed_fact_extraction_application_excludes_withheld_it
     assert snapshot.items[0].fact_id == persisted_fact_id
     assert snapshot.items[0].fact_value_id == persisted_fact_value_id
     assert snapshot.items[0].evidence_ids == tuple(evidence_ids)
+
+
+@pytest.mark.parametrize(
+    ("fact_value_overrides", "expected_message"),
+    [
+        ({"language_code": "en"}, "language_code"),
+        ({"confidence": 0.1}, "confidence"),
+        ({"confidence": True}, "confidence"),
+        ({"confidence": float("nan")}, "confidence"),
+        ({"confidence": float("inf")}, "confidence"),
+        ({"confidence": 1.1}, "confidence"),
+    ],
+)
+def test_replay_completed_application_rejects_fact_value_metadata_drift(
+    fact_value_overrides: dict,
+    expected_message: str,
+) -> None:
+    context, response, application, fact_value = _build_replay_fixture(
+        fact_value_overrides=fact_value_overrides,
+    )
+    session = FakeSession()
+    original_get_fact_value_with_links = persistence_service.fact_repository.get_fact_value_with_links
+    persistence_service.fact_repository.get_fact_value_with_links = (
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=fact_value)
+    )
+
+    try:
+        with pytest.raises(
+            persistence_service.FactExtractionApplicationReplayConflictError,
+            match=expected_message,
+        ):
+            run_async(
+                persistence_service._replay_completed_application(
+                    session,
+                    application=application,
+                    context=context,
+                    project_id=context.project_id,
+                    extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+                    response=response,
+                )
+            )
+    finally:
+        persistence_service.fact_repository.get_fact_value_with_links = (
+            original_get_fact_value_with_links
+        )
+
+
+@pytest.mark.parametrize(
+    ("response_json", "fact_value_overrides"),
+    [
+        (
+            {
+                **valid_response_json(),
+                "facts": [
+                    {
+                        **valid_response_json()["facts"][0],
+                        "language_code": None,
+                        "confidence": 0.0,
+                    }
+                ],
+            },
+            {"language_code": None, "confidence": 0.0},
+        ),
+        (
+            {
+                **valid_response_json(),
+                "facts": [
+                    {
+                        **valid_response_json()["facts"][0],
+                        "language_code": "zh-CN",
+                        "confidence": 1.0,
+                    }
+                ],
+            },
+            {"language_code": "zh-CN", "confidence": 1.0},
+        ),
+    ],
+)
+def test_replay_completed_application_accepts_valid_fact_value_metadata_boundaries(
+    response_json: dict,
+    fact_value_overrides: dict,
+) -> None:
+    context, response, application, fact_value = _build_replay_fixture(
+        response_json=response_json,
+        fact_value_overrides=fact_value_overrides,
+    )
+    session = FakeSession()
+    original_get_fact_value_with_links = persistence_service.fact_repository.get_fact_value_with_links
+    persistence_service.fact_repository.get_fact_value_with_links = (
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=fact_value)
+    )
+
+    try:
+        result = run_async(
+            persistence_service._replay_completed_application(
+                session,
+                application=application,
+                context=context,
+                project_id=context.project_id,
+                extraction_run_id=context.blocks[0].extraction_run_id_snapshot,
+                response=response,
+            )
+        )
+    finally:
+        persistence_service.fact_repository.get_fact_value_with_links = (
+            original_get_fact_value_with_links
+        )
+
+    assert result.replayed_application is True
 
 
 def test_fact_value_replay_unique_constraint_exists_and_compiles() -> None:
