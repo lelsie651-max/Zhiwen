@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.project import ProjectStatus
 from app.models.project_version import ProjectVersion
+from app.schemas.project_version import ProjectVersionCreateResult
 from app.schemas.dynamic_schema_knowledge_view import (
     DynamicSchemaKnowledgeField,
     DynamicSchemaKnowledgeRecord,
@@ -310,6 +311,12 @@ def _thaw_snapshot_json(snapshot_json: object) -> dict[str, object]:
             snapshot_json
         ).decode("utf-8")
     )
+
+
+def _mutable_snapshot(
+    snapshot: project_version_service.ProjectVersionSnapshot,
+) -> project_version_service.ProjectVersionSnapshot:
+    return replace(snapshot, snapshot_json=_thaw_snapshot_json(snapshot.snapshot_json))
 
 
 def _install_repository_patches(
@@ -751,6 +758,211 @@ def test_snapshot_json_preserves_fact_values_and_evidence_and_is_deeply_immutabl
         created.snapshot_json["new_key"] = "blocked"  # type: ignore[index]
     with pytest.raises(TypeError):
         created.snapshot_json["records"][0] = "blocked"  # type: ignore[index]
+
+
+def test_authenticate_project_version_snapshot_returns_frozen_copy_for_mutable_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    created = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+    mutable_input = _mutable_snapshot(created)
+    original_snapshot_json = mutable_input.snapshot_json
+
+    authenticated = project_version_service.authenticate_project_version_snapshot(
+        mutable_input
+    )
+
+    assert isinstance(authenticated, ProjectVersionCreateResult)
+    assert authenticated.created_new is True
+    assert authenticated.snapshot_json_hash == created.snapshot_json_hash
+    assert authenticated.version_manifest_hash == created.version_manifest_hash
+    assert authenticated.snapshot_json is not original_snapshot_json
+    mutable_input.snapshot_json["project_id"] = str(_uuid("mutated-project"))  # type: ignore[index]
+    mutable_input.snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"]["value_groups"][0]["values"][0]["normalized_value_text"] = "mutated"  # type: ignore[index]
+    assert authenticated.snapshot_json["project_id"] == str(created.project_id)
+    assert (
+        authenticated.snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"]["value_groups"][0]["values"][0]["normalized_value_text"]  # type: ignore[index]
+        == "Alice"
+    )
+    with pytest.raises(TypeError):
+        authenticated.snapshot_json["project_id"] = "blocked"  # type: ignore[index]
+
+
+def test_authenticate_project_version_snapshot_rejects_non_bool_created_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    created = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+    mutable_input = replace(
+        _mutable_snapshot(created),
+        created_new=1,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        project_version_service.ProjectVersionInvariantError,
+        match="project_version_snapshot_invalid",
+    ):
+        project_version_service.authenticate_project_version_snapshot(mutable_input)
+
+
+@pytest.mark.parametrize(
+    "mutate_snapshot",
+    [
+        lambda snapshot_json: snapshot_json.pop("project_id"),
+        lambda snapshot_json: snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"].pop("fact_id"),
+        lambda snapshot_json: snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"]["value_groups"][0]["values"][0].pop("normalized_value_text"),
+        lambda snapshot_json: snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"]["value_groups"][0]["evidences"][0].pop("excerpt"),
+    ],
+)
+def test_authenticate_project_version_snapshot_maps_missing_keys_to_fixed_error(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_snapshot,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    created = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+    mutated_snapshot_json = _thaw_snapshot_json(created.snapshot_json)
+    mutate_snapshot(mutated_snapshot_json)
+
+    with pytest.raises(
+        project_version_service.ProjectVersionInvariantError,
+        match="project_version_snapshot_invalid",
+    ):
+        project_version_service.authenticate_project_version_snapshot(
+            replace(created, snapshot_json=mutated_snapshot_json)
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate_snapshot",
+    [
+        lambda created, snapshot_json: snapshot_json.__setitem__("records", {"not": "a-list"}),
+        lambda created, snapshot_json: snapshot_json.__setitem__("project_id", "bad-uuid"),
+        lambda created, snapshot_json: snapshot_json["records"][0]["sections"][0]["fields"][0]["source_field"].__setitem__("created_at", "bad-datetime"),
+        lambda created, snapshot_json: snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"].__setitem__("semantic_group_count", "bad-int"),
+        lambda created, snapshot_json: replace(created, snapshot_json=snapshot_json, record_count=True),
+    ],
+)
+def test_authenticate_project_version_snapshot_maps_malformed_shapes_to_fixed_error(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_snapshot,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    created = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+    mutated_snapshot_json = _thaw_snapshot_json(created.snapshot_json)
+    mutated = mutate_snapshot(created, mutated_snapshot_json)
+    mutated_snapshot = (
+        mutated
+        if isinstance(mutated, project_version_service.ProjectVersionSnapshot)
+        else replace(created, snapshot_json=mutated_snapshot_json)
+    )
+
+    with pytest.raises(
+        project_version_service.ProjectVersionInvariantError,
+        match="project_version_snapshot_invalid",
+    ):
+        project_version_service.authenticate_project_version_snapshot(mutated_snapshot)
+
+
+def test_authenticate_project_version_snapshot_redacts_sensitive_sentinel_in_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    created = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+    sentinel = "SENSITIVE_SENTINEL_13_2_1"
+    mutated_snapshot_json = _thaw_snapshot_json(created.snapshot_json)
+    mutated_snapshot_json["records"][0]["sections"][0]["fields"][0]["reviewed_facts"][0]["fact"]["value_groups"][0]["evidences"][0]["excerpt"] = sentinel
+    mutated_snapshot_json.pop("project_id")
+
+    with pytest.raises(project_version_service.ProjectVersionInvariantError) as exc_info:
+        project_version_service.authenticate_project_version_snapshot(
+            replace(created, snapshot_json=mutated_snapshot_json, reason=sentinel)
+        )
+
+    assert str(exc_info.value) == "project_version_snapshot_invalid"
+    assert sentinel not in str(exc_info.value)
+
+
+def test_create_get_idempotent_and_recovery_paths_use_authenticated_return_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_authenticate = project_version_service.authenticate_project_version_snapshot
+
+    def tracking_authenticate(snapshot):
+        authenticated = original_authenticate(snapshot)
+        return replace(authenticated, is_current=False)
+
+    monkeypatch.setattr(
+        project_version_service,
+        "authenticate_project_version_snapshot",
+        tracking_authenticate,
+    )
+
+    create_store = Store()
+    create_session_factory = SessionFactory(create_store)
+    _install_all_patches(monkeypatch, create_store)
+    created = run_async(
+        project_version_service.create_project_version(
+            create_session_factory,
+            **_base_kwargs(create_store),
+        )
+    )
+    fetched = run_async(
+        project_version_service.get_project_version_snapshot(
+            create_session_factory,
+            project_id=create_store.project.id,
+            project_version_id=created.id,
+        )
+    )
+    retried = run_async(
+        project_version_service.create_project_version(
+            create_session_factory,
+            **_base_kwargs(create_store),
+        )
+    )
+
+    recovery_store = Store()
+    recovery_session_factory = SessionFactory(recovery_store)
+    _install_all_patches(monkeypatch, recovery_store)
+
+    def concurrent_winner(project_version: ProjectVersion, _session: FakeSession) -> None:
+        if recovery_store.versions:
+            return
+        recovery_store.versions.append(_clone_project_version_row(project_version))
+        recovery_store.project.current_version_id = project_version.id
+        recovery_store.create_error = _integrity_error("pk_project_versions")
+
+    recovery_store.on_create_version = concurrent_winner
+    recovered = run_async(
+        project_version_service.create_project_version(
+            recovery_session_factory,
+            **_base_kwargs(recovery_store),
+        )
+    )
+
+    assert created.is_current is False
+    assert fetched.is_current is False
+    assert retried.is_current is False
+    assert recovered.is_current is False
 
 
 def test_authenticate_project_version_snapshot_rejects_column_json_drift(

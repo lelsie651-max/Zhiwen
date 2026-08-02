@@ -686,6 +686,21 @@ def _snapshot_kwargs(snapshot: ProjectVersionSnapshot) -> dict[str, object]:
     }
 
 
+def _build_authenticated_snapshot(
+    snapshot: ProjectVersionSnapshot,
+    *,
+    frozen_snapshot_json: Mapping[str, object],
+) -> ProjectVersionSnapshot:
+    kwargs = _snapshot_kwargs(snapshot)
+    kwargs["snapshot_json"] = frozen_snapshot_json
+    if isinstance(snapshot, ProjectVersionCreateResult):
+        return ProjectVersionCreateResult(
+            **kwargs,
+            created_new=_require_snapshot_bool(snapshot.created_new),
+        )
+    return ProjectVersionSnapshot(**kwargs)
+
+
 def _to_create_result(
     snapshot: ProjectVersionSnapshot,
     *,
@@ -886,63 +901,77 @@ def authenticate_project_version_snapshot(
         raise ProjectVersionInvariantError("project_version_snapshot_invalid")
     _require_aware_datetime(snapshot.created_at, error_code="project_version_snapshot_invalid")
     _require_snapshot_bool(snapshot.is_current)
-    frozen_snapshot_json = _freeze_snapshot_json(snapshot.snapshot_json)
-    knowledge_view = _deserialize_dynamic_schema_knowledge_view(frozen_snapshot_json)
     try:
+        frozen_snapshot_json = _freeze_snapshot_json(snapshot.snapshot_json)
+        knowledge_view = _deserialize_dynamic_schema_knowledge_view(frozen_snapshot_json)
         authenticated_view = knowledge_view_service.authenticate_dynamic_schema_knowledge_view(
             knowledge_view,
             subject_keys=None,
         )
-    except knowledge_view_service.DynamicSchemaKnowledgeViewError:
+        expected_snapshot_json = knowledge_view_service.serialize_dynamic_schema_knowledge_view(
+            authenticated_view,
+            subject_keys=None,
+        )
+        frozen_expected_snapshot_json = _freeze_snapshot_json(expected_snapshot_json)
+        if _canonical_bytes(frozen_snapshot_json) != _canonical_bytes(
+            frozen_expected_snapshot_json
+        ):
+            raise ProjectVersionInvariantError("project_version_snapshot_invalid")
+        if (
+            duplicate_grouping_service.hash_deterministic_payload(
+                expected_snapshot_json
+            )
+            != snapshot.snapshot_json_hash
+        ):
+            raise ProjectVersionInvariantError("project_version_snapshot_invalid")
+        expected_version_manifest_hash = _build_version_manifest_hash(
+            project_version_id=snapshot.id,
+            project_id=snapshot.project_id,
+            version_no=snapshot.version_no,
+            created_by_id=snapshot.created_by_id,
+            creation_kind=snapshot.creation_kind,
+            reason=snapshot.reason,
+            copied_from_version_id=snapshot.copied_from_version_id,
+            schema_id=snapshot.schema_id,
+            schema_version_id=snapshot.schema_version_id,
+            orchestration_id=snapshot.orchestration_id,
+            extraction_run_id=snapshot.extraction_run_id,
+            consistency_check_application_id=snapshot.consistency_check_application_id,
+            source_consistency_application_id=snapshot.source_consistency_application_id,
+            schema_definition_manifest_hash=snapshot.schema_definition_manifest_hash,
+            ufl_source_manifest_hash=snapshot.ufl_source_manifest_hash,
+            consistency_result_manifest_hash=snapshot.consistency_result_manifest_hash,
+            raw_projection_manifest_hash=snapshot.raw_projection_manifest_hash,
+            reviewed_projection_manifest_hash=snapshot.reviewed_projection_manifest_hash,
+            knowledge_view_manifest_hash=snapshot.knowledge_view_manifest_hash,
+            knowledge_view_algorithm_name=snapshot.knowledge_view_algorithm_name,
+            knowledge_view_algorithm_version=snapshot.knowledge_view_algorithm_version,
+            snapshot_json_hash=snapshot.snapshot_json_hash,
+            record_count=snapshot.record_count,
+            section_count=snapshot.section_count,
+            field_count=snapshot.field_count,
+            missing_field_count=snapshot.missing_field_count,
+            review_required_field_count=snapshot.review_required_field_count,
+            resolved_field_count=snapshot.resolved_field_count,
+            observation_only_field_count=snapshot.observation_only_field_count,
+            mixed_field_count=snapshot.mixed_field_count,
+            created_at=snapshot.created_at,
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        knowledge_view_service.DynamicSchemaKnowledgeViewError,
+    ):
         raise ProjectVersionInvariantError("project_version_snapshot_invalid") from None
     _assert_snapshot_matches_knowledge_view(snapshot, view=authenticated_view)
-    expected_snapshot_json = knowledge_view_service.serialize_dynamic_schema_knowledge_view(
-        authenticated_view,
-        subject_keys=None,
-    )
-    if _canonical_bytes(frozen_snapshot_json) != _canonical_bytes(expected_snapshot_json):
-        raise ProjectVersionInvariantError("project_version_snapshot_invalid")
-    if (
-        duplicate_grouping_service.hash_deterministic_payload(expected_snapshot_json)
-        != snapshot.snapshot_json_hash
-    ):
-        raise ProjectVersionInvariantError("project_version_snapshot_invalid")
-    expected_version_manifest_hash = _build_version_manifest_hash(
-        project_version_id=snapshot.id,
-        project_id=snapshot.project_id,
-        version_no=snapshot.version_no,
-        created_by_id=snapshot.created_by_id,
-        creation_kind=snapshot.creation_kind,
-        reason=snapshot.reason,
-        copied_from_version_id=snapshot.copied_from_version_id,
-        schema_id=snapshot.schema_id,
-        schema_version_id=snapshot.schema_version_id,
-        orchestration_id=snapshot.orchestration_id,
-        extraction_run_id=snapshot.extraction_run_id,
-        consistency_check_application_id=snapshot.consistency_check_application_id,
-        source_consistency_application_id=snapshot.source_consistency_application_id,
-        schema_definition_manifest_hash=snapshot.schema_definition_manifest_hash,
-        ufl_source_manifest_hash=snapshot.ufl_source_manifest_hash,
-        consistency_result_manifest_hash=snapshot.consistency_result_manifest_hash,
-        raw_projection_manifest_hash=snapshot.raw_projection_manifest_hash,
-        reviewed_projection_manifest_hash=snapshot.reviewed_projection_manifest_hash,
-        knowledge_view_manifest_hash=snapshot.knowledge_view_manifest_hash,
-        knowledge_view_algorithm_name=snapshot.knowledge_view_algorithm_name,
-        knowledge_view_algorithm_version=snapshot.knowledge_view_algorithm_version,
-        snapshot_json_hash=snapshot.snapshot_json_hash,
-        record_count=snapshot.record_count,
-        section_count=snapshot.section_count,
-        field_count=snapshot.field_count,
-        missing_field_count=snapshot.missing_field_count,
-        review_required_field_count=snapshot.review_required_field_count,
-        resolved_field_count=snapshot.resolved_field_count,
-        observation_only_field_count=snapshot.observation_only_field_count,
-        mixed_field_count=snapshot.mixed_field_count,
-        created_at=snapshot.created_at,
-    )
     if expected_version_manifest_hash != snapshot.version_manifest_hash:
         raise ProjectVersionInvariantError("project_version_snapshot_invalid")
-    return snapshot
+    return _build_authenticated_snapshot(
+        snapshot,
+        frozen_snapshot_json=frozen_expected_snapshot_json,
+    )
 
 
 def _prepared_matches_snapshot(
@@ -1182,23 +1211,26 @@ async def _recover_existing_snapshot_after_integrity_error(
                 read_session,
                 project_id=existing.project_id,
             )
-            snapshot = authenticate_project_version_snapshot(
-                _build_snapshot_from_row(
-                    existing,
-                    is_current=(
-                        project is not None and project.current_version_id == existing.id
-                    ),
-                )
+            snapshot = _build_snapshot_from_row(
+                existing,
+                is_current=(
+                    project is not None and project.current_version_id == existing.id
+                ),
             )
             await read_session.rollback()
         except BaseException:
             await read_session.rollback()
             raise
-    if snapshot.project_id != prepared.project_id:
+    authenticated_result = authenticate_project_version_snapshot(
+        _to_create_result(snapshot, created_new=False)
+    )
+    if not isinstance(authenticated_result, ProjectVersionCreateResult):
+        raise ProjectVersionInvariantError("project_version_snapshot_invalid")
+    if authenticated_result.project_id != prepared.project_id:
         raise ProjectVersionInvariantError("project_version_idempotency_mismatch")
-    if not _prepared_matches_snapshot(prepared, snapshot=snapshot):
+    if not _prepared_matches_snapshot(prepared, snapshot=authenticated_result):
         raise ProjectVersionInvariantError("project_version_idempotency_mismatch")
-    return _to_create_result(snapshot, created_new=False)
+    return authenticated_result
 
 
 async def create_project_version(
@@ -1259,14 +1291,19 @@ async def create_project_version(
                 project_version_id=project_version_id,
             )
             if existing is not None:
-                snapshot = authenticate_project_version_snapshot(
-                    _build_snapshot_from_row(
-                        existing,
-                        is_current=project.current_version_id == existing.id,
+                authenticated_result = authenticate_project_version_snapshot(
+                    _to_create_result(
+                        _build_snapshot_from_row(
+                            existing,
+                            is_current=project.current_version_id == existing.id,
+                        ),
+                        created_new=False,
                     )
                 )
+                if not isinstance(authenticated_result, ProjectVersionCreateResult):
+                    raise ProjectVersionInvariantError("project_version_snapshot_invalid")
                 if not _request_identity_matches_existing_snapshot(
-                    snapshot,
+                    authenticated_result,
                     project_id=project_id,
                     schema_id=schema_id,
                     schema_version_id=schema_version_id,
@@ -1291,12 +1328,15 @@ async def create_project_version(
                     creation_kind=normalized_creation_kind,
                     reason=normalized_reason,
                 )
-                if not _prepared_matches_snapshot(prepared, snapshot=snapshot):
+                if not _prepared_matches_snapshot(
+                    prepared,
+                    snapshot=authenticated_result,
+                ):
                     raise ProjectVersionInvariantError(
                         "project_version_idempotency_mismatch"
                     )
                 await write_session.commit()
-                return _to_create_result(snapshot, created_new=False)
+                return authenticated_result
 
             prepared = await _prepare_project_version_source(
                 session_factory,
@@ -1363,10 +1403,15 @@ async def create_project_version(
             )
             project.current_version_id = project_version.id
             await write_session.commit()
-            snapshot = authenticate_project_version_snapshot(
-                _build_snapshot_from_row(project_version, is_current=True)
+            authenticated_result = authenticate_project_version_snapshot(
+                _to_create_result(
+                    _build_snapshot_from_row(project_version, is_current=True),
+                    created_new=True,
+                )
             )
-            return _to_create_result(snapshot, created_new=True)
+            if not isinstance(authenticated_result, ProjectVersionCreateResult):
+                raise ProjectVersionInvariantError("project_version_snapshot_invalid")
+            return authenticated_result
         except IntegrityError as error:
             constraint_name = _get_integrity_constraint_name(error)
             await write_session.rollback()
