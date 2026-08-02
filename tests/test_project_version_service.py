@@ -61,6 +61,7 @@ class FakeSession:
         self.rollback_count = 0
         self.flush_count = 0
         self.pending_versions: list[ProjectVersion] = []
+        self.created_orm_versions: list[ProjectVersion] = []
         self.project = self._clone_project(store.project)
 
     @staticmethod
@@ -75,6 +76,10 @@ class FakeSession:
 
     async def commit(self) -> None:
         self.commit_count += 1
+        if self.store.on_commit is not None:
+            self.store.on_commit(self)
+        if self.store.commit_error is not None:
+            raise self.store.commit_error
         self.store.versions.extend(self.pending_versions)
         self.pending_versions = []
         if self.project is not None and self.store.project is not None:
@@ -129,7 +134,9 @@ class Store:
         self.auth_calls: list[dict[str, object]] = []
         self.knowledge_view = _build_knowledge_view()
         self.create_error: Exception | None = None
+        self.commit_error: Exception | None = None
         self.on_create_version = None
+        self.on_commit = None
 
 
 def _clone_project_version_row(project_version: ProjectVersion) -> SimpleNamespace:
@@ -372,6 +379,7 @@ def _install_repository_patches(
     async def fake_create_project_version(session: FakeSession, project_version: ProjectVersion):
         store.call_log.append("create_project_version")
         session.pending_versions.append(_clone_project_version_row(project_version))
+        session.created_orm_versions.append(project_version)
         await session.flush()
         if store.on_create_version is not None:
             store.on_create_version(project_version, session)
@@ -490,6 +498,44 @@ def test_create_project_version_assigns_strictly_increasing_versions_and_locks_b
     assert store.call_log.index("project_lock") < store.call_log.index("max_version_no")
     assert store.build_calls[0]["subject_keys"] is None
     assert all(call["subject_keys"] is None for call in store.auth_calls)
+
+
+def test_create_project_version_authenticates_before_commit_and_returns_precommitted_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    call_order: list[str] = []
+    original_authenticate = project_version_service.authenticate_project_version_snapshot
+    sentinel_result: ProjectVersionCreateResult | None = None
+
+    def on_commit(_session: FakeSession) -> None:
+        call_order.append("commit")
+
+    def tracking_authenticate(snapshot):
+        nonlocal sentinel_result
+        if isinstance(snapshot, ProjectVersionCreateResult) and snapshot.created_new is True:
+            call_order.append("authenticate")
+            assert session_factory.sessions[-1].commit_count == 0
+            sentinel_result = replace(original_authenticate(snapshot), is_current=False)
+            return sentinel_result
+        return original_authenticate(snapshot)
+
+    store.on_commit = on_commit
+    monkeypatch.setattr(
+        project_version_service,
+        "authenticate_project_version_snapshot",
+        tracking_authenticate,
+    )
+
+    created = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+
+    assert sentinel_result is not None
+    assert created is sentinel_result
+    assert call_order == ["authenticate", "commit"]
 
 
 @pytest.mark.parametrize(
@@ -656,6 +702,44 @@ def test_create_project_version_rolls_back_version_and_pointer_on_write_failure(
     assert session_factory.sessions[0].rollback_count == 1
 
 
+def test_create_project_version_rolls_back_when_precommit_authentication_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    original_authenticate = project_version_service.authenticate_project_version_snapshot
+
+    def failing_authenticate(snapshot):
+        if isinstance(snapshot, ProjectVersionCreateResult) and snapshot.created_new is True:
+            raise project_version_service.ProjectVersionInvariantError(
+                "project_version_snapshot_invalid"
+            )
+        return original_authenticate(snapshot)
+
+    monkeypatch.setattr(
+        project_version_service,
+        "authenticate_project_version_snapshot",
+        failing_authenticate,
+    )
+
+    with pytest.raises(
+        project_version_service.ProjectVersionInvariantError,
+        match="project_version_snapshot_invalid",
+    ):
+        run_async(
+            project_version_service.create_project_version(
+                session_factory,
+                **_base_kwargs(store),
+            )
+        )
+
+    assert session_factory.sessions[0].commit_count == 0
+    assert session_factory.sessions[0].rollback_count == 1
+    assert store.versions == []
+    assert store.project.current_version_id is None
+
+
 def test_create_project_version_sanitizes_unknown_integrity_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -669,6 +753,98 @@ def test_create_project_version_sanitizes_unknown_integrity_errors(
         match="project_version_write_integrity_error",
     ):
         run_async(project_version_service.create_project_version(session_factory, **_base_kwargs(store)))
+
+
+def test_create_project_version_does_not_access_orm_or_reauthenticate_after_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    after_commit = False
+    original_authenticate = project_version_service.authenticate_project_version_snapshot
+    original_build_snapshot = project_version_service._build_snapshot_from_row
+
+    def on_commit(_session: FakeSession) -> None:
+        nonlocal after_commit
+        after_commit = True
+
+    def tracking_authenticate(snapshot):
+        if after_commit:
+            raise AssertionError("post_commit_authenticate_called")
+        return original_authenticate(snapshot)
+
+    def tracking_build_snapshot(row, *, is_current):
+        if after_commit:
+            raise AssertionError("post_commit_orm_access")
+        return original_build_snapshot(row, is_current=is_current)
+
+    store.on_commit = on_commit
+    monkeypatch.setattr(
+        project_version_service,
+        "authenticate_project_version_snapshot",
+        tracking_authenticate,
+    )
+    monkeypatch.setattr(
+        project_version_service,
+        "_build_snapshot_from_row",
+        tracking_build_snapshot,
+    )
+
+    created = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+
+    assert created.created_new is True
+    assert after_commit is True
+
+
+def test_create_project_version_recovers_when_commit_raises_integrity_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+
+    def on_commit(session: FakeSession) -> None:
+        if store.versions:
+            return
+        store.versions.extend(session.pending_versions)
+        store.project.current_version_id = session.project.current_version_id
+
+    store.on_commit = on_commit
+    store.commit_error = _integrity_error("pk_project_versions")
+
+    recovered = run_async(
+        project_version_service.create_project_version(session_factory, **_base_kwargs(store))
+    )
+
+    assert recovered.created_new is False
+    assert recovered.version_no == 1
+    assert recovered.snapshot_json_hash
+    assert session_factory.sessions[0].rollback_count == 1
+
+
+def test_create_project_version_rolls_back_when_commit_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store()
+    session_factory = SessionFactory(store)
+    _install_all_patches(monkeypatch, store)
+    store.commit_error = RuntimeError("commit boom")
+
+    with pytest.raises(RuntimeError, match="commit boom"):
+        run_async(
+            project_version_service.create_project_version(
+                session_factory,
+                **_base_kwargs(store),
+            )
+        )
+
+    assert session_factory.sessions[0].commit_count == 1
+    assert session_factory.sessions[0].rollback_count == 1
+    assert store.versions == []
+    assert store.project.current_version_id is None
 
 
 def test_get_project_version_snapshot_reads_exact_pair_and_rolls_back(

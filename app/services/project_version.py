@@ -1402,7 +1402,6 @@ async def create_project_version(
                 project_version,
             )
             project.current_version_id = project_version.id
-            await write_session.commit()
             authenticated_result = authenticate_project_version_snapshot(
                 _to_create_result(
                     _build_snapshot_from_row(project_version, is_current=True),
@@ -1411,6 +1410,7 @@ async def create_project_version(
             )
             if not isinstance(authenticated_result, ProjectVersionCreateResult):
                 raise ProjectVersionInvariantError("project_version_snapshot_invalid")
+            await write_session.commit()
             return authenticated_result
         except IntegrityError as error:
             constraint_name = _get_integrity_constraint_name(error)
