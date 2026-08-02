@@ -35,6 +35,12 @@ from app.services.dynamic_schema_projection import (
     project_current_dynamic_schema,
     project_dynamic_schema_version,
 )
+from app.services.dynamic_schema_ufl_projection import (
+    DynamicSchemaUFLProjectionError,
+    DynamicSchemaUFLProjectionInvariantError,
+    DynamicSchemaUFLProjectionStateError,
+    project_orchestration_ufl_to_dynamic_schema,
+)
 from app.services.fact import (
     FactIdentityConflictError,
     FactNotFoundError,
@@ -171,6 +177,9 @@ __all__ = [
     "DynamicSchemaProjectionError",
     "DynamicSchemaProjectionNotFoundError",
     "ProjectionStateCorruptionError",
+    "DynamicSchemaUFLProjectionError",
+    "DynamicSchemaUFLProjectionStateError",
+    "DynamicSchemaUFLProjectionInvariantError",
     "DynamicSchemaPermissionError",
     "DynamicSchemaProjectNotFoundError",
     "DynamicSchemaIdentityMismatchError",
@@ -196,6 +205,7 @@ __all__ = [
     "activate_dynamic_schema_version",
     "project_dynamic_schema_version",
     "project_current_dynamic_schema",
+    "project_orchestration_ufl_to_dynamic_schema",
     "create_human_schema_draft",
     "propose_ai_schema_version",
     "FactProposalError",
