@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 import inspect
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import uuid
 
 import pytest
@@ -55,6 +55,30 @@ class SentinelObject:
 
     def __repr__(self) -> str:
         return self.sentinel
+
+
+class RollbackGuardedObject:
+    def __init__(self, session_ref: dict[str, object], **attrs: object) -> None:
+        object.__setattr__(self, "_session_ref", session_ref)
+        object.__setattr__(self, "_attrs", dict(attrs))
+
+    def __getattribute__(self, name: str) -> object:
+        if name in {"_session_ref", "_attrs", "__class__", "__dict__", "__repr__"}:
+            return object.__getattribute__(self, name)
+        session_ref = object.__getattribute__(self, "_session_ref")
+        session = session_ref.get("session")
+        if session is not None and getattr(session, "rollback_count", 0) > 0:
+            raise RuntimeError("orm_attribute_expired_after_rollback")
+        attrs = object.__getattribute__(self, "_attrs")
+        if name in attrs:
+            return attrs[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        self._attrs[name] = value
+
+    def __repr__(self) -> str:
+        return f"RollbackGuardedObject({self._attrs!r})"
 
 
 def _project(project_id: uuid.UUID | None = None):
@@ -238,6 +262,8 @@ def _install_repository(
     fields=None,
     active_versions=None,
     capture: dict[str, object] | None = None,
+    schema_lookup_id: object | None = None,
+    version_lookup_id: object | None = None,
 ) -> None:
     async def fake_get_project_by_id(_session, *, project_id):
         if capture is not None:
@@ -246,17 +272,25 @@ def _install_repository(
             return project
         return None
 
-    async def fake_get_dynamic_schema_by_id(_session, *, schema_id):
+    async def fake_get_dynamic_schema_by_id_with_project(_session, *, schema_id, project_id=None):
         if capture is not None:
             capture.setdefault("schema_ids", []).append(schema_id)
-        if schema is not None and schema_id == schema.id:
+            capture.setdefault("schema_project_ids", []).append(project_id)
+        if (
+            schema is not None
+            and schema_id == (schema_lookup_id if schema_lookup_id is not None else schema.id)
+            and (project_id is None or project_id == schema.project_id)
+        ):
             return schema
         return None
 
     async def fake_get_dynamic_schema_version_by_id(_session, *, schema_version_id):
         if capture is not None:
             capture.setdefault("version_ids", []).append(schema_version_id)
-        if version is not None and schema_version_id == version.id:
+        if (
+            version is not None
+            and schema_version_id == (version_lookup_id if version_lookup_id is not None else version.id)
+        ):
             return version
         return None
 
@@ -282,7 +316,7 @@ def _install_repository(
     monkeypatch.setattr(
         projection_service.projection_repository,
         "get_dynamic_schema_by_id",
-        fake_get_dynamic_schema_by_id,
+        fake_get_dynamic_schema_by_id_with_project,
     )
     monkeypatch.setattr(
         projection_service.projection_repository,
@@ -404,6 +438,254 @@ def test_get_current_dynamic_schema_definition_snapshot_follows_current_version_
     assert snapshot.schema_version_id == fixture["current_version"].id
     assert snapshot.schema_version_id != higher_version.id
     assert capture["version_ids"] == [fixture["current_version"].id]
+
+
+def test_get_current_dynamic_schema_definition_snapshot_uses_single_session_without_calling_version_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        requested_status="active",
+        current_status="active",
+        current_points_to_requested=False,
+    )
+    current_fields = [
+        _field(
+            schema_version_id=fixture["current_version"].id,
+            seed="current-title",
+            field_key="title",
+            display_order=0,
+            is_title=True,
+        ),
+        _field(
+            schema_version_id=fixture["current_version"].id,
+            seed="current-summary",
+            field_key="summary",
+            display_order=1,
+            is_summary=True,
+        ),
+    ]
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["current_version"],
+        fields=current_fields,
+        active_versions=[fixture["current_version"]],
+    )
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("current entry must not call version entry")
+
+    monkeypatch.setattr(
+        projection_service,
+        "get_dynamic_schema_definition_snapshot",
+        fail_if_called,
+    )
+
+    snapshot = run_async(
+        projection_service.get_current_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+        )
+    )
+
+    assert snapshot.is_current is True
+    assert len(factory.sessions) == 1
+    assert factory.sessions[0].commit_count == 0
+    assert factory.sessions[0].rollback_count == 1
+
+
+def test_get_current_dynamic_schema_definition_snapshot_builds_dto_before_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_ref: dict[str, object] = {}
+    project = _project()
+    current_version_id = _uuid("guarded-current-version")
+    schema = RollbackGuardedObject(
+        session_ref,
+        id=_uuid("guarded-schema"),
+        project_id=project.id,
+        schema_key="profile.main",
+        name="Profile Main",
+        subject_kind="person",
+        description="Main profile",
+        status="active",
+        current_version_id=current_version_id,
+    )
+    version = RollbackGuardedObject(
+        session_ref,
+        id=current_version_id,
+        schema_id=schema.id,
+        version_no=1,
+        status="active",
+        source_kind="human",
+        summary="Schema summary",
+        layout_config={"sections": ["main"]},
+        created_by_id=_uuid("guarded-created-by"),
+        activated_by_id=_uuid("guarded-activated-by"),
+        activated_at=datetime(2026, 8, 2, 10, 0, tzinfo=timezone.utc),
+    )
+    fields = [
+        RollbackGuardedObject(
+            session_ref,
+            id=_uuid("guarded-field-title"),
+            schema_version_id=current_version_id,
+            field_key="title",
+            label="Title",
+            description=None,
+            predicate_key="person.title",
+            scope_key=None,
+            expected_value_type="string",
+            cardinality="one",
+            is_required=True,
+            is_title=True,
+            is_summary=False,
+            is_hidden=False,
+            group_key=None,
+            display_order=0,
+            display_config={"nested": {"tags": ["a", "b"]}},
+            validation_rules={"max_length": 100},
+            created_at=datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc),
+        ),
+    ]
+    factory = SessionFactory()
+
+    async def fake_get_project_by_id(_session, *, project_id):
+        session_ref["session"] = _session
+        if project_id == project.id:
+            return project
+        return None
+
+    async def fake_get_dynamic_schema_by_id(_session, *, schema_id, project_id=None):
+        session_ref["session"] = _session
+        if schema_id == schema.id and (project_id is None or project_id == project.id):
+            return schema
+        return None
+
+    async def fake_get_dynamic_schema_version_by_id(_session, *, schema_version_id):
+        session_ref["session"] = _session
+        if schema_version_id == version.id:
+            return version
+        return None
+
+    async def fake_list_fields(_session, *, schema_version_id):
+        session_ref["session"] = _session
+        if schema_version_id == version.id:
+            return list(fields)
+        return []
+
+    async def fake_list_active_versions(_session, *, schema_id):
+        session_ref["session"] = _session
+        if schema_id == schema.id:
+            return [version]
+        return []
+
+    monkeypatch.setattr(
+        projection_service.projection_repository,
+        "get_project_by_id",
+        fake_get_project_by_id,
+    )
+    monkeypatch.setattr(
+        projection_service.projection_repository,
+        "get_dynamic_schema_by_id",
+        fake_get_dynamic_schema_by_id,
+    )
+    monkeypatch.setattr(
+        projection_service.projection_repository,
+        "get_dynamic_schema_version_by_id",
+        fake_get_dynamic_schema_version_by_id,
+    )
+    monkeypatch.setattr(
+        projection_service.projection_repository,
+        "list_dynamic_schema_fields_by_version_id",
+        fake_list_fields,
+    )
+    monkeypatch.setattr(
+        projection_service.projection_repository,
+        "list_active_dynamic_schema_versions",
+        fake_list_active_versions,
+    )
+
+    snapshot = run_async(
+        projection_service.get_current_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=project.id,
+            schema_id=schema.id,
+        )
+    )
+
+    assert snapshot.schema_version_id == current_version_id
+    assert snapshot.fields[0].field_key == "title"
+    assert factory.sessions[0].rollback_count == 1
+
+
+@pytest.mark.parametrize(
+    ("current_version_id", "active_versions"),
+    [
+        (None, []),
+        (_uuid("current-missing-active"), []),
+        (
+            _uuid("current-pointer-drift"),
+            [
+                _version(
+                    schema_id=_uuid("other-schema"),
+                    version_id=_uuid("active-foreign"),
+                    status="active",
+                    activated_by_id=_uuid("active-by"),
+                    activated_at=datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc),
+                )
+            ],
+        ),
+    ],
+)
+def test_get_current_dynamic_schema_definition_snapshot_rejects_current_pointer_or_active_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    current_version_id: uuid.UUID | None,
+    active_versions: list[object],
+) -> None:
+    fixture = _fixture(
+        requested_status="active",
+        current_status="active",
+        current_points_to_requested=False,
+    )
+    fixture["schema"].current_version_id = current_version_id
+    if current_version_id is not None:
+        fixture["current_version"].id = current_version_id
+        fixture["current_version"].schema_id = fixture["schema"].id
+    current_fields = [
+        _field(
+            schema_version_id=current_version_id or fixture["current_version"].id,
+            seed="current-title",
+            field_key="title",
+            display_order=0,
+            is_title=True,
+        )
+    ]
+    for active_version in active_versions:
+        active_version.schema_id = fixture["schema"].id
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["current_version"] if current_version_id is not None else None,
+        fields=current_fields,
+        active_versions=active_versions,
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match="dynamic_schema_definition_snapshot_current_state_invalid",
+    ):
+        run_async(
+            projection_service.get_current_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -566,6 +848,68 @@ def test_get_dynamic_schema_definition_snapshot_rejects_invalid_field_contracts(
         )
 
 
+@pytest.mark.parametrize("field_name", ["is_required", "is_title", "is_summary", "is_hidden"])
+@pytest.mark.parametrize("invalid_value", ["false", "true", 0, 1])
+def test_get_dynamic_schema_definition_snapshot_rejects_non_bool_field_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    fixture = _fixture(requested_status="draft")
+    setattr(fixture["fields"][0], field_name, invalid_value)
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[],
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match="dynamic_schema_definition_snapshot_field_invalid",
+    ):
+        run_async(
+            projection_service.get_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+                schema_version_id=fixture["requested_version"].id,
+            )
+        )
+
+
+def test_get_dynamic_schema_definition_snapshot_rejects_bool_display_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(requested_status="draft")
+    fixture["fields"][0].display_order = True
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[],
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match="dynamic_schema_definition_snapshot_field_invalid",
+    ):
+        run_async(
+            projection_service.get_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+                schema_version_id=fixture["requested_version"].id,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("status", "activated_by_id", "activated_at", "expected_code"),
     [
@@ -628,6 +972,127 @@ def test_get_dynamic_schema_definition_snapshot_rejects_invalid_version_activati
 
 
 @pytest.mark.parametrize(
+    ("mutator", "use_current_entry", "expected_code"),
+    [
+        (
+            lambda fixture: setattr(fixture["schema"], "id", "not-a-uuid"),
+            False,
+            "dynamic_schema_definition_snapshot_schema_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["schema"], "project_id", "not-a-uuid"),
+            False,
+            "dynamic_schema_definition_snapshot_schema_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["schema"], "current_version_id", "not-a-uuid"),
+            True,
+            "dynamic_schema_definition_snapshot_schema_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["requested_version"], "id", "not-a-uuid"),
+            False,
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["requested_version"], "schema_id", "not-a-uuid"),
+            False,
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["requested_version"], "created_by_id", "not-a-uuid"),
+            False,
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            lambda fixture: setattr(
+                fixture["requested_version"],
+                "activated_at",
+                datetime(2026, 8, 2, 8, 0),
+            ),
+            False,
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["fields"][0], "id", "not-a-uuid"),
+            False,
+            "dynamic_schema_definition_snapshot_field_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["fields"][0], "schema_version_id", "not-a-uuid"),
+            False,
+            "dynamic_schema_definition_snapshot_field_invalid",
+        ),
+        (
+            lambda fixture: setattr(
+                fixture["fields"][0],
+                "created_at",
+                datetime(2026, 8, 2, 12, 0),
+            ),
+            False,
+            "dynamic_schema_definition_snapshot_field_invalid",
+        ),
+    ],
+)
+def test_get_dynamic_schema_definition_snapshot_rejects_invalid_identity_or_datetime_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    mutator,
+    use_current_entry: bool,
+    expected_code: str,
+) -> None:
+    requested_schema_id = _uuid("requested-schema-id")
+    requested_version_id = _uuid("requested-version-id")
+    fixture = _fixture(
+        requested_status="active" if use_current_entry else "draft",
+        current_status="active" if use_current_entry else None,
+        current_points_to_requested=True if use_current_entry else False,
+    )
+    fixture["schema"].id = requested_schema_id
+    fixture["requested_version"].id = requested_version_id
+    fixture["requested_version"].schema_id = requested_schema_id
+    for field in fixture["fields"]:
+        field.schema_version_id = requested_version_id
+    if use_current_entry:
+        fixture["current_version"] = fixture["requested_version"]
+        fixture["active_versions"] = [fixture["requested_version"]]
+        fixture["schema"].current_version_id = requested_version_id
+    mutator(fixture)
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=fixture["active_versions"],
+        schema_lookup_id=requested_schema_id,
+        version_lookup_id=requested_version_id,
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match=expected_code,
+    ):
+        if use_current_entry:
+            run_async(
+                projection_service.get_current_dynamic_schema_definition_snapshot(
+                    factory,
+                    project_id=fixture["project"].id,
+                        schema_id=requested_schema_id,
+                )
+            )
+        else:
+            run_async(
+                projection_service.get_dynamic_schema_definition_snapshot(
+                    factory,
+                    project_id=fixture["project"].id,
+                    schema_id=requested_schema_id,
+                    schema_version_id=requested_version_id,
+                )
+            )
+
+
+@pytest.mark.parametrize(
     "invalid_config",
     [
         {"bad": float("nan")},
@@ -668,6 +1133,56 @@ def test_get_dynamic_schema_definition_snapshot_rejects_invalid_json_configs_wit
         )
 
     assert "SENSITIVE_DYNAMIC_SCHEMA_SENTINEL" not in str(exc_info.value)
+
+
+def test_get_dynamic_schema_definition_snapshot_returns_deeply_immutable_nested_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(requested_status="active", current_status="active")
+    fixture["requested_version"].layout_config = {
+        "sections": [
+            {"name": "main", "widgets": ["title", "summary"]},
+            {"name": "meta", "widgets": []},
+        ]
+    }
+    fixture["fields"][0].display_config = {
+        "options": {"badges": ["primary", "secondary"]},
+    }
+    fixture["fields"][0].validation_rules = {
+        "constraints": {"max_length": 100},
+    }
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[fixture["requested_version"]],
+    )
+
+    snapshot = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
+        )
+    )
+
+    assert isinstance(snapshot.layout_config, MappingProxyType)
+    assert isinstance(snapshot.layout_config["sections"], tuple)
+    assert isinstance(snapshot.layout_config["sections"][0], MappingProxyType)
+    summary_field = next(field for field in snapshot.fields if field.field_key == "summary")
+    assert isinstance(summary_field.display_config, MappingProxyType)
+    assert isinstance(summary_field.display_config["options"], MappingProxyType)
+    assert isinstance(summary_field.display_config["options"]["badges"], tuple)
+    with pytest.raises(TypeError):
+        snapshot.layout_config["sections"] = ()
+    with pytest.raises(TypeError):
+        summary_field.display_config["options"] = {}
+    with pytest.raises(AttributeError):
+        summary_field.display_config["options"]["badges"].append("x")
 
 
 def test_get_dynamic_schema_definition_snapshot_orders_fields_and_manifest_deterministically(
@@ -754,6 +1269,34 @@ def test_get_dynamic_schema_definition_snapshot_manifest_changes_when_definition
     )
 
     assert baseline.definition_manifest_hash != changed.definition_manifest_hash
+
+
+def test_get_dynamic_schema_definition_snapshot_preserves_golden_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(requested_status="active", current_status="active")
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[fixture["requested_version"]],
+    )
+
+    snapshot = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
+        )
+    )
+
+    assert snapshot.algorithm_name == "dynamic_schema_definition_snapshot"
+    assert snapshot.algorithm_version == "1.0.0"
+    assert snapshot.definition_manifest_hash == "63627d6cad9cc68b4088715e33d4d0dca787f0428ddbbc2a905162cd0bf3e961"
 
 
 def test_get_dynamic_schema_definition_snapshot_returns_frozen_dto_without_orm_objects(

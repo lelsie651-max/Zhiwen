@@ -151,6 +151,56 @@ def _require_uuid(value: object, *, field_name: str) -> uuid.UUID:
     return value
 
 
+def _require_record_uuid(value: object, *, error_code: str) -> uuid.UUID:
+    if not isinstance(value, uuid.UUID):
+        raise DynamicSchemaDefinitionSnapshotInvariantError(error_code)
+    return value
+
+
+def _require_optional_record_uuid(
+    value: object | None,
+    *,
+    error_code: str,
+) -> uuid.UUID | None:
+    if value is None:
+        return None
+    return _require_record_uuid(value, error_code=error_code)
+
+
+def _require_strict_bool(value: object, *, error_code: str) -> bool:
+    if type(value) is not bool:
+        raise DynamicSchemaDefinitionSnapshotInvariantError(error_code)
+    return value
+
+
+def _require_strict_int(value: object, *, error_code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DynamicSchemaDefinitionSnapshotInvariantError(error_code)
+    return value
+
+
+def _require_aware_datetime(
+    value: object,
+    *,
+    error_code: str,
+) -> datetime:
+    if not isinstance(value, datetime):
+        raise DynamicSchemaDefinitionSnapshotInvariantError(error_code)
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        raise DynamicSchemaDefinitionSnapshotInvariantError(error_code)
+    return value
+
+
+def _require_optional_aware_datetime(
+    value: object | None,
+    *,
+    error_code: str,
+) -> datetime | None:
+    if value is None:
+        return None
+    return _require_aware_datetime(value, error_code=error_code)
+
+
 def _freeze_json_value(value: Any) -> object:
     if value is None or isinstance(value, bool | int | str):
         return value
@@ -197,6 +247,23 @@ def _validate_json_config(value: object) -> object:
         raise DynamicSchemaDefinitionSnapshotInvariantError(
             "dynamic_schema_definition_snapshot_json_config_invalid"
         ) from None
+    return frozen
+
+
+def _validate_mapping_json_config(value: object) -> object:
+    if not isinstance(value, Mapping):
+        raise DynamicSchemaDefinitionSnapshotInvariantError(
+            "dynamic_schema_definition_snapshot_json_config_invalid"
+        )
+    if any(not isinstance(key, str) for key in value.keys()):
+        raise DynamicSchemaDefinitionSnapshotInvariantError(
+            "dynamic_schema_definition_snapshot_json_config_invalid"
+        )
+    frozen = _validate_json_config(value)
+    if not isinstance(frozen, Mapping):
+        raise DynamicSchemaDefinitionSnapshotInvariantError(
+            "dynamic_schema_definition_snapshot_json_config_invalid"
+        )
     return frozen
 
 
@@ -450,6 +517,18 @@ def _build_projected_value(fact: Fact) -> ProjectedValue:
 
 
 def _validate_schema_record(schema: DynamicSchema) -> DynamicSchemaIdentityInput:
+    _require_record_uuid(
+        schema.id,
+        error_code="dynamic_schema_definition_snapshot_schema_invalid",
+    )
+    _require_record_uuid(
+        schema.project_id,
+        error_code="dynamic_schema_definition_snapshot_schema_invalid",
+    )
+    _require_optional_record_uuid(
+        schema.current_version_id,
+        error_code="dynamic_schema_definition_snapshot_schema_invalid",
+    )
     try:
         identity = DynamicSchemaIdentityInput(
             schema_key=schema.schema_key,
@@ -486,7 +565,30 @@ def _validate_version_record(
     field_inputs: list[DynamicSchemaFieldInput],
     layout_config: object,
 ) -> DynamicSchemaVersionInput:
-    if isinstance(version.version_no, bool) or not isinstance(version.version_no, int) or version.version_no <= 0:
+    _require_record_uuid(
+        version.id,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    )
+    _require_record_uuid(
+        version.schema_id,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    )
+    _require_optional_record_uuid(
+        version.created_by_id,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    )
+    _require_optional_record_uuid(
+        version.activated_by_id,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    )
+    _require_optional_aware_datetime(
+        version.activated_at,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    )
+    if _require_strict_int(
+        version.version_no,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    ) <= 0:
         raise DynamicSchemaDefinitionSnapshotInvariantError(
             "dynamic_schema_definition_snapshot_version_invalid"
         )
@@ -552,12 +654,58 @@ def _validate_field_records(
     validated_field_inputs: list[DynamicSchemaFieldInput] = []
     field_snapshots: list[DynamicSchemaFieldDefinitionSnapshot] = []
     for field in fields:
-        if field.schema_version_id != expected_schema_version_id:
+        field_id = _require_record_uuid(
+            field.id,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
+        field_schema_version_id = _require_record_uuid(
+            field.schema_version_id,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
+        if field_schema_version_id != expected_schema_version_id:
             raise DynamicSchemaDefinitionSnapshotInvariantError(
                 "dynamic_schema_definition_snapshot_field_invalid"
             )
-        display_config = _validate_json_config(field.display_config)
-        validation_rules = _validate_json_config(field.validation_rules)
+        display_config = _validate_mapping_json_config(field.display_config)
+        validation_rules = _validate_mapping_json_config(field.validation_rules)
+        expected_value_type = field.expected_value_type
+        cardinality = field.cardinality
+        if not isinstance(expected_value_type, str) or expected_value_type not in {
+            member.value for member in DynamicSchemaFieldValueType
+        }:
+            raise DynamicSchemaDefinitionSnapshotInvariantError(
+                "dynamic_schema_definition_snapshot_field_invalid"
+            )
+        if not isinstance(cardinality, str) or cardinality not in {
+            member.value for member in DynamicSchemaFieldCardinality
+        }:
+            raise DynamicSchemaDefinitionSnapshotInvariantError(
+                "dynamic_schema_definition_snapshot_field_invalid"
+            )
+        is_required = _require_strict_bool(
+            field.is_required,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
+        is_title = _require_strict_bool(
+            field.is_title,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
+        is_summary = _require_strict_bool(
+            field.is_summary,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
+        is_hidden = _require_strict_bool(
+            field.is_hidden,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
+        display_order = _require_strict_int(
+            field.display_order,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
+        created_at = _require_aware_datetime(
+            field.created_at,
+            error_code="dynamic_schema_definition_snapshot_field_invalid",
+        )
         try:
             field_input = DynamicSchemaFieldInput(
                 field_key=field.field_key,
@@ -565,14 +713,14 @@ def _validate_field_records(
                 description=field.description,
                 predicate_key=field.predicate_key,
                 scope_key=field.scope_key,
-                expected_value_type=field.expected_value_type,
-                cardinality=field.cardinality,
-                is_required=field.is_required,
-                is_title=field.is_title,
-                is_summary=field.is_summary,
-                is_hidden=field.is_hidden,
+                expected_value_type=expected_value_type,
+                cardinality=cardinality,
+                is_required=is_required,
+                is_title=is_title,
+                is_summary=is_summary,
+                is_hidden=is_hidden,
                 group_key=field.group_key,
-                display_order=field.display_order,
+                display_order=display_order,
                 display_config=display_config,
                 validation_rules=validation_rules,
             )
@@ -586,10 +734,16 @@ def _validate_field_records(
             or field_input.description != field.description
             or field_input.predicate_key != field.predicate_key
             or field_input.scope_key != field.scope_key
-            or field_input.expected_value_type.value != field.expected_value_type
-            or field_input.cardinality.value != field.cardinality
+            or field_input.expected_value_type.value != expected_value_type
+            or field_input.cardinality.value != cardinality
+            or field_input.is_required is not is_required
+            or field_input.is_title is not is_title
+            or field_input.is_summary is not is_summary
+            or field_input.is_hidden is not is_hidden
             or field_input.group_key != field.group_key
-            or field_input.display_order != field.display_order
+            or field_input.display_order != display_order
+            or field_input.display_config != display_config
+            or field_input.validation_rules != validation_rules
         ):
             raise DynamicSchemaDefinitionSnapshotInvariantError(
                 "dynamic_schema_definition_snapshot_field_invalid"
@@ -597,27 +751,24 @@ def _validate_field_records(
         validated_field_inputs.append(field_input)
         field_snapshots.append(
             DynamicSchemaFieldDefinitionSnapshot(
-                field_id=_require_uuid(field.id, field_name="field_id"),
-                schema_version_id=_require_uuid(
-                    field.schema_version_id,
-                    field_name="field_schema_version_id",
-                ),
+                field_id=field_id,
+                schema_version_id=field_schema_version_id,
                 field_key=field.field_key,
                 label=field.label,
                 description=field.description,
                 predicate_key=field.predicate_key,
                 scope_key=field.scope_key,
-                expected_value_type=field.expected_value_type,
-                cardinality=field.cardinality,
-                is_required=field.is_required,
-                is_title=field.is_title,
-                is_summary=field.is_summary,
-                is_hidden=field.is_hidden,
+                expected_value_type=expected_value_type,
+                cardinality=cardinality,
+                is_required=is_required,
+                is_title=is_title,
+                is_summary=is_summary,
+                is_hidden=is_hidden,
                 group_key=field.group_key,
-                display_order=field.display_order,
+                display_order=display_order,
                 display_config=display_config,
                 validation_rules=validation_rules,
-                created_at=field.created_at,
+                created_at=created_at,
             )
         )
     ordered_field_snapshots = tuple(
@@ -636,6 +787,22 @@ def _validate_current_state(
     active_versions: Sequence[DynamicSchemaVersion],
 ) -> bool:
     for active_version in active_versions:
+        _require_record_uuid(
+            active_version.id,
+            error_code="dynamic_schema_definition_snapshot_current_state_invalid",
+        )
+        _require_record_uuid(
+            active_version.schema_id,
+            error_code="dynamic_schema_definition_snapshot_current_state_invalid",
+        )
+        _require_optional_record_uuid(
+            active_version.activated_by_id,
+            error_code="dynamic_schema_definition_snapshot_current_state_invalid",
+        )
+        _require_optional_aware_datetime(
+            active_version.activated_at,
+            error_code="dynamic_schema_definition_snapshot_current_state_invalid",
+        )
         if (
             active_version.schema_id != schema.id
             or active_version.status != DynamicSchemaVersionStatus.ACTIVE.value
@@ -692,6 +859,18 @@ def _build_snapshot(
     active_versions: Sequence[DynamicSchemaVersion],
 ) -> DynamicSchemaDefinitionSnapshot:
     _validate_schema_record(schema)
+    schema_id = _require_record_uuid(
+        schema.id,
+        error_code="dynamic_schema_definition_snapshot_schema_invalid",
+    )
+    schema_project_id = _require_record_uuid(
+        schema.project_id,
+        error_code="dynamic_schema_definition_snapshot_schema_invalid",
+    )
+    if schema_project_id != project_id:
+        raise DynamicSchemaDefinitionSnapshotInvariantError(
+            "dynamic_schema_definition_snapshot_schema_invalid"
+        )
     layout_config = _validate_json_config(version.layout_config)
     validated_field_inputs, field_snapshots = _validate_field_records(
         fields,
@@ -702,6 +881,18 @@ def _build_snapshot(
         field_inputs=validated_field_inputs,
         layout_config=layout_config,
     )
+    version_id = _require_record_uuid(
+        version.id,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    )
+    version_schema_id = _require_record_uuid(
+        version.schema_id,
+        error_code="dynamic_schema_definition_snapshot_version_invalid",
+    )
+    if version_schema_id != schema_id:
+        raise DynamicSchemaDefinitionSnapshotInvariantError(
+            "dynamic_schema_definition_snapshot_version_invalid"
+        )
     is_current = _validate_current_state(
         schema=schema,
         version=version,
@@ -709,13 +900,13 @@ def _build_snapshot(
     )
     snapshot = DynamicSchemaDefinitionSnapshot(
         project_id=project_id,
-        schema_id=schema.id,
+        schema_id=schema_id,
         schema_key=schema.schema_key,
         name=schema.name,
         subject_kind=schema.subject_kind,
         description=schema.description,
         schema_status=schema.status,
-        schema_version_id=version.id,
+        schema_version_id=version_id,
         version_no=version.version_no,
         version_status=version.status,
         source_kind=version.source_kind,
@@ -757,6 +948,118 @@ def _build_snapshot(
     )
 
 
+async def _get_dynamic_schema_definition_snapshot_in_session(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    schema_id: uuid.UUID,
+    schema_version_id: uuid.UUID | None = None,
+    current_only: bool,
+) -> DynamicSchemaDefinitionSnapshot:
+    project = await projection_repository.get_project_by_id(
+        session,
+        project_id=project_id,
+    )
+    if project is None:
+        raise DynamicSchemaDefinitionSnapshotNotFoundError(
+            "dynamic_schema_definition_snapshot_project_not_found"
+        )
+
+    schema = await projection_repository.get_dynamic_schema_by_id(
+        session,
+        schema_id=schema_id,
+    )
+    if schema is None:
+        raise DynamicSchemaDefinitionSnapshotNotFoundError(
+            "dynamic_schema_definition_snapshot_schema_not_found"
+        )
+    schema_record_id = _require_record_uuid(
+        schema.id,
+        error_code="dynamic_schema_definition_snapshot_schema_invalid",
+    )
+    schema_project_id = _require_record_uuid(
+        schema.project_id,
+        error_code="dynamic_schema_definition_snapshot_schema_invalid",
+    )
+    if schema_project_id != project_id:
+        raise DynamicSchemaDefinitionSnapshotNotFoundError(
+            "dynamic_schema_definition_snapshot_schema_not_found"
+        )
+
+    if current_only:
+        current_version_id = _require_optional_record_uuid(
+            schema.current_version_id,
+            error_code="dynamic_schema_definition_snapshot_schema_invalid",
+        )
+        if current_version_id is None:
+            raise DynamicSchemaDefinitionSnapshotInvariantError(
+                "dynamic_schema_definition_snapshot_current_state_invalid"
+            )
+        version = await projection_repository.get_dynamic_schema_version_by_id(
+            session,
+            schema_version_id=current_version_id,
+        )
+        if version is None:
+            raise DynamicSchemaDefinitionSnapshotInvariantError(
+                "dynamic_schema_definition_snapshot_current_state_invalid"
+            )
+        _require_record_uuid(
+            version.id,
+            error_code="dynamic_schema_definition_snapshot_version_invalid",
+        )
+        version_schema_id = _require_record_uuid(
+            version.schema_id,
+            error_code="dynamic_schema_definition_snapshot_version_invalid",
+        )
+        if version_schema_id != schema_record_id:
+            raise DynamicSchemaDefinitionSnapshotInvariantError(
+                "dynamic_schema_definition_snapshot_current_state_invalid"
+            )
+    else:
+        assert schema_version_id is not None
+        version = await projection_repository.get_dynamic_schema_version_by_id(
+            session,
+            schema_version_id=schema_version_id,
+        )
+        if version is None:
+            raise DynamicSchemaDefinitionSnapshotNotFoundError(
+                "dynamic_schema_definition_snapshot_version_not_found"
+            )
+        _require_record_uuid(
+            version.id,
+            error_code="dynamic_schema_definition_snapshot_version_invalid",
+        )
+        version_schema_id = _require_record_uuid(
+            version.schema_id,
+            error_code="dynamic_schema_definition_snapshot_version_invalid",
+        )
+        if version_schema_id != schema_record_id:
+            raise DynamicSchemaDefinitionSnapshotNotFoundError(
+                "dynamic_schema_definition_snapshot_version_not_found"
+            )
+
+    fields = await projection_repository.list_dynamic_schema_fields_by_version_id(
+        session,
+        schema_version_id=version.id,
+    )
+    active_versions = await projection_repository.list_active_dynamic_schema_versions(
+        session,
+        schema_id=schema_record_id,
+    )
+    snapshot = _build_snapshot(
+        project_id=project_id,
+        schema=schema,
+        version=version,
+        fields=fields,
+        active_versions=active_versions,
+    )
+    if current_only and snapshot.is_current is not True:
+        raise DynamicSchemaDefinitionSnapshotInvariantError(
+            "dynamic_schema_definition_snapshot_current_state_invalid"
+        )
+    return snapshot
+
+
 async def get_dynamic_schema_definition_snapshot(
     session_factory: Callable[[], AsyncSession],
     *,
@@ -769,44 +1072,12 @@ async def get_dynamic_schema_definition_snapshot(
     schema_version_id = _require_uuid(schema_version_id, field_name="schema_version_id")
     async with session_factory() as session:
         try:
-            project = await projection_repository.get_project_by_id(
+            return await _get_dynamic_schema_definition_snapshot_in_session(
                 session,
                 project_id=project_id,
-            )
-            if project is None:
-                raise DynamicSchemaDefinitionSnapshotNotFoundError(
-                    "dynamic_schema_definition_snapshot_project_not_found"
-                )
-            schema = await projection_repository.get_dynamic_schema_by_id(
-                session,
                 schema_id=schema_id,
-            )
-            if schema is None or schema.project_id != project_id:
-                raise DynamicSchemaDefinitionSnapshotNotFoundError(
-                    "dynamic_schema_definition_snapshot_schema_not_found"
-                )
-            version = await projection_repository.get_dynamic_schema_version_by_id(
-                session,
                 schema_version_id=schema_version_id,
-            )
-            if version is None or version.schema_id != schema.id:
-                raise DynamicSchemaDefinitionSnapshotNotFoundError(
-                    "dynamic_schema_definition_snapshot_version_not_found"
-                )
-            fields = await projection_repository.list_dynamic_schema_fields_by_version_id(
-                session,
-                schema_version_id=version.id,
-            )
-            active_versions = await projection_repository.list_active_dynamic_schema_versions(
-                session,
-                schema_id=schema.id,
-            )
-            return _build_snapshot(
-                project_id=project_id,
-                schema=schema,
-                version=version,
-                fields=fields,
-                active_versions=active_versions,
+                current_only=False,
             )
         finally:
             await session.rollback()
@@ -822,31 +1093,11 @@ async def get_current_dynamic_schema_definition_snapshot(
     schema_id = _require_uuid(schema_id, field_name="schema_id")
     async with session_factory() as session:
         try:
-            project = await projection_repository.get_project_by_id(
+            return await _get_dynamic_schema_definition_snapshot_in_session(
                 session,
                 project_id=project_id,
-            )
-            if project is None:
-                raise DynamicSchemaDefinitionSnapshotNotFoundError(
-                    "dynamic_schema_definition_snapshot_project_not_found"
-                )
-            schema = await projection_repository.get_dynamic_schema_by_id(
-                session,
                 schema_id=schema_id,
+                current_only=True,
             )
-            if schema is None or schema.project_id != project_id:
-                raise DynamicSchemaDefinitionSnapshotNotFoundError(
-                    "dynamic_schema_definition_snapshot_schema_not_found"
-                )
-            if schema.current_version_id is None:
-                raise DynamicSchemaDefinitionSnapshotInvariantError(
-                    "dynamic_schema_definition_snapshot_current_state_invalid"
-                )
         finally:
             await session.rollback()
-    return await get_dynamic_schema_definition_snapshot(
-        session_factory,
-        project_id=project_id,
-        schema_id=schema_id,
-        schema_version_id=schema.current_version_id,
-    )
