@@ -1,333 +1,284 @@
-import asyncio
-import inspect
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
+import inspect
+from types import SimpleNamespace
 import uuid
 
 import pytest
-from sqlalchemy.orm import joinedload as sa_joinedload
-from sqlalchemy.orm import selectinload as sa_selectinload
 
-from app.models.document_content import DocumentBlock, ExtractionRun, SourceEvidence
-from app.models.dynamic_schema import DynamicSchema, DynamicSchemaField, DynamicSchemaVersion
-from app.models.fact import Fact, FactEvidenceLink, FactValue
-from app.models.project import Project
-from app.schemas.dynamic_schema_projection import DynamicSchemaProjection
 from app.services import dynamic_schema_projection as projection_service
 
 
 def run_async(awaitable):
+    import asyncio
+
     return asyncio.run(awaitable)
 
 
-class ReadOnlySession:
-    async def execute(self, *_args, **_kwargs):
-        raise AssertionError("execute should be mocked in read-only tests")
-
-    async def commit(self):
-        raise AssertionError("projection service must not commit")
-
-    async def rollback(self):
-        raise AssertionError("projection service must not rollback")
-
-    async def flush(self):
-        raise AssertionError("projection service must not flush")
-
-    def add(self, *_args, **_kwargs):
-        raise AssertionError("projection service must not add objects")
-
-    def add_all(self, *_args, **_kwargs):
-        raise AssertionError("projection service must not add objects")
+def _uuid(seed: str) -> uuid.UUID:
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"dynamic-schema-projection:{seed}")
 
 
-class StubSchemaWithoutCurrentVersion:
-    def __init__(
-        self,
-        *,
-        project_id: uuid.UUID,
-        schema_id: uuid.UUID | None = None,
-        current_version_id: uuid.UUID | None = None,
-        status: str = "active",
-    ) -> None:
-        self.id = schema_id or uuid.uuid4()
-        self.project_id = project_id
-        self.schema_key = "profile.main"
-        self.name = "Profile Main"
-        self.subject_kind = "person"
-        self.description = "Profile"
-        self.status = status
-        self.current_version_id = current_version_id
+class FakeSession:
+    def __init__(self) -> None:
+        self.commit_count = 0
+        self.rollback_count = 0
 
-    @property
-    def current_version(self):
-        raise AssertionError("schema.current_version must not be accessed")
+    async def commit(self) -> None:
+        self.commit_count += 1
+
+    async def rollback(self) -> None:
+        self.rollback_count += 1
+
+    async def __aenter__(self) -> "FakeSession":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
 
 
-def build_project(*, project_id: uuid.UUID | None = None) -> Project:
-    actual_id = project_id or uuid.uuid4()
-    return Project(
-        id=actual_id,
-        name="Projection Project",
-        slug=f"projection-{str(actual_id)[:8]}",
-        created_by_id=uuid.uuid4(),
-        status="active",
-    )
+class SessionFactory:
+    def __init__(self) -> None:
+        self.sessions: list[FakeSession] = []
+
+    def __call__(self) -> FakeSession:
+        session = FakeSession()
+        self.sessions.append(session)
+        return session
 
 
-def build_schema(
+class SentinelObject:
+    def __init__(self, sentinel: str) -> None:
+        self.sentinel = sentinel
+
+    def __repr__(self) -> str:
+        return self.sentinel
+
+
+def _project(project_id: uuid.UUID | None = None):
+    return SimpleNamespace(id=project_id or _uuid("project"))
+
+
+def _schema(
     *,
     project_id: uuid.UUID,
     schema_id: uuid.UUID | None = None,
     current_version_id: uuid.UUID | None = None,
     status: str = "active",
+    schema_key: str = "profile.main",
+    name: str = "Profile Main",
     subject_kind: str = "person",
-) -> DynamicSchema:
-    return DynamicSchema(
-        id=schema_id or uuid.uuid4(),
+    description: str | None = "Main profile",
+):
+    return SimpleNamespace(
+        id=schema_id or _uuid("schema"),
         project_id=project_id,
-        schema_key="profile.main",
-        name="Profile Main",
+        schema_key=schema_key,
+        name=name,
         subject_kind=subject_kind,
-        description="Projection schema",
+        description=description,
         status=status,
         current_version_id=current_version_id,
-        created_by_id=None,
     )
 
 
-def build_version(
+def _version(
     *,
     schema_id: uuid.UUID,
     version_id: uuid.UUID | None = None,
     version_no: int = 1,
-    status: str = "active",
-) -> DynamicSchemaVersion:
-    return DynamicSchemaVersion(
-        id=version_id or uuid.uuid4(),
+    status: str = "draft",
+    source_kind: str = "human",
+    summary: str | None = "Schema summary",
+    layout_config: object | None = None,
+    created_by_id: uuid.UUID | None = None,
+    activated_by_id: uuid.UUID | None = None,
+    activated_at: datetime | None = None,
+):
+    return SimpleNamespace(
+        id=version_id or _uuid(f"version:{version_no}:{status}"),
         schema_id=schema_id,
         version_no=version_no,
         status=status,
-        source_kind="human",
-        summary="Projection version",
-        layout_config={"layout": "default"},
-        created_by_id=None,
-        activated_by_id=None if status in {"draft", "proposed"} else uuid.uuid4(),
-        activated_at=None if status in {"draft", "proposed"} else datetime.now(timezone.utc),
+        source_kind=source_kind,
+        summary=summary,
+        layout_config={} if layout_config is None else layout_config,
+        created_by_id=created_by_id,
+        activated_by_id=activated_by_id,
+        activated_at=activated_at,
     )
 
 
-def build_field(
+def _field(
     *,
-    version_id: uuid.UUID,
+    schema_version_id: uuid.UUID,
+    seed: str,
     field_key: str,
-    predicate_key: str,
     display_order: int,
+    label: str | None = None,
+    description: str | None = None,
+    predicate_key: str | None = None,
     scope_key: str | None = None,
+    expected_value_type: str = "string",
     cardinality: str = "one",
-    expected_value_type: str = "any",
     is_required: bool = False,
+    is_title: bool = False,
+    is_summary: bool = False,
     is_hidden: bool = False,
-) -> DynamicSchemaField:
-    return DynamicSchemaField(
-        id=uuid.uuid4(),
-        schema_version_id=version_id,
+    group_key: str | None = None,
+    display_config: object | None = None,
+    validation_rules: object | None = None,
+):
+    return SimpleNamespace(
+        id=_uuid(f"field:{seed}"),
+        schema_version_id=schema_version_id,
         field_key=field_key,
-        label=field_key.title(),
-        description=None,
-        predicate_key=predicate_key,
+        label=label or field_key.title(),
+        description=description,
+        predicate_key=predicate_key or f"person.{field_key}",
         scope_key=scope_key,
         expected_value_type=expected_value_type,
         cardinality=cardinality,
         is_required=is_required,
-        is_title=False,
-        is_summary=False,
+        is_title=is_title,
+        is_summary=is_summary,
         is_hidden=is_hidden,
-        group_key=None,
+        group_key=group_key,
         display_order=display_order,
-        display_config={},
-        validation_rules={},
+        display_config={} if display_config is None else display_config,
+        validation_rules={} if validation_rules is None else validation_rules,
+        created_at=datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc),
     )
 
 
-def build_fact(
+def _fixture(
     *,
-    project_id: uuid.UUID,
-    subject_kind: str = "person",
-    subject_key: str,
-    predicate_key: str,
-    scope_key: str | None = None,
-    identity_hash: str | None = None,
-    current_value: FactValue | None = None,
-    status: str = "active",
-) -> Fact:
-    fact = Fact(
-        id=uuid.uuid4(),
-        project_id=project_id,
-        subject_kind=subject_kind,
-        subject_key=subject_key,
-        predicate_key=predicate_key,
-        scope_key=scope_key,
-        identity_hash=identity_hash or uuid.uuid4().hex + uuid.uuid4().hex,
-        status=status,
-        current_value_id=current_value.id if current_value is not None else None,
-        created_by_id=None,
+    requested_status: str = "active",
+    current_status: str | None = None,
+    current_points_to_requested: bool = True,
+):
+    project = _project()
+    requested_version_id = _uuid(f"requested:{requested_status}")
+    current_version_id = requested_version_id if current_points_to_requested else _uuid("current")
+    schema = _schema(
+        project_id=project.id,
+        current_version_id=current_version_id if current_status is not None else None,
     )
-    if current_value is not None:
-        fact.current_value = current_value
-        current_value.fact = fact
-        current_value.fact_id = fact.id
-    return fact
+    requested_version = _version(
+        schema_id=schema.id,
+        version_id=requested_version_id,
+        version_no=2,
+        status=requested_status,
+        source_kind="human",
+        created_by_id=_uuid("created-by"),
+        activated_by_id=(
+            _uuid("activated-by")
+            if requested_status in {"active", "retired"}
+            else None
+        ),
+        activated_at=(
+            datetime(2026, 8, 2, 10, 0, tzinfo=timezone.utc)
+            if requested_status in {"active", "retired"}
+            else None
+        ),
+        layout_config={"sections": ["main", "meta"]},
+    )
+    current_version = None
+    active_versions: list[object] = []
+    if current_status is not None:
+        current_version = _version(
+            schema_id=schema.id,
+            version_id=schema.current_version_id,
+            version_no=99,
+            status=current_status,
+            source_kind="human",
+            created_by_id=_uuid("current-created-by"),
+            activated_by_id=_uuid("current-activated-by"),
+            activated_at=datetime(2026, 8, 2, 9, 0, tzinfo=timezone.utc),
+        )
+        active_versions = [current_version]
+    fields = [
+        _field(
+            schema_version_id=requested_version.id,
+            seed="summary",
+            field_key="summary",
+            display_order=1,
+            is_summary=True,
+            group_key="meta",
+            display_config={"multiline": True},
+        ),
+        _field(
+            schema_version_id=requested_version.id,
+            seed="title",
+            field_key="title",
+            display_order=0,
+            is_title=True,
+            is_required=True,
+            validation_rules={"max_length": 100},
+        ),
+    ]
+    return {
+        "project": project,
+        "schema": schema,
+        "requested_version": requested_version,
+        "current_version": current_version,
+        "fields": fields,
+        "active_versions": active_versions,
+    }
 
 
-def build_fact_value(
+def _install_repository(
+    monkeypatch: pytest.MonkeyPatch,
     *,
-    fact_id: uuid.UUID | None = None,
-    value_type: str = "string",
-    value_json="Alice",
-    normalized_value_text: str = "Alice",
-    status: str = "accepted",
-    source_kind: str = "human",
-    evidence_links: list[FactEvidenceLink] | None = None,
-) -> FactValue:
-    value = FactValue(
-        id=uuid.uuid4(),
-        fact_id=fact_id or uuid.uuid4(),
-        version_no=1,
-        value_type=value_type,
-        value_json=value_json,
-        normalized_value_text=normalized_value_text,
-        value_hash="a" * 64,
-        language_code="zh-CN",
-        status=status,
-        source_kind=source_kind,
-        extraction_run_id=None,
-        confidence=0.9,
-        created_by_id=None,
-        decided_by_id=uuid.uuid4() if status == "accepted" else None,
-        decided_at=datetime.now(timezone.utc) if status == "accepted" else None,
-    )
-    value.evidence_links = evidence_links or []
-    for link in value.evidence_links:
-        link.fact_value = value
-        link.fact_value_id = value.id
-    return value
-
-
-def build_evidence_link(
-    *,
-    source_order: int,
-    role: str = "supporting",
-    is_primary: bool = False,
-    evidence: SourceEvidence | None = None,
-) -> FactEvidenceLink:
-    actual_evidence = evidence or build_source_evidence()
-    link = FactEvidenceLink(
-        id=uuid.uuid4(),
-        fact_value_id=uuid.uuid4(),
-        evidence_id=actual_evidence.id,
-        role=role,
-        is_primary=is_primary,
-        source_order=source_order,
-    )
-    link.evidence = actual_evidence
-    return link
-
-
-def build_source_evidence(
-    *,
-    excerpt: str = "Alice",
-    location_key: str = "md:p1",
-    page_no: int | None = None,
-    start_line: int | None = 1,
-    end_line: int | None = 1,
-    start_offset: int = 0,
-    end_offset: int = 5,
-) -> SourceEvidence:
-    run = ExtractionRun(
-        id=uuid.uuid4(),
-        revision_id=uuid.uuid4(),
-        attempt_no=1,
-        status="completed",
-        outcome="success",
-        extractor_name="extractor",
-        extractor_version="1.0.0",
-        detected_format="md",
-        detected_encoding="utf-8",
-        page_count=None,
-        character_count=10,
-        block_count=1,
-        warnings=[],
-        content_metadata={},
-    )
-    block = DocumentBlock(
-        id=uuid.uuid4(),
-        extraction_run_id=run.id,
-        source_order=0,
-        block_type="paragraph",
-        raw_text="Alice text",
-        normalized_text="Alice text",
-        location_key=location_key,
-        anchor_hash="b" * 64,
-        page_no=page_no,
-        block_index=0,
-        heading_path=[],
-        start_line=start_line,
-        end_line=end_line,
-        block_metadata={},
-    )
-    block.extraction_run = run
-    evidence = SourceEvidence(
-        id=uuid.uuid4(),
-        block_id=block.id,
-        start_offset=start_offset,
-        end_offset=end_offset,
-        excerpt=excerpt,
-        excerpt_hash="c" * 64,
-    )
-    evidence.block = block
-    return evidence
-
-
-def attach_version_fields(version: DynamicSchemaVersion, fields: list[DynamicSchemaField]) -> None:
-    version.fields = fields
-    for field in fields:
-        field.schema_version = version
-
-
-def patch_projection_dependencies(
-    monkeypatch,
-    *,
-    schema,
-    version,
-    facts: list[Fact],
+    project=None,
+    schema=None,
+    version=None,
+    fields=None,
+    active_versions=None,
+    capture: dict[str, object] | None = None,
 ) -> None:
-    async def fake_get_dynamic_schema_by_id(_session, *, project_id, schema_id):
-        if project_id == schema.project_id and schema_id == schema.id:
+    async def fake_get_project_by_id(_session, *, project_id):
+        if capture is not None:
+            capture.setdefault("project_ids", []).append(project_id)
+        if project is not None and project_id == project.id:
+            return project
+        return None
+
+    async def fake_get_dynamic_schema_by_id(_session, *, schema_id):
+        if capture is not None:
+            capture.setdefault("schema_ids", []).append(schema_id)
+        if schema is not None and schema_id == schema.id:
             return schema
         return None
 
-    async def fake_get_dynamic_schema_version_with_fields_for_projection(_session, *, schema_id, version_id):
-        if schema_id == version.schema_id and version_id == version.id:
+    async def fake_get_dynamic_schema_version_by_id(_session, *, schema_version_id):
+        if capture is not None:
+            capture.setdefault("version_ids", []).append(schema_version_id)
+        if version is not None and schema_version_id == version.id:
             return version
         return None
 
-    async def fake_list_facts_for_projection(
-        _session,
-        *,
-        project_id,
-        subject_kind,
-        predicate_keys,
-        subject_keys=None,
-    ):
-        selected = [
-            fact
-            for fact in facts
-            if fact.project_id == project_id
-            and fact.subject_kind == subject_kind
-            and fact.predicate_key in predicate_keys
-            and (subject_keys is None or fact.subject_key in subject_keys)
-        ]
-        return selected
+    async def fake_list_fields(_session, *, schema_version_id):
+        if capture is not None:
+            capture.setdefault("field_version_ids", []).append(schema_version_id)
+        if version is not None and schema_version_id == version.id:
+            return list(fields or [])
+        return []
 
+    async def fake_list_active_versions(_session, *, schema_id):
+        if capture is not None:
+            capture.setdefault("active_schema_ids", []).append(schema_id)
+        if schema is not None and schema_id == schema.id:
+            return list(active_versions or [])
+        return []
+
+    monkeypatch.setattr(
+        projection_service.projection_repository,
+        "get_project_by_id",
+        fake_get_project_by_id,
+    )
     monkeypatch.setattr(
         projection_service.projection_repository,
         "get_dynamic_schema_by_id",
@@ -335,510 +286,534 @@ def patch_projection_dependencies(
     )
     monkeypatch.setattr(
         projection_service.projection_repository,
-        "get_dynamic_schema_version_with_fields_for_projection",
-        fake_get_dynamic_schema_version_with_fields_for_projection,
+        "get_dynamic_schema_version_by_id",
+        fake_get_dynamic_schema_version_by_id,
     )
     monkeypatch.setattr(
         projection_service.projection_repository,
-        "list_facts_for_projection",
-        fake_list_facts_for_projection,
+        "list_dynamic_schema_fields_by_version_id",
+        fake_list_fields,
+    )
+    monkeypatch.setattr(
+        projection_service.projection_repository,
+        "list_active_dynamic_schema_versions",
+        fake_list_active_versions,
     )
 
 
-def test_project_current_dynamic_schema_projects_current_schema(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id, current_version_id=uuid.uuid4())
-    version = build_version(schema_id=schema.id, version_id=schema.current_version_id, status="active")
-    attach_version_fields(
-        version,
-        [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)],
+@pytest.mark.parametrize(
+    ("requested_status", "current_status", "current_points_to_requested", "expected_is_current"),
+    [
+        ("draft", None, False, False),
+        ("proposed", None, False, False),
+        ("active", "active", True, True),
+        ("retired", "active", False, False),
+    ],
+)
+def test_get_dynamic_schema_definition_snapshot_reads_requested_version_status(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_status: str,
+    current_status: str | None,
+    current_points_to_requested: bool,
+    expected_is_current: bool,
+) -> None:
+    fixture = _fixture(
+        requested_status=requested_status,
+        current_status=current_status,
+        current_points_to_requested=current_points_to_requested,
     )
-    value = build_fact_value(evidence_links=[build_evidence_link(source_order=0, is_primary=True)])
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value)
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=fixture["active_versions"],
+    )
 
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    result = run_async(
-        projection_service.project_current_dynamic_schema(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
+    snapshot = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
         )
     )
 
-    assert isinstance(result, DynamicSchemaProjection)
-    assert result.version_id == version.id
-    assert result.records[0].subject_key == "alice"
-    assert result.records[0].fields[0].values[0].fact_id == fact.id
+    assert snapshot.version_status == requested_status
+    assert snapshot.is_current is expected_is_current
+    assert snapshot.field_count == 2
+    assert [field.field_key for field in snapshot.fields] == ["title", "summary"]
 
 
-@pytest.mark.parametrize("status", ["draft", "proposed", "retired", "active"])
-def test_explicit_version_projection_allows_preview_statuses(monkeypatch, status: str) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status=status)
-    attach_version_fields(
-        version,
-        [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)],
+def test_get_current_dynamic_schema_definition_snapshot_follows_current_version_id_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        requested_status="active",
+        current_status="active",
+        current_points_to_requested=False,
     )
-    value = build_fact_value()
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value)
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-        )
+    higher_version = _version(
+        schema_id=fixture["schema"].id,
+        version_id=_uuid("higher-version"),
+        version_no=999,
+        status="retired",
+        source_kind="human",
+        created_by_id=_uuid("higher-created"),
+        activated_by_id=_uuid("higher-activated"),
+        activated_at=datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc),
     )
-
-    assert result.version_status == status
-
-
-def test_cross_project_schema_or_version_is_rejected(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    other_project = build_project()
-    schema = build_schema(project_id=other_project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[])
-
-    with pytest.raises(projection_service.DynamicSchemaProjectionNotFoundError):
-        run_async(
-            projection_service.project_dynamic_schema_version(
-                session,
-                project_id=project.id,
-                schema_id=schema.id,
-                version_id=version.id,
-            )
-        )
-
-
-def test_hidden_fields_are_excluded_by_default_and_can_be_included(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    fields = [
-        build_field(version_id=version.id, field_key="visible", predicate_key="person.name", display_order=0),
-        build_field(version_id=version.id, field_key="secret", predicate_key="person.secret", display_order=1, is_hidden=True),
-    ]
-    attach_version_fields(version, fields)
-    value = build_fact_value()
-    secret_value = build_fact_value(value_json="secret", normalized_value_text="secret")
-    facts = [
-        build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value),
-        build_fact(project_id=project.id, subject_key="alice", predicate_key="person.secret", current_value=secret_value),
-    ]
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=facts)
-
-    hidden_excluded = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-        )
-    )
-    hidden_included = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-            include_hidden=True,
-        )
-    )
-
-    assert [field.field_key for field in hidden_excluded.records[0].fields] == ["visible"]
-    assert [field.field_key for field in hidden_included.records[0].fields] == ["visible", "secret"]
-
-
-def test_subject_kind_isolated_from_other_facts(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id, subject_kind="person")
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    person_value = build_fact_value()
-    org_value = build_fact_value(value_json="Acme", normalized_value_text="Acme")
-    facts = [
-        build_fact(project_id=project.id, subject_kind="person", subject_key="alice", predicate_key="person.name", current_value=person_value),
-        build_fact(project_id=project.id, subject_kind="organization", subject_key="acme", predicate_key="person.name", current_value=org_value),
-    ]
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=facts)
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-        )
-    )
-
-    assert [record.subject_key for record in result.records] == ["alice"]
-
-
-def test_one_field_with_null_scope_matches_exact_null_scope(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    null_scope_value = build_fact_value(value_json="Alice")
-    scoped_value = build_fact_value(value_json="Alias")
-    facts = [
-        build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", scope_key=None, current_value=null_scope_value),
-        build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", scope_key="alias", current_value=scoped_value),
-    ]
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=facts)
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-        )
-    )
-
-    assert [value.value_json for value in result.records[0].fields[0].values] == ["Alice"]
-
-
-def test_many_field_aggregates_scopes_with_stable_sort(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(
-        version,
-        [build_field(version_id=version.id, field_key="aliases", predicate_key="person.alias", display_order=0, cardinality="many")],
-    )
-    facts = [
-        build_fact(
-            project_id=project.id,
-            subject_key="alice",
-            predicate_key="person.alias",
-            scope_key="z_scope",
-            identity_hash="f" * 64,
-            current_value=build_fact_value(value_json="Zulu"),
+    current_fields = [
+        _field(
+            schema_version_id=fixture["current_version"].id,
+            seed="current-title",
+            field_key="title",
+            display_order=0,
+            is_title=True,
         ),
-        build_fact(
-            project_id=project.id,
-            subject_key="alice",
-            predicate_key="person.alias",
-            scope_key=None,
-            identity_hash="a" * 64,
-            current_value=build_fact_value(value_json="Primary"),
-        ),
-        build_fact(
-            project_id=project.id,
-            subject_key="alice",
-            predicate_key="person.alias",
-            scope_key="a_scope",
-            identity_hash="b" * 64,
-            current_value=build_fact_value(value_json="Alpha"),
+        _field(
+            schema_version_id=fixture["current_version"].id,
+            seed="current-summary",
+            field_key="summary",
+            display_order=1,
+            is_summary=True,
         ),
     ]
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=facts)
+    capture: dict[str, object] = {}
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["current_version"],
+        fields=current_fields,
+        active_versions=[fixture["current_version"]],
+        capture=capture,
+    )
 
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
+    snapshot = run_async(
+        projection_service.get_current_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
         )
     )
 
-    projected_values = result.records[0].fields[0].values
-    assert [value.value_json for value in projected_values] == ["Primary", "Alpha", "Zulu"]
-    assert [value.scope_key for value in projected_values] == [None, "a_scope", "z_scope"]
+    assert snapshot.schema_version_id == fixture["current_version"].id
+    assert snapshot.schema_version_id != higher_version.id
+    assert capture["version_ids"] == [fixture["current_version"].id]
 
 
-def test_required_missing_field_is_marked(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(
-        version,
-        [build_field(version_id=version.id, field_key="birth_date", predicate_key="person.birth_date", display_order=0, is_required=True)],
-    )
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[])
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-            subject_keys=["alice"],
-        )
-    )
-
-    assert result.records[0].fields[0].is_missing is True
-    assert result.records[0].required_missing_field_keys == ["birth_date"]
-
-
-def test_type_incompatible_value_is_returned_with_issue(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(
-        version,
-        [build_field(version_id=version.id, field_key="birth_date", predicate_key="person.birth_date", display_order=0, expected_value_type="date")],
-    )
-    value = build_fact_value(value_type="string", value_json="not-a-date", normalized_value_text="not-a-date")
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.birth_date", current_value=value)
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-        )
+@pytest.mark.parametrize(
+    ("project_present", "schema_present", "version_present", "expected_code"),
+    [
+        (False, True, True, "dynamic_schema_definition_snapshot_project_not_found"),
+        (True, False, True, "dynamic_schema_definition_snapshot_schema_not_found"),
+        (True, True, False, "dynamic_schema_definition_snapshot_version_not_found"),
+    ],
+)
+def test_get_dynamic_schema_definition_snapshot_rejects_unknown_or_cross_source_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    project_present: bool,
+    schema_present: bool,
+    version_present: bool,
+    expected_code: str,
+) -> None:
+    fixture = _fixture(requested_status="draft")
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"] if project_present else None,
+        schema=fixture["schema"] if schema_present else None,
+        version=fixture["requested_version"] if version_present else None,
+        fields=fixture["fields"],
+        active_versions=[],
     )
 
-    projected_field = result.records[0].fields[0]
-    assert projected_field.values[0].value_json == "not-a-date"
-    assert projected_field.values[0].type_compatible is False
-    assert projected_field.issues
-
-
-def test_non_accepted_or_missing_current_value_is_rejected(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    rejected_value = build_fact_value(status="rejected", value_json="Alice")
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=rejected_value)
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    with pytest.raises(projection_service.ProjectionStateCorruptionError):
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotError,
+        match=expected_code,
+    ):
         run_async(
-            projection_service.project_dynamic_schema_version(
-                session,
-                project_id=project.id,
-                schema_id=schema.id,
-                version_id=version.id,
+            projection_service.get_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+                schema_version_id=fixture["requested_version"].id,
             )
         )
 
 
-def test_current_value_belonging_to_other_fact_is_rejected(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    value = build_fact_value(value_json="Alice")
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value)
-    value.fact_id = uuid.uuid4()
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
+@pytest.mark.parametrize(
+    ("current_version_id", "active_versions", "requested_status"),
+    [
+        (_uuid("current"), [], "draft"),
+        (None, [_version(schema_id=_uuid("schema"), status="active", activated_by_id=_uuid("a"), activated_at=datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc))], "draft"),
+        (_uuid("current"), [
+            _version(schema_id=_uuid("schema"), version_id=_uuid("active-1"), status="active", activated_by_id=_uuid("a1"), activated_at=datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc)),
+            _version(schema_id=_uuid("schema"), version_id=_uuid("active-2"), status="active", activated_by_id=_uuid("a2"), activated_at=datetime(2026, 8, 2, 9, 0, tzinfo=timezone.utc)),
+        ], "draft"),
+    ],
+)
+def test_get_dynamic_schema_definition_snapshot_rejects_current_pointer_or_active_set_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    current_version_id: uuid.UUID | None,
+    active_versions: list[object],
+    requested_status: str,
+) -> None:
+    fixture = _fixture(requested_status=requested_status)
+    fixture["schema"].current_version_id = current_version_id
+    for active_version in active_versions:
+        active_version.schema_id = fixture["schema"].id
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=active_versions,
+    )
 
-    with pytest.raises(projection_service.ProjectionStateCorruptionError):
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match="dynamic_schema_definition_snapshot_current_state_invalid",
+    ):
         run_async(
-            projection_service.project_dynamic_schema_version(
-                session,
-                project_id=project.id,
-                schema_id=schema.id,
-                version_id=version.id,
+            projection_service.get_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+                schema_version_id=fixture["requested_version"].id,
             )
         )
 
 
-def test_evidence_order_and_location_fields_are_projected(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    evidence_a = build_source_evidence(excerpt="A", location_key="md:a", start_line=2, end_line=2, start_offset=3, end_offset=4)
-    evidence_b = build_source_evidence(excerpt="B", location_key="md:b", start_line=1, end_line=1, start_offset=0, end_offset=1)
-    links = [
-        build_evidence_link(source_order=2, role="context", evidence=evidence_a),
-        build_evidence_link(source_order=1, role="supporting", is_primary=True, evidence=evidence_b),
-    ]
-    value = build_fact_value(evidence_links=links)
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value)
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-        )
+@pytest.mark.parametrize(
+    ("mutator", "expected_code"),
+    [
+        (
+            lambda fixture: fixture["fields"].append(
+                _field(
+                    schema_version_id=fixture["requested_version"].id,
+                    seed="dup-key",
+                    field_key="title",
+                    display_order=2,
+                )
+            ),
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            lambda fixture: fixture["fields"].append(
+                _field(
+                    schema_version_id=fixture["requested_version"].id,
+                    seed="dup-order",
+                    field_key="extra",
+                    display_order=0,
+                )
+            ),
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["fields"][0], "expected_value_type", "bogus"),
+            "dynamic_schema_definition_snapshot_field_invalid",
+        ),
+        (
+            lambda fixture: setattr(fixture["fields"][0], "is_hidden", True)
+            or setattr(fixture["fields"][0], "is_title", True),
+            "dynamic_schema_definition_snapshot_field_invalid",
+        ),
+        (
+            lambda fixture: setattr(
+                fixture["fields"][0],
+                "schema_version_id",
+                _uuid("foreign-version"),
+            ),
+            "dynamic_schema_definition_snapshot_field_invalid",
+        ),
+    ],
+)
+def test_get_dynamic_schema_definition_snapshot_rejects_invalid_field_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+    mutator,
+    expected_code: str,
+) -> None:
+    fixture = _fixture(requested_status="draft")
+    mutator(fixture)
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[],
     )
 
-    evidences = result.records[0].fields[0].values[0].evidences
-    assert [evidence.excerpt for evidence in evidences] == ["B", "A"]
-    assert evidences[0].location_key == "md:b"
-    assert evidences[0].start_line == 1
-    assert evidences[0].start_offset == 0
-
-
-def test_subject_keys_preserve_request_order_and_allow_empty_records(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    value = build_fact_value(value_json="Alice")
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value)
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-            subject_keys=["missing", "alice"],
-        )
-    )
-
-    assert [record.subject_key for record in result.records] == ["missing", "alice"]
-    assert result.records[0].fields[0].values == []
-    assert result.records[1].fields[0].values[0].value_json == "Alice"
-
-
-def test_service_does_not_trigger_write_operations(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    value = build_fact_value()
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value)
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    result = run_async(
-        projection_service.project_dynamic_schema_version(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-            version_id=version.id,
-        )
-    )
-
-    assert result.records[0].subject_key == "alice"
-
-
-def test_current_wrapper_does_not_access_schema_current_version(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    version_id = uuid.uuid4()
-    schema = StubSchemaWithoutCurrentVersion(project_id=project.id, current_version_id=version_id)
-    version = build_version(schema_id=schema.id, version_id=version_id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    value = build_fact_value()
-    fact = build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=value)
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=[fact])
-
-    result = run_async(
-        projection_service.project_current_dynamic_schema(
-            session,
-            project_id=project.id,
-            schema_id=schema.id,
-        )
-    )
-
-    assert result.records[0].subject_key == "alice"
-
-
-def test_one_field_matching_multiple_null_scope_facts_is_corruption(monkeypatch) -> None:
-    session = ReadOnlySession()
-    project = build_project()
-    schema = build_schema(project_id=project.id)
-    version = build_version(schema_id=schema.id, status="active")
-    attach_version_fields(version, [build_field(version_id=version.id, field_key="name", predicate_key="person.name", display_order=0)])
-    facts = [
-        build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=build_fact_value(value_json="A")),
-        build_fact(project_id=project.id, subject_key="alice", predicate_key="person.name", current_value=build_fact_value(value_json="B")),
-    ]
-    patch_projection_dependencies(monkeypatch, schema=schema, version=version, facts=facts)
-
-    with pytest.raises(projection_service.ProjectionStateCorruptionError):
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match=expected_code,
+    ):
         run_async(
-            projection_service.project_dynamic_schema_version(
-                session,
-                project_id=project.id,
-                schema_id=schema.id,
-                version_id=version.id,
+            projection_service.get_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+                schema_version_id=fixture["requested_version"].id,
             )
         )
 
 
-def test_projection_repository_uses_explicit_loader_strategy(monkeypatch) -> None:
-    from app.repositories import dynamic_schema_projection as projection_repository
+@pytest.mark.parametrize(
+    ("status", "activated_by_id", "activated_at", "expected_code"),
+    [
+        (
+            "draft",
+            _uuid("bad-activator"),
+            datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc),
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            "proposed",
+            _uuid("bad-activator-proposed"),
+            datetime(2026, 8, 2, 8, 30, tzinfo=timezone.utc),
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+        (
+            "active",
+            None,
+            None,
+            "dynamic_schema_definition_snapshot_version_invalid",
+        ),
+    ],
+)
+def test_get_dynamic_schema_definition_snapshot_rejects_invalid_version_activation_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    activated_by_id: uuid.UUID | None,
+    activated_at: datetime | None,
+    expected_code: str,
+) -> None:
+    fixture = _fixture(
+        requested_status=status,
+        current_status="active" if status == "active" else None,
+        current_points_to_requested=status == "active",
+    )
+    fixture["requested_version"].activated_by_id = activated_by_id
+    fixture["requested_version"].activated_at = activated_at
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=fixture["active_versions"],
+    )
 
-    recorded: dict[str, list[object]] = {"joined": [], "selectin": []}
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match=expected_code,
+    ):
+        run_async(
+            projection_service.get_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+                schema_version_id=fixture["requested_version"].id,
+            )
+        )
 
-    class FakeResult:
-        def scalar_one_or_none(self):
-            return None
 
-        def scalars(self):
-            class FakeScalars:
-                def unique(self_inner):
-                    return self_inner
+@pytest.mark.parametrize(
+    "invalid_config",
+    [
+        {"bad": float("nan")},
+        {"bad": float("inf")},
+        {"bad": b"bytes"},
+        {"bad": datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)},
+        {1: "bad-key"},
+        {"bad": SentinelObject("SENSITIVE_DYNAMIC_SCHEMA_SENTINEL")},
+    ],
+)
+def test_get_dynamic_schema_definition_snapshot_rejects_invalid_json_configs_without_leaking_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_config: object,
+) -> None:
+    fixture = _fixture(requested_status="draft")
+    fixture["requested_version"].layout_config = invalid_config
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[],
+    )
 
-                def all(self_inner):
-                    return []
+    with pytest.raises(
+        projection_service.DynamicSchemaDefinitionSnapshotInvariantError,
+        match="dynamic_schema_definition_snapshot_json_config_invalid",
+    ) as exc_info:
+        run_async(
+            projection_service.get_dynamic_schema_definition_snapshot(
+                factory,
+                project_id=fixture["project"].id,
+                schema_id=fixture["schema"].id,
+                schema_version_id=fixture["requested_version"].id,
+            )
+        )
 
-            return FakeScalars()
+    assert "SENSITIVE_DYNAMIC_SCHEMA_SENTINEL" not in str(exc_info.value)
 
-    class FakeSession:
-        async def execute(self, _statement):
-            return FakeResult()
 
-    def tracked_joinedload(attribute):
-        recorded["joined"].append(attribute)
-        return sa_joinedload(attribute)
+def test_get_dynamic_schema_definition_snapshot_orders_fields_and_manifest_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(requested_status="active", current_status="active")
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=list(reversed(fixture["fields"])),
+        active_versions=[fixture["requested_version"]],
+    )
 
-    def tracked_selectinload(attribute):
-        recorded["selectin"].append(attribute)
-        return sa_selectinload(attribute)
+    first = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
+        )
+    )
+    second = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
+        )
+    )
 
-    monkeypatch.setattr(projection_repository, "joinedload", tracked_joinedload)
-    monkeypatch.setattr(projection_repository, "selectinload", tracked_selectinload)
+    assert [field.field_key for field in first.fields] == ["title", "summary"]
+    assert first.definition_manifest_hash == second.definition_manifest_hash
+
+
+@pytest.mark.parametrize("mutation", ["schema", "version", "field", "config", "algorithm"])
+def test_get_dynamic_schema_definition_snapshot_manifest_changes_when_definition_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    fixture = _fixture(requested_status="active", current_status="active")
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[fixture["requested_version"]],
+    )
+    baseline = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
+        )
+    )
+
+    if mutation == "schema":
+        fixture["schema"].name = "Changed Name"
+    elif mutation == "version":
+        fixture["requested_version"].summary = "Changed Summary"
+    elif mutation == "field":
+        fixture["fields"][0].label = "Changed Label"
+    elif mutation == "config":
+        fixture["requested_version"].layout_config = {"sections": ["changed"]}
+    else:
+        monkeypatch.setattr(
+            projection_service,
+            "DYNAMIC_SCHEMA_DEFINITION_SNAPSHOT_ALGORITHM_VERSION",
+            "1.0.1",
+        )
+
+    changed = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
+        )
+    )
+
+    assert baseline.definition_manifest_hash != changed.definition_manifest_hash
+
+
+def test_get_dynamic_schema_definition_snapshot_returns_frozen_dto_without_orm_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(requested_status="active", current_status="active")
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[fixture["requested_version"]],
+    )
+
+    snapshot = run_async(
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
+        )
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        snapshot.name = "mutated"
+    assert isinstance(snapshot.fields, tuple)
+    assert not hasattr(snapshot, "_sa_instance_state")
+    assert not hasattr(snapshot.fields[0], "_sa_instance_state")
+
+
+def test_get_dynamic_schema_definition_snapshot_rolls_back_without_commit_or_for_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(requested_status="draft")
+    factory = SessionFactory()
+    _install_repository(
+        monkeypatch,
+        project=fixture["project"],
+        schema=fixture["schema"],
+        version=fixture["requested_version"],
+        fields=fixture["fields"],
+        active_versions=[],
+    )
 
     run_async(
-        projection_repository.get_dynamic_schema_version_with_fields_for_projection(
-            FakeSession(),
-            schema_id=uuid.uuid4(),
-            version_id=uuid.uuid4(),
-        )
-    )
-    run_async(
-        projection_repository.list_facts_for_projection(
-            FakeSession(),
-            project_id=uuid.uuid4(),
-            subject_kind="person",
-            predicate_keys=["person.name"],
+        projection_service.get_dynamic_schema_definition_snapshot(
+            factory,
+            project_id=fixture["project"].id,
+            schema_id=fixture["schema"].id,
+            schema_version_id=fixture["requested_version"].id,
         )
     )
 
-    source = inspect.getsource(projection_repository.list_facts_for_projection)
-    assert any(
-        attribute is DynamicSchemaVersion.schema or attribute is Fact.current_value
-        for attribute in recorded["joined"]
-    )
-    assert any(attribute is FactValue.evidence_links for attribute in recorded["selectin"])
-    assert "selectinload(FactValue.evidence_links)" in source
-    assert "joinedload(FactEvidenceLink.evidence)" in source
-    assert "joinedload(SourceEvidence.block)" in source
-    assert "'" not in source.split("options(", 1)[1]
+    assert len(factory.sessions) == 1
+    assert factory.sessions[0].commit_count == 0
+    assert factory.sessions[0].rollback_count == 1
+
+    repository_source = inspect.getsource(projection_service.projection_repository)
+    service_source = inspect.getsource(projection_service)
+    assert "with_for_update" not in repository_source
+    assert "app.services.llm" not in service_source

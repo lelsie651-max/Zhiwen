@@ -6,22 +6,42 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
-from app.models.document_content import DocumentBlock, SourceEvidence
+from app.models.document_content import SourceEvidence
 from app.models.dynamic_schema import DynamicSchema, DynamicSchemaField, DynamicSchemaVersion
 from app.models.fact import Fact, FactEvidenceLink, FactValue
+from app.models.document_content import DocumentBlock
+from app.models.project import Project
+
+
+async def get_project_by_id(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+) -> Project | None:
+    result = await session.execute(select(Project).where(Project.id == project_id))
+    return result.scalar_one_or_none()
 
 
 async def get_dynamic_schema_by_id(
     session: AsyncSession,
     *,
-    project_id: uuid.UUID,
+    project_id: uuid.UUID | None = None,
     schema_id: uuid.UUID,
 ) -> DynamicSchema | None:
+    statement = select(DynamicSchema).where(DynamicSchema.id == schema_id)
+    if project_id is not None:
+        statement = statement.where(DynamicSchema.project_id == project_id)
+    result = await session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def get_dynamic_schema_version_by_id(
+    session: AsyncSession,
+    *,
+    schema_version_id: uuid.UUID,
+) -> DynamicSchemaVersion | None:
     result = await session.execute(
-        select(DynamicSchema).where(
-            DynamicSchema.project_id == project_id,
-            DynamicSchema.id == schema_id,
-        )
+        select(DynamicSchemaVersion).where(DynamicSchemaVersion.id == schema_version_id)
     )
     return result.scalar_one_or_none()
 
@@ -44,6 +64,33 @@ async def get_dynamic_schema_version_with_fields_for_projection(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def list_dynamic_schema_fields_by_version_id(
+    session: AsyncSession,
+    *,
+    schema_version_id: uuid.UUID,
+) -> list[DynamicSchemaField]:
+    result = await session.execute(
+        select(DynamicSchemaField).where(
+            DynamicSchemaField.schema_version_id == schema_version_id
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def list_active_dynamic_schema_versions(
+    session: AsyncSession,
+    *,
+    schema_id: uuid.UUID,
+) -> list[DynamicSchemaVersion]:
+    result = await session.execute(
+        select(DynamicSchemaVersion).where(
+            DynamicSchemaVersion.schema_id == schema_id,
+            DynamicSchemaVersion.status == "active",
+        )
+    )
+    return list(result.scalars().all())
 
 
 async def list_facts_for_projection(

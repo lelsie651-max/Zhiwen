@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+from typing import Literal
+import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,6 +16,10 @@ from app.models.dynamic_schema import (
     DynamicSchemaVersionStatus,
 )
 from app.models.fact import FactEvidenceRole, FactValueSourceKind, FactValueType
+
+
+DynamicSchemaDefinitionSnapshotAlgorithmName = Literal["dynamic_schema_definition_snapshot"]
+DynamicSchemaDefinitionSnapshotAlgorithmVersion = Literal["1.0.0"]
 
 
 class ProjectedEvidence(BaseModel):
@@ -93,3 +100,51 @@ class DynamicSchemaProjection(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid")
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicSchemaFieldDefinitionSnapshot:
+    field_id: uuid.UUID
+    schema_version_id: uuid.UUID
+    field_key: str
+    label: str
+    description: str | None
+    predicate_key: str
+    scope_key: str | None
+    expected_value_type: str
+    cardinality: str
+    is_required: bool
+    is_title: bool
+    is_summary: bool
+    is_hidden: bool
+    group_key: str | None
+    display_order: int
+    display_config: object
+    validation_rules: object
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicSchemaDefinitionSnapshot:
+    project_id: uuid.UUID
+    schema_id: uuid.UUID
+    schema_key: str
+    name: str
+    subject_kind: str
+    description: str | None
+    schema_status: str
+    schema_version_id: uuid.UUID
+    version_no: int
+    version_status: str
+    source_kind: str
+    summary: str | None
+    layout_config: object
+    created_by_id: uuid.UUID | None
+    activated_by_id: uuid.UUID | None
+    activated_at: datetime | None
+    is_current: bool
+    algorithm_name: DynamicSchemaDefinitionSnapshotAlgorithmName
+    algorithm_version: DynamicSchemaDefinitionSnapshotAlgorithmVersion
+    field_count: int
+    fields: tuple[DynamicSchemaFieldDefinitionSnapshot, ...]
+    definition_manifest_hash: str
