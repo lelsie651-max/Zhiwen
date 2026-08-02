@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import unicodedata
 import uuid
 from collections.abc import Callable
 
@@ -18,7 +17,6 @@ from app.schemas.effective_fact_value import (
     EffectiveFactValueProjection,
     EffectiveFactValueProjectionItem,
 )
-from app.schemas.fact import _normalize_required_text
 from app.schemas.ufl_fact_snapshot import UFLFactSnapshot
 import app.services.consistency_check_persistence as consistency_persistence_service
 import app.services.dynamic_schema_ufl_projection as raw_projection_service
@@ -57,44 +55,38 @@ def _require_sha256(value: object, *, error_code: str) -> str:
     return value
 
 
-def _normalize_subject_key(value: object) -> str:
-    if not isinstance(value, str):
-        raise DynamicSchemaReviewProjectionStateError(
-            "dynamic_schema_review_projection_subject_keys_invalid"
-        )
-    normalized = unicodedata.normalize("NFC", value)
+def _normalize_subject_keys(subject_keys: object) -> list[str] | None:
     try:
-        return _normalize_required_text(
-            normalized,
-            field_name="subject_key",
-            max_length=255,
+        return raw_projection_service.normalize_dynamic_schema_ufl_subject_keys(
+            subject_keys
         )
-    except ValueError:
+    except raw_projection_service.DynamicSchemaUFLProjectionStateError:
         raise DynamicSchemaReviewProjectionStateError(
             "dynamic_schema_review_projection_subject_keys_invalid"
         ) from None
 
 
-def _validate_subject_keys(subject_keys: object) -> list[str] | None:
-    if subject_keys is None:
-        return None
-    if not isinstance(subject_keys, list):
+def _authenticate_raw_projection(
+    *,
+    projection: DynamicSchemaUFLProjection,
+    subject_keys: object,
+) -> DynamicSchemaUFLProjection:
+    try:
+        return raw_projection_service.authenticate_dynamic_schema_ufl_projection(
+            projection,
+            subject_keys=subject_keys,
+        )
+    except raw_projection_service.DynamicSchemaUFLProjectionStateError:
         raise DynamicSchemaReviewProjectionStateError(
             "dynamic_schema_review_projection_subject_keys_invalid"
-        )
-    if len(subject_keys) > 500:
-        raise DynamicSchemaReviewProjectionStateError(
-            "dynamic_schema_review_projection_subject_keys_invalid"
-        )
-    normalized = [_normalize_subject_key(value) for value in subject_keys]
-    if len(set(normalized)) != len(normalized):
-        raise DynamicSchemaReviewProjectionStateError(
-            "dynamic_schema_review_projection_subject_keys_invalid"
-        )
-    return normalized
+        ) from None
+    except raw_projection_service.DynamicSchemaUFLProjectionInvariantError:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_raw_projection_mismatch"
+        ) from None
 
 
-def _validate_raw_projection(
+def _validate_raw_projection_source_binding(
     *,
     project_id: uuid.UUID,
     schema_id: uuid.UUID,
@@ -114,27 +106,6 @@ def _validate_raw_projection(
         raise DynamicSchemaReviewProjectionInvariantError(
             "dynamic_schema_review_projection_raw_projection_mismatch"
         )
-    if (
-        projection.algorithm_name
-        != raw_projection_service.DYNAMIC_SCHEMA_UFL_PROJECTION_ALGORITHM_NAME
-        or projection.algorithm_version
-        != raw_projection_service.DYNAMIC_SCHEMA_UFL_PROJECTION_ALGORITHM_VERSION
-    ):
-        raise DynamicSchemaReviewProjectionInvariantError(
-            "dynamic_schema_review_projection_raw_projection_mismatch"
-        )
-    _require_sha256(
-        projection.schema_definition_manifest_hash,
-        error_code="dynamic_schema_review_projection_raw_projection_mismatch",
-    )
-    _require_sha256(
-        projection.ufl_source_manifest_hash,
-        error_code="dynamic_schema_review_projection_raw_projection_mismatch",
-    )
-    _require_sha256(
-        projection.projection_manifest_hash,
-        error_code="dynamic_schema_review_projection_raw_projection_mismatch",
-    )
 
 
 def _validate_authenticated_application(
@@ -158,7 +129,20 @@ def _validate_authenticated_application(
     )
 
 
-def _validate_effective_projection(
+def _authenticate_effective_projection(
+    projection: EffectiveFactValueProjection,
+) -> EffectiveFactValueProjection:
+    try:
+        return effective_fact_value_service.authenticate_effective_fact_value_projection(
+            projection
+        )
+    except effective_fact_value_service.EffectiveFactValueProjectionInvariantError:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_effective_projection_mismatch"
+        ) from None
+
+
+def _validate_effective_projection_source_binding(
     *,
     project_id: uuid.UUID,
     consistency_check_application_id: uuid.UUID,
@@ -198,38 +182,6 @@ def _validate_effective_projection(
         effective_projection.result_manifest_hash,
         error_code="dynamic_schema_review_projection_effective_projection_mismatch",
     )
-
-    resolved_count = sum(
-        1
-        for item in effective_projection.items
-        if item.resolution_status == "resolved"
-    )
-    pending_count = sum(
-        1
-        for item in effective_projection.items
-        if item.resolution_status in {"pending_review", "unreviewed_compatible"}
-    )
-    deferred_count = sum(
-        1
-        for item in effective_projection.items
-        if item.resolution_status == "deferred"
-    )
-    if effective_projection.fact_count != len(effective_projection.items):
-        raise DynamicSchemaReviewProjectionInvariantError(
-            "dynamic_schema_review_projection_effective_count_mismatch"
-        )
-    if effective_projection.resolved_count != resolved_count:
-        raise DynamicSchemaReviewProjectionInvariantError(
-            "dynamic_schema_review_projection_effective_count_mismatch"
-        )
-    if effective_projection.pending_count != pending_count:
-        raise DynamicSchemaReviewProjectionInvariantError(
-            "dynamic_schema_review_projection_effective_count_mismatch"
-        )
-    if effective_projection.deferred_count != deferred_count:
-        raise DynamicSchemaReviewProjectionInvariantError(
-            "dynamic_schema_review_projection_effective_count_mismatch"
-        )
 
 
 def _index_effective_items(
@@ -370,7 +322,9 @@ def _build_reviewed_fact(
 
 def _serialize_reviewed_fact(reviewed_fact: DynamicSchemaReviewedFact) -> dict[str, object]:
     return {
-        "fact": raw_projection_service._serialize_ufl_fact(reviewed_fact.fact),
+        "fact": raw_projection_service.serialize_dynamic_schema_ufl_fact(
+            reviewed_fact.fact
+        ),
         "review_state": reviewed_fact.review_state,
         "candidate_id": (
             str(reviewed_fact.candidate_id)
@@ -399,7 +353,7 @@ def _serialize_reviewed_fact(reviewed_fact: DynamicSchemaReviewedFact) -> dict[s
 
 def _serialize_reviewed_field(field: DynamicSchemaReviewedField) -> dict[str, object]:
     return {
-        "source_field": raw_projection_service._serialize_projected_field(
+        "source_field": raw_projection_service.serialize_dynamic_schema_ufl_projected_field(
             field.source_field
         ),
         "review_required": field.review_required,
@@ -483,7 +437,7 @@ async def project_reviewed_orchestration_ufl_to_dynamic_schema(
         consistency_check_application_id,
         field_name="consistency_check_application_id",
     )
-    normalized_subject_keys = _validate_subject_keys(subject_keys)
+    normalized_subject_keys = _normalize_subject_keys(subject_keys)
 
     raw_projection = await raw_projection_service.project_orchestration_ufl_to_dynamic_schema(
         session_factory,
@@ -506,32 +460,40 @@ async def project_reviewed_orchestration_ufl_to_dynamic_schema(
         consistency_check_application_id=consistency_check_application_id,
     )
 
-    _validate_raw_projection(
+    authenticated_raw_projection = _authenticate_raw_projection(
+        projection=raw_projection,
+        subject_keys=subject_keys,
+    )
+    authenticated_effective_projection = _authenticate_effective_projection(
+        effective_projection
+    )
+
+    _validate_raw_projection_source_binding(
         project_id=project_id,
         schema_id=schema_id,
         schema_version_id=schema_version_id,
         orchestration_id=orchestration_id,
-        projection=raw_projection,
+        projection=authenticated_raw_projection,
     )
     _validate_authenticated_application(
         project_id=project_id,
         orchestration_id=orchestration_id,
         context=authenticated_context,
     )
-    _validate_effective_projection(
+    _validate_effective_projection_source_binding(
         project_id=project_id,
         consistency_check_application_id=consistency_check_application_id,
         authenticated_context=authenticated_context,
-        effective_projection=effective_projection,
+        effective_projection=authenticated_effective_projection,
     )
 
-    matched_facts_by_id = _index_matched_facts(raw_projection)
-    effective_items_by_fact_id = _index_effective_items(effective_projection)
+    matched_facts_by_id = _index_matched_facts(authenticated_raw_projection)
+    effective_items_by_fact_id = _index_effective_items(authenticated_effective_projection)
     unique_fact_summaries: dict[uuid.UUID, DynamicSchemaReviewedFact] = {}
     reviewed_records: list[DynamicSchemaReviewedRecord] = []
     field_review_required_count = 0
 
-    for record in raw_projection.records:
+    for record in authenticated_raw_projection.records:
         reviewed_fields: list[DynamicSchemaReviewedField] = []
         for field in record.fields:
             reviewed_facts: list[DynamicSchemaReviewedFact] = []
@@ -604,18 +566,18 @@ async def project_reviewed_orchestration_ufl_to_dynamic_schema(
     )
 
     projection = DynamicSchemaReviewProjection(
-        project_id=raw_projection.project_id,
-        schema_id=raw_projection.schema_id,
-        schema_version_id=raw_projection.schema_version_id,
-        orchestration_id=raw_projection.orchestration_id,
-        extraction_run_id=raw_projection.extraction_run_id,
+        project_id=authenticated_raw_projection.project_id,
+        schema_id=authenticated_raw_projection.schema_id,
+        schema_version_id=authenticated_raw_projection.schema_version_id,
+        orchestration_id=authenticated_raw_projection.orchestration_id,
+        extraction_run_id=authenticated_raw_projection.extraction_run_id,
         consistency_check_application_id=consistency_check_application_id,
         source_consistency_application_id=authenticated_context.application.consistency_application_id,
-        schema_definition_manifest_hash=raw_projection.schema_definition_manifest_hash,
-        ufl_source_manifest_hash=raw_projection.ufl_source_manifest_hash,
+        schema_definition_manifest_hash=authenticated_raw_projection.schema_definition_manifest_hash,
+        ufl_source_manifest_hash=authenticated_raw_projection.ufl_source_manifest_hash,
         consistency_result_manifest_hash=authenticated_context.application.result_manifest_hash,
-        raw_projection_manifest_hash=raw_projection.projection_manifest_hash,
-        comparison_quality=raw_projection.comparison_quality,
+        raw_projection_manifest_hash=authenticated_raw_projection.projection_manifest_hash,
+        comparison_quality=authenticated_raw_projection.comparison_quality,
         algorithm_name=DYNAMIC_SCHEMA_REVIEW_PROJECTION_ALGORITHM_NAME,
         algorithm_version=DYNAMIC_SCHEMA_REVIEW_PROJECTION_ALGORITHM_VERSION,
         record_count=len(reviewed_records),

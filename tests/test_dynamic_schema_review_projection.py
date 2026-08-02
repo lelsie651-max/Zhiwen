@@ -34,6 +34,7 @@ from app.schemas.ufl_fact_snapshot import (
     UFLFactValueSnapshot,
 )
 from app.services import dynamic_schema_review_projection as review_projection_service
+from app.services import dynamic_schema_ufl_projection as raw_projection_service
 from app.utils.deterministic_json import freeze_deterministic_json_value
 
 
@@ -157,6 +158,8 @@ def _field(
     field_key: str,
     display_order: int,
     matched_facts: tuple[UFLFactSnapshot, ...],
+    predicate_key: str | None = None,
+    is_required: bool = False,
     issues: tuple[str, ...] = (),
 ) -> DynamicSchemaUFLProjectedField:
     return DynamicSchemaUFLProjectedField(
@@ -165,11 +168,11 @@ def _field(
         field_key=field_key,
         label=field_key.title(),
         description=None,
-        predicate_key=field_key,
+        predicate_key=field_key if predicate_key is None else predicate_key,
         scope_key=None,
         expected_value_type="string",
         cardinality="one",
-        is_required=False,
+        is_required=is_required,
         is_title=False,
         is_summary=False,
         is_hidden=False,
@@ -208,7 +211,7 @@ def _raw_projection(
     comparison_quality: str = "complete",
     projection_manifest_hash: str = "",
 ) -> DynamicSchemaUFLProjection:
-    return DynamicSchemaUFLProjection(
+    projection = DynamicSchemaUFLProjection(
         project_id=_uuid("project"),
         schema_id=_uuid("schema"),
         schema_version_id=_uuid("schema-version"),
@@ -227,8 +230,13 @@ def _raw_projection(
         ),
         issue_count=sum(record.issue_count for record in records),
         records=records,
-        projection_manifest_hash=projection_manifest_hash or _hash("raw-projection"),
+        projection_manifest_hash="",
     )
+    manifest_hash = projection_manifest_hash or raw_projection_service._build_manifest_hash(
+        projection=projection,
+        subject_keys_filter=None,
+    )
+    return replace(projection, projection_manifest_hash=manifest_hash)
 
 
 def _member(fact_value_id: uuid.UUID) -> ConsistencyReviewProjectionMember:
@@ -252,6 +260,8 @@ def _effective_item(
     effective_fact_value_ids: tuple[uuid.UUID, ...],
     candidate_member_ids: tuple[uuid.UUID, ...] | None = None,
     decision_kind: str | None = None,
+    agent_verdict: str | None = None,
+    review_status: str | None = None,
 ) -> EffectiveFactValueProjectionItem:
     candidate_member_ids = (
         candidate_member_ids
@@ -262,12 +272,28 @@ def _effective_item(
             for fact_value_id in group.fact_value_ids
         )
     )
+    if agent_verdict is None:
+        if resolution_status == "unreviewed_compatible":
+            agent_verdict = "compatible"
+        elif resolution_status == "pending_review":
+            agent_verdict = "conflict"
+        else:
+            agent_verdict = "conflict"
+    if review_status is None:
+        if resolution_status == "pending_review":
+            review_status = "pending_review"
+        elif resolution_status == "deferred":
+            review_status = "deferred"
+        elif resolution_status == "unreviewed_compatible":
+            review_status = "not_required"
+        else:
+            review_status = "reviewed"
     return EffectiveFactValueProjectionItem(
         fact_id=fact.fact_id,
         candidate_id=_uuid(f"candidate:{fact.fact_id}"),
         assessment_id=_uuid(f"assessment:{fact.fact_id}"),
-        agent_verdict="conflict",
-        review_status="reviewed",
+        agent_verdict=agent_verdict,
+        review_status=review_status,
         resolution_status=resolution_status,  # type: ignore[arg-type]
         resolution_basis=resolution_basis,  # type: ignore[arg-type]
         current_decision_id=(
@@ -468,6 +494,7 @@ def _base_projection() -> tuple[DynamicSchemaUFLProjection, dict[str, UFLFactSna
                 field_key="confirm_compatible_duplicate",
                 display_order=4,
                 matched_facts=(confirm_compatible,),
+                predicate_key="confirm_compatible",
             ),
             _field(field_key="pending", display_order=5, matched_facts=(pending,)),
             _field(field_key="deferred", display_order=6, matched_facts=(deferred,)),
@@ -476,6 +503,7 @@ def _base_projection() -> tuple[DynamicSchemaUFLProjection, dict[str, UFLFactSna
                 field_key="missing_required",
                 display_order=8,
                 matched_facts=(),
+                is_required=True,
                 issues=("required_missing",),
             ),
         ),
@@ -651,7 +679,7 @@ def test_project_reviewed_orchestration_ufl_to_dynamic_schema_subject_filter_ord
             records = tuple(record_by_subject[key] for key in sorted(record_by_subject))
         else:
             records = tuple(record_by_subject[key] for key in subject_keys if key in record_by_subject)
-        return replace(
+        projection = replace(
             raw_projection,
             record_count=len(records),
             projected_field_count=sum(len(record.fields) for record in records),
@@ -660,6 +688,14 @@ def test_project_reviewed_orchestration_ufl_to_dynamic_schema_subject_filter_ord
             ),
             issue_count=sum(record.issue_count for record in records),
             records=records,
+            projection_manifest_hash="",
+        )
+        return replace(
+            projection,
+            projection_manifest_hash=raw_projection_service._build_manifest_hash(
+                projection=projection,
+                subject_keys_filter=subject_keys,
+            ),
         )
 
     _install_sources(
@@ -780,7 +816,7 @@ def test_project_reviewed_orchestration_ufl_to_dynamic_schema_rejects_invalid_fa
 
     with pytest.raises(
         review_projection_service.DynamicSchemaReviewProjectionInvariantError,
-        match="dynamic_schema_review_projection_fact_binding_mismatch",
+        match="dynamic_schema_review_projection_effective_projection_mismatch",
     ):
         run_async(
             review_projection_service.project_reviewed_orchestration_ufl_to_dynamic_schema(
@@ -898,7 +934,7 @@ def test_project_reviewed_orchestration_ufl_to_dynamic_schema_rejects_effective_
 
     with pytest.raises(
         review_projection_service.DynamicSchemaReviewProjectionInvariantError,
-        match="dynamic_schema_review_projection_effective_count_mismatch",
+        match="dynamic_schema_review_projection_effective_projection_mismatch",
     ):
         run_async(
             review_projection_service.project_reviewed_orchestration_ufl_to_dynamic_schema(
@@ -970,7 +1006,7 @@ def test_project_reviewed_orchestration_ufl_to_dynamic_schema_allows_unused_effe
 def test_project_reviewed_orchestration_ufl_to_dynamic_schema_handles_zero_fact_and_zero_assessment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    raw_projection = _raw_projection(records=(), projection_manifest_hash=_hash("empty-raw"))
+    raw_projection = _raw_projection(records=())
     _install_sources(
         monkeypatch,
         raw_projection_factory=lambda _subject_keys: raw_projection,
@@ -1056,3 +1092,112 @@ def test_project_reviewed_orchestration_ufl_to_dynamic_schema_does_not_open_sess
     assert "authenticate_persisted_consistency_check_application" in source
     assert "get_effective_fact_value_projection" in source
     assert isinstance(projection, DynamicSchemaReviewProjection)
+
+
+def test_project_reviewed_orchestration_ufl_to_dynamic_schema_rejects_replaced_raw_child_projection_even_if_manifest_is_resigned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_projection, _facts = _base_projection()
+    mutated_projection = replace(
+        raw_projection,
+        records=(
+            replace(
+                raw_projection.records[0],
+                fields=(
+                    replace(
+                        raw_projection.records[0].fields[0],
+                        matched_facts=(
+                            replace(
+                                raw_projection.records[0].fields[0].matched_facts[0],
+                                subject_key="other",
+                            ),
+                        ),
+                    ),
+                )
+                + raw_projection.records[0].fields[1:],
+            ),
+            raw_projection.records[1],
+        ),
+        projection_manifest_hash="",
+    )
+    resigned_projection = replace(
+        mutated_projection,
+        projection_manifest_hash=raw_projection_service._build_manifest_hash(
+            projection=mutated_projection,
+            subject_keys_filter=None,
+        ),
+    )
+    _install_sources(
+        monkeypatch,
+        raw_projection_factory=lambda _subject_keys: resigned_projection,
+        authenticated_context=_authenticated_context(),
+        effective_projection=_effective_projection(items=()),
+    )
+
+    with pytest.raises(
+        review_projection_service.DynamicSchemaReviewProjectionInvariantError,
+        match="dynamic_schema_review_projection_raw_projection_mismatch",
+    ):
+        run_async(
+            review_projection_service.project_reviewed_orchestration_ufl_to_dynamic_schema(
+                SessionFactory(),
+                project_id=raw_projection.project_id,
+                schema_id=raw_projection.schema_id,
+                schema_version_id=raw_projection.schema_version_id,
+                orchestration_id=raw_projection.orchestration_id,
+                consistency_check_application_id=_uuid("consistency-check-application"),
+            )
+        )
+
+
+def test_project_reviewed_orchestration_ufl_to_dynamic_schema_calls_public_child_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_projection, _facts = _base_projection()
+    authenticated_context = _authenticated_context()
+    effective_projection = _effective_projection(items=())
+    _install_sources(
+        monkeypatch,
+        raw_projection_factory=lambda _subject_keys: raw_projection,
+        authenticated_context=authenticated_context,
+        effective_projection=effective_projection,
+    )
+    original_raw_authenticate = (
+        review_projection_service.raw_projection_service.authenticate_dynamic_schema_ufl_projection
+    )
+    original_effective_authenticate = (
+        review_projection_service.effective_fact_value_service.authenticate_effective_fact_value_projection
+    )
+    calls: list[str] = []
+
+    def tracking_raw_authenticate(projection, *, subject_keys):
+        calls.append("raw")
+        return original_raw_authenticate(projection, subject_keys=subject_keys)
+
+    def tracking_effective_authenticate(projection):
+        calls.append("effective")
+        return original_effective_authenticate(projection)
+
+    monkeypatch.setattr(
+        review_projection_service.raw_projection_service,
+        "authenticate_dynamic_schema_ufl_projection",
+        tracking_raw_authenticate,
+    )
+    monkeypatch.setattr(
+        review_projection_service.effective_fact_value_service,
+        "authenticate_effective_fact_value_projection",
+        tracking_effective_authenticate,
+    )
+
+    run_async(
+        review_projection_service.project_reviewed_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=raw_projection.project_id,
+            schema_id=raw_projection.schema_id,
+            schema_version_id=raw_projection.schema_version_id,
+            orchestration_id=raw_projection.orchestration_id,
+            consistency_check_application_id=_uuid("consistency-check-application"),
+        )
+    )
+
+    assert calls == ["raw", "effective"]

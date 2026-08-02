@@ -474,6 +474,19 @@ def _install_sources(
     )
 
 
+def _recompute_projection_manifest(
+    projection,
+    *,
+    subject_keys=None,
+):
+    return projection_service._build_manifest_hash(
+        projection=projection,
+        subject_keys_filter=projection_service.normalize_dynamic_schema_ufl_subject_keys(
+            subject_keys
+        ),
+    )
+
+
 def test_project_orchestration_ufl_to_dynamic_schema_matches_subject_field_scope_and_preserves_hidden_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -903,3 +916,240 @@ def test_project_orchestration_ufl_to_dynamic_schema_uses_only_public_snapshots_
     assert projection.algorithm_name == "dynamic_schema_ufl_projection"
     assert projection.algorithm_version == "1.0.0"
     assert isinstance(projection.records[0].fields[0].display_config, MappingProxyType)
+
+
+@pytest.mark.parametrize(
+    "mutate_projection",
+    [
+        lambda projection: replace(projection, record_count=True),
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=(
+                        replace(
+                            projection.records[0].fields[0],
+                            matched_fact_count=True,
+                        ),
+                    )
+                    + projection.records[0].fields[1:],
+                ),
+                projection.records[1],
+            ),
+        ),
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=projection.records[0].fields[:1]
+                    + (
+                        replace(
+                            projection.records[0].fields[1],
+                            semantic_value_count=1,
+                        ),
+                    )
+                    + projection.records[0].fields[2:],
+                ),
+                projection.records[1],
+            ),
+        ),
+        lambda projection: replace(projection, issue_count=projection.issue_count + 1),
+    ],
+)
+def test_authenticate_dynamic_schema_ufl_projection_rejects_count_and_issue_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_projection,
+) -> None:
+    schema_snapshot = _schema_snapshot()
+    ufl_snapshot = _ufl_snapshot()
+    _install_sources(
+        monkeypatch,
+        schema_snapshot=schema_snapshot,
+        ufl_snapshot=ufl_snapshot,
+    )
+    projection = run_async(
+        projection_service.project_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=schema_snapshot.project_id,
+            schema_id=schema_snapshot.schema_id,
+            schema_version_id=schema_snapshot.schema_version_id,
+            orchestration_id=ufl_snapshot.orchestration_id,
+        )
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaUFLProjectionInvariantError,
+        match="dynamic_schema_ufl_projection_projection_invalid",
+    ):
+        projection_service.authenticate_dynamic_schema_ufl_projection(
+            mutate_projection(projection),
+            subject_keys=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate_projection",
+    [
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=(
+                        replace(
+                            projection.records[0].fields[0],
+                            matched_facts=(
+                                replace(
+                                    projection.records[0].fields[0].matched_facts[0],
+                                    subject_key="other",
+                                ),
+                            ),
+                        ),
+                    )
+                    + projection.records[0].fields[1:],
+                ),
+                projection.records[1],
+            ),
+        ),
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=(
+                        replace(
+                            projection.records[0].fields[0],
+                            predicate_key="other_predicate",
+                        ),
+                    )
+                    + projection.records[0].fields[1:],
+                ),
+                projection.records[1],
+            ),
+        ),
+        lambda projection: replace(
+            projection,
+            records=(
+                replace(
+                    projection.records[0],
+                    fields=projection.records[0].fields[:2]
+                    + (
+                        replace(
+                            projection.records[0].fields[2],
+                            matched_facts=(
+                                replace(
+                                    projection.records[0].fields[2].matched_facts[0],
+                                    scope_key="other_scope",
+                                ),
+                            ),
+                        ),
+                    )
+                    + projection.records[0].fields[3:],
+                ),
+                projection.records[1],
+            ),
+        ),
+    ],
+)
+def test_authenticate_dynamic_schema_ufl_projection_rejects_subject_predicate_and_scope_mismatch_even_if_manifest_is_resigned(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_projection,
+) -> None:
+    schema_snapshot = _schema_snapshot()
+    ufl_snapshot = _ufl_snapshot()
+    _install_sources(
+        monkeypatch,
+        schema_snapshot=schema_snapshot,
+        ufl_snapshot=ufl_snapshot,
+    )
+    projection = run_async(
+        projection_service.project_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=schema_snapshot.project_id,
+            schema_id=schema_snapshot.schema_id,
+            schema_version_id=schema_snapshot.schema_version_id,
+            orchestration_id=ufl_snapshot.orchestration_id,
+        )
+    )
+    mutated_projection = mutate_projection(projection)
+    resigned_projection = replace(
+        mutated_projection,
+        projection_manifest_hash=_recompute_projection_manifest(mutated_projection),
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaUFLProjectionInvariantError,
+        match="dynamic_schema_ufl_projection_projection_invalid",
+    ):
+        projection_service.authenticate_dynamic_schema_ufl_projection(
+            resigned_projection,
+            subject_keys=None,
+        )
+
+
+def test_authenticate_dynamic_schema_ufl_projection_rejects_manifest_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema_snapshot = _schema_snapshot()
+    ufl_snapshot = _ufl_snapshot()
+    _install_sources(
+        monkeypatch,
+        schema_snapshot=schema_snapshot,
+        ufl_snapshot=ufl_snapshot,
+    )
+    projection = run_async(
+        projection_service.project_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=schema_snapshot.project_id,
+            schema_id=schema_snapshot.schema_id,
+            schema_version_id=schema_snapshot.schema_version_id,
+            orchestration_id=ufl_snapshot.orchestration_id,
+        )
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaUFLProjectionInvariantError,
+        match="dynamic_schema_ufl_projection_projection_invalid",
+    ):
+        projection_service.authenticate_dynamic_schema_ufl_projection(
+            replace(projection, projection_manifest_hash="3" * 64),
+            subject_keys=None,
+        )
+
+
+def test_project_orchestration_ufl_to_dynamic_schema_calls_public_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema_snapshot = _schema_snapshot()
+    ufl_snapshot = _ufl_snapshot()
+    _install_sources(
+        monkeypatch,
+        schema_snapshot=schema_snapshot,
+        ufl_snapshot=ufl_snapshot,
+    )
+    original_authenticate = projection_service.authenticate_dynamic_schema_ufl_projection
+    calls: list[int] = []
+
+    def tracking_authenticate(projection, *, subject_keys):
+        calls.append(1)
+        return original_authenticate(projection, subject_keys=subject_keys)
+
+    monkeypatch.setattr(
+        projection_service,
+        "authenticate_dynamic_schema_ufl_projection",
+        tracking_authenticate,
+    )
+
+    run_async(
+        projection_service.project_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=schema_snapshot.project_id,
+            schema_id=schema_snapshot.schema_id,
+            schema_version_id=schema_snapshot.schema_version_id,
+            orchestration_id=ufl_snapshot.orchestration_id,
+        )
+    )
+
+    assert calls == [1]

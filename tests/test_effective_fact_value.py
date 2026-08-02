@@ -202,6 +202,98 @@ def _install_projection_monkeypatch(
     )
 
 
+def _valid_effective_projection():
+    select_one_decision = _decision(
+        seed="auth-select-one",
+        decision_no=1,
+        decision_kind="select_one",
+        selected_fact_value_ids=(_uuid("auth-fv-1"),),
+    )
+    defer_decision = _decision(
+        seed="auth-defer",
+        decision_no=1,
+        decision_kind="defer",
+        selected_fact_value_ids=(),
+    )
+    compatible_decision = _decision(
+        seed="auth-compatible",
+        decision_no=1,
+        decision_kind="confirm_compatible",
+        selected_fact_value_ids=(),
+    )
+    review_projection = _projection(
+        (
+            _item(
+                seed="auth-select-one",
+                fact_id=_uuid("auth-fact-1"),
+                assessment_id=_uuid("auth-assessment-1"),
+                candidate_id=_uuid("auth-candidate-1"),
+                verdict="conflict",
+                review_status="reviewed",
+                current_decision=select_one_decision,
+                decision_history=(select_one_decision,),
+                selected_fact_value_ids=(_uuid("auth-fv-1"),),
+                members=(
+                    _member(
+                        fact_value_id=_uuid("auth-fv-1"),
+                        selected=True,
+                        selection_order=0,
+                    ),
+                    _member(fact_value_id=_uuid("auth-fv-2")),
+                ),
+            ),
+            _item(
+                seed="auth-pending",
+                fact_id=_uuid("auth-fact-2"),
+                assessment_id=_uuid("auth-assessment-2"),
+                candidate_id=_uuid("auth-candidate-2"),
+                verdict="insufficient_evidence",
+                review_status="pending_review",
+                members=(_member(fact_value_id=_uuid("auth-fv-3")),),
+            ),
+            _item(
+                seed="auth-deferred",
+                fact_id=_uuid("auth-fact-3"),
+                assessment_id=_uuid("auth-assessment-3"),
+                candidate_id=_uuid("auth-candidate-3"),
+                verdict="conflict",
+                review_status="deferred",
+                current_decision=defer_decision,
+                decision_history=(defer_decision,),
+                selected_fact_value_ids=(),
+                members=(_member(fact_value_id=_uuid("auth-fv-4")),),
+            ),
+            _item(
+                seed="auth-compatible",
+                fact_id=_uuid("auth-fact-4"),
+                assessment_id=_uuid("auth-assessment-4"),
+                candidate_id=_uuid("auth-candidate-4"),
+                verdict="compatible",
+                review_status="reviewed",
+                current_decision=compatible_decision,
+                decision_history=(compatible_decision,),
+                selected_fact_value_ids=(),
+                members=(
+                    _member(fact_value_id=_uuid("auth-fv-5")),
+                    _member(fact_value_id=_uuid("auth-fv-6")),
+                ),
+            ),
+            _item(
+                seed="auth-unreviewed-compatible",
+                fact_id=_uuid("auth-fact-5"),
+                assessment_id=_uuid("auth-assessment-5"),
+                candidate_id=_uuid("auth-candidate-5"),
+                verdict="compatible",
+                review_status="not_required",
+                members=(_member(fact_value_id=_uuid("auth-fv-7")),),
+            ),
+        )
+    )
+    return effective_fact_value_service._build_effective_fact_value_projection(
+        review_projection
+    )
+
+
 def test_get_effective_fact_value_projection_maps_select_one(monkeypatch) -> None:
     fv1 = _uuid("fv-1")
     fv2 = _uuid("fv-2")
@@ -731,3 +823,124 @@ def test_get_effective_fact_value_projection_does_not_write_and_does_not_leak_se
 
     assert session_factory.sessions == []
     assert sentinel not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "mutate_projection",
+    [
+        lambda projection: replace(
+            projection,
+            items=(replace(projection.items[0], current_decision_id=None),)
+            + projection.items[1:],
+        ),
+        lambda projection: replace(
+            projection,
+            items=(
+                replace(projection.items[0], current_decision_kind="confirm_compatible"),
+            )
+            + projection.items[1:],
+        ),
+        lambda projection: replace(
+            projection,
+            items=(replace(projection.items[0], effective_fact_value_ids=()),)
+            + projection.items[1:],
+        ),
+        lambda projection: replace(
+            projection,
+            items=(
+                projection.items[0],
+                replace(projection.items[1], current_decision_id=_uuid("bad-decision")),
+            )
+            + projection.items[2:],
+        ),
+        lambda projection: replace(
+            projection,
+            items=projection.items[:2]
+            + (
+                replace(projection.items[2], current_decision_kind="select_one"),
+            )
+            + projection.items[3:],
+        ),
+    ],
+)
+def test_authenticate_effective_fact_value_projection_rejects_invalid_state_shapes(
+    mutate_projection,
+) -> None:
+    projection = _valid_effective_projection()
+    mutated_projection = mutate_projection(projection)
+
+    with pytest.raises(
+        effective_fact_value_service.EffectiveFactValueProjectionInvariantError,
+        match="effective_fact_value_projection_immutable_ledger_mismatch",
+    ):
+        effective_fact_value_service.authenticate_effective_fact_value_projection(
+            mutated_projection
+        )
+
+
+def test_authenticate_effective_fact_value_projection_rejects_pending_deferred_and_unreviewed_shape_errors() -> None:
+    projection = _valid_effective_projection()
+    mutated_projection = replace(
+        projection,
+        items=(
+            projection.items[0],
+            replace(projection.items[1], review_status="reviewed"),
+            replace(projection.items[2], current_decision_kind="select_one"),
+            replace(
+                projection.items[3],
+                effective_fact_value_ids=(_uuid("auth-fv-5"),),
+            ),
+            replace(projection.items[4], review_status="reviewed"),
+        ),
+    )
+
+    with pytest.raises(
+        effective_fact_value_service.EffectiveFactValueProjectionInvariantError,
+        match="effective_fact_value_projection_immutable_ledger_mismatch",
+    ):
+        effective_fact_value_service.authenticate_effective_fact_value_projection(
+            mutated_projection
+        )
+
+
+def test_authenticate_effective_fact_value_projection_rejects_bool_counts() -> None:
+    projection = _valid_effective_projection()
+
+    with pytest.raises(
+        effective_fact_value_service.EffectiveFactValueProjectionInvariantError,
+        match="effective_fact_value_projection_immutable_ledger_mismatch",
+    ):
+        effective_fact_value_service.authenticate_effective_fact_value_projection(
+            replace(projection, fact_count=True)
+        )
+
+
+def test_get_effective_fact_value_projection_calls_public_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = _projection(())
+    _install_projection_monkeypatch(monkeypatch, projection=projection)
+    original_authenticate = (
+        effective_fact_value_service.authenticate_effective_fact_value_projection
+    )
+    calls: list[int] = []
+
+    def tracking_authenticate(auth_projection):
+        calls.append(1)
+        return original_authenticate(auth_projection)
+
+    monkeypatch.setattr(
+        effective_fact_value_service,
+        "authenticate_effective_fact_value_projection",
+        tracking_authenticate,
+    )
+
+    run_async(
+        effective_fact_value_service.get_effective_fact_value_projection(
+            SessionFactory(),
+            project_id=projection.project_id,
+            consistency_check_application_id=projection.consistency_check_application_id,
+        )
+    )
+
+    assert calls == [1]

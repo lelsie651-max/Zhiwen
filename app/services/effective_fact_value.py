@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Callable, Sequence
 
@@ -15,6 +16,9 @@ from app.schemas.effective_fact_value import (
     EffectiveFactValueProjectionItem,
 )
 from app.services import consistency_projection as projection_service
+
+
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class EffectiveFactValueProjectionError(Exception):
@@ -33,6 +37,30 @@ def _require_uuid(value: uuid.UUID, *, field_name: str) -> uuid.UUID:
     if not isinstance(value, uuid.UUID):
         raise EffectiveFactValueProjectionStateError(
             f"effective_fact_value_projection_{field_name}_invalid"
+        )
+    return value
+
+
+def _require_projection_uuid(value: object) -> uuid.UUID:
+    if not isinstance(value, uuid.UUID):
+        raise EffectiveFactValueProjectionInvariantError(
+            "effective_fact_value_projection_immutable_ledger_mismatch"
+        )
+    return value
+
+
+def _require_projection_sha256(value: object) -> str:
+    if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
+        raise EffectiveFactValueProjectionInvariantError(
+            "effective_fact_value_projection_immutable_ledger_mismatch"
+        )
+    return value
+
+
+def _require_projection_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise EffectiveFactValueProjectionInvariantError(
+            "effective_fact_value_projection_immutable_ledger_mismatch"
         )
     return value
 
@@ -172,6 +200,153 @@ def _resolve_effective_fact_value_ids(
     _immutable_mismatch()
 
 
+def _validate_authenticated_projection_item(
+    item: EffectiveFactValueProjectionItem,
+    *,
+    seen_fact_ids: set[uuid.UUID],
+    seen_candidate_ids: set[uuid.UUID],
+    seen_assessment_ids: set[uuid.UUID],
+) -> None:
+    fact_id = _require_projection_uuid(item.fact_id)
+    candidate_id = _require_projection_uuid(item.candidate_id)
+    assessment_id = _require_projection_uuid(item.assessment_id)
+    if fact_id in seen_fact_ids:
+        _immutable_mismatch()
+    if candidate_id in seen_candidate_ids:
+        _immutable_mismatch()
+    if assessment_id in seen_assessment_ids:
+        _immutable_mismatch()
+    seen_fact_ids.add(fact_id)
+    seen_candidate_ids.add(candidate_id)
+    seen_assessment_ids.add(assessment_id)
+
+    member_fact_value_ids: list[uuid.UUID] = []
+    seen_member_fact_value_ids: set[uuid.UUID] = set()
+    for member in item.candidate_members:
+        member_fact_value_id = _require_projection_uuid(member.fact_value_id)
+        if member_fact_value_id in seen_member_fact_value_ids:
+            _immutable_mismatch()
+        seen_member_fact_value_ids.add(member_fact_value_id)
+        member_fact_value_ids.append(member_fact_value_id)
+
+    seen_effective_fact_value_ids: set[uuid.UUID] = set()
+    for fact_value_id in item.effective_fact_value_ids:
+        validated_fact_value_id = _require_projection_uuid(fact_value_id)
+        if validated_fact_value_id in seen_effective_fact_value_ids:
+            _immutable_mismatch()
+        if validated_fact_value_id not in seen_member_fact_value_ids:
+            _immutable_mismatch()
+        seen_effective_fact_value_ids.add(validated_fact_value_id)
+
+    if item.resolution_status == "resolved":
+        if item.review_status != "reviewed":
+            _immutable_mismatch()
+        if item.current_decision_id is None:
+            _immutable_mismatch()
+        _require_projection_uuid(item.current_decision_id)
+        if item.resolution_basis == "human_selection":
+            if item.current_decision_kind == "select_one":
+                if len(item.effective_fact_value_ids) != 1:
+                    _immutable_mismatch()
+            elif item.current_decision_kind == "keep_multiple":
+                if not 2 <= len(item.effective_fact_value_ids) <= 200:
+                    _immutable_mismatch()
+            else:
+                _immutable_mismatch()
+        elif item.resolution_basis == "human_confirmed_compatibility":
+            if item.current_decision_kind != "confirm_compatible":
+                _immutable_mismatch()
+            if item.effective_fact_value_ids != tuple(member_fact_value_ids):
+                _immutable_mismatch()
+        else:
+            _immutable_mismatch()
+    elif item.resolution_status == "pending_review":
+        if item.agent_verdict not in {"conflict", "insufficient_evidence"}:
+            _immutable_mismatch()
+        if item.review_status != "pending_review":
+            _immutable_mismatch()
+        if item.resolution_basis != "none":
+            _immutable_mismatch()
+        if item.current_decision_id is not None or item.current_decision_kind is not None:
+            _immutable_mismatch()
+        if item.effective_fact_value_ids:
+            _immutable_mismatch()
+    elif item.resolution_status == "unreviewed_compatible":
+        if item.agent_verdict != "compatible":
+            _immutable_mismatch()
+        if item.review_status != "not_required":
+            _immutable_mismatch()
+        if item.resolution_basis != "none":
+            _immutable_mismatch()
+        if item.current_decision_id is not None or item.current_decision_kind is not None:
+            _immutable_mismatch()
+        if item.effective_fact_value_ids:
+            _immutable_mismatch()
+    elif item.resolution_status == "deferred":
+        if item.review_status != "deferred":
+            _immutable_mismatch()
+        if item.resolution_basis != "none":
+            _immutable_mismatch()
+        if item.current_decision_id is None:
+            _immutable_mismatch()
+        _require_projection_uuid(item.current_decision_id)
+        if item.current_decision_kind != "defer":
+            _immutable_mismatch()
+        if item.effective_fact_value_ids:
+            _immutable_mismatch()
+    else:
+        _immutable_mismatch()
+
+
+def authenticate_effective_fact_value_projection(
+    projection: EffectiveFactValueProjection,
+) -> EffectiveFactValueProjection:
+    if not isinstance(projection, EffectiveFactValueProjection):
+        raise EffectiveFactValueProjectionInvariantError(
+            "effective_fact_value_projection_immutable_ledger_mismatch"
+        )
+    _require_projection_uuid(projection.project_id)
+    _require_projection_uuid(projection.consistency_check_application_id)
+    _require_projection_uuid(projection.source_consistency_application_id)
+    _require_projection_sha256(projection.result_manifest_hash)
+    fact_count = _require_projection_count(projection.fact_count)
+    resolved_count = _require_projection_count(projection.resolved_count)
+    pending_count = _require_projection_count(projection.pending_count)
+    deferred_count = _require_projection_count(projection.deferred_count)
+
+    seen_fact_ids: set[uuid.UUID] = set()
+    seen_candidate_ids: set[uuid.UUID] = set()
+    seen_assessment_ids: set[uuid.UUID] = set()
+    for item in projection.items:
+        _validate_authenticated_projection_item(
+            item,
+            seen_fact_ids=seen_fact_ids,
+            seen_candidate_ids=seen_candidate_ids,
+            seen_assessment_ids=seen_assessment_ids,
+        )
+
+    recomputed_resolved_count = sum(
+        1 for item in projection.items if item.resolution_status == "resolved"
+    )
+    recomputed_pending_count = sum(
+        1
+        for item in projection.items
+        if item.resolution_status in {"pending_review", "unreviewed_compatible"}
+    )
+    recomputed_deferred_count = sum(
+        1 for item in projection.items if item.resolution_status == "deferred"
+    )
+    if fact_count != len(projection.items):
+        _immutable_mismatch()
+    if resolved_count != recomputed_resolved_count:
+        _immutable_mismatch()
+    if pending_count != recomputed_pending_count:
+        _immutable_mismatch()
+    if deferred_count != recomputed_deferred_count:
+        _immutable_mismatch()
+    return projection
+
+
 async def get_effective_fact_value_projection(
     session_factory: Callable[[], AsyncSession],
     *,
@@ -258,14 +433,16 @@ def _build_effective_fact_value_projection(
     deferred_count = sum(
         1 for item in items if item.resolution_status == "deferred"
     )
-    return EffectiveFactValueProjection(
-        project_id=review_projection.project_id,
-        consistency_check_application_id=review_projection.consistency_check_application_id,
-        source_consistency_application_id=review_projection.source_consistency_application_id,
-        result_manifest_hash=review_projection.result_manifest_hash,
-        fact_count=len(items),
-        resolved_count=resolved_count,
-        pending_count=pending_count,
-        deferred_count=deferred_count,
-        items=tuple(items),
+    return authenticate_effective_fact_value_projection(
+        EffectiveFactValueProjection(
+            project_id=review_projection.project_id,
+            consistency_check_application_id=review_projection.consistency_check_application_id,
+            source_consistency_application_id=review_projection.source_consistency_application_id,
+            result_manifest_hash=review_projection.result_manifest_hash,
+            fact_count=len(items),
+            resolved_count=resolved_count,
+            pending_count=pending_count,
+            deferred_count=deferred_count,
+            items=tuple(items),
+        )
     )
