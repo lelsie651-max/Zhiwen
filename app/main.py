@@ -8,6 +8,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.routers.app import router as app_router
+from app.routers.bailian_tools import router as bailian_tools_router
 from app.routers.health import router as health_router
 from app.routers.projects import router as projects_router
 from app.routers.web import router as web_router
@@ -49,6 +50,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(app_router)
     app.include_router(projects_router)
+    app.include_router(bailian_tools_router)
 
     return app
 

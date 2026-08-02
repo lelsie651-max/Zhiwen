@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(default=26214400, gt=0)
     upload_chunk_bytes: int = Field(default=1048576, gt=0)
     processing_stale_minutes: int = Field(default=30, gt=0)
+    bailian_tool_token: SecretStr = SecretStr("")
 
     # LLM (OpenAI-compatible) settings. Works with DeepSeek official API,
     # Alibaba Cloud Bailian (DashScope compatible-mode), or any compatible host.
