@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from app.models.processing_job import ProcessingJob
     from app.models.project import Project
     from app.models.project_member import ProjectMember
+    from app.models.project_version import ProjectVersion
 
 
 class UserStatus(StrEnum):
@@ -74,6 +75,10 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     created_projects: Mapped[list["Project"]] = relationship(
         back_populates="created_by",
         foreign_keys="Project.created_by_id",
+    )
+    created_project_versions: Mapped[list["ProjectVersion"]] = relationship(
+        back_populates="created_by",
+        foreign_keys="ProjectVersion.created_by_id",
     )
     project_members: Mapped[list["ProjectMember"]] = relationship(
         back_populates="user",

@@ -62,6 +62,7 @@ class DynamicSchema(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "dynamic_schemas"
     __table_args__ = (
         UniqueConstraint("project_id", "schema_key", name="uq_dynamic_schemas_project_id_schema_key"),
+        UniqueConstraint("id", "project_id", name="uq_dynschema_id_project"),
         UniqueConstraint("current_version_id", name="uq_dynamic_schemas_current_version_id"),
         CheckConstraint("char_length(schema_key) BETWEEN 1 AND 120", name="dynamic_schemas_schema_key_length"),
         CheckConstraint("schema_key ~ '^[a-z0-9._-]+$'", name="dynamic_schemas_schema_key_format"),
@@ -143,6 +144,7 @@ class DynamicSchemaVersion(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "dynamic_schema_versions"
     __table_args__ = (
         UniqueConstraint("schema_id", "version_no", name="uq_dynamic_schema_versions_schema_id_version_no"),
+        UniqueConstraint("id", "schema_id", name="uq_dynsver_id_schema"),
         CheckConstraint("version_no > 0", name="dynamic_schema_versions_version_no_positive"),
         CheckConstraint(
             "status IN ('draft', 'proposed', 'active', 'retired')",

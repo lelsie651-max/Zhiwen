@@ -39,6 +39,12 @@ class FactExtractionOrchestration(UUIDPrimaryKeyMixin, Base):
             name="uq_feo_id_extraction_run",
         ),
         UniqueConstraint(
+            "id",
+            "project_id",
+            "extraction_run_id",
+            name="uq_feo_id_proj_run",
+        ),
+        UniqueConstraint(
             "extraction_run_id",
             "request_hash",
             "attempt_no",

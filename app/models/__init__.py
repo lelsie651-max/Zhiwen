@@ -85,6 +85,7 @@ from app.models.ingestion_validation import (
     ValidationUserDecision,
 )
 from app.models.project import Project, ProjectStatus, ProjectVisibility
+from app.models.project_version import ProjectVersion, ProjectVersionCreationKind
 from app.models.project_member import ProjectMember, ProjectMemberRole
 from app.models.processing_job import (
     ProcessingJob,
@@ -167,6 +168,8 @@ __all__ = [
     "Project",
     "ProjectVisibility",
     "ProjectStatus",
+    "ProjectVersion",
+    "ProjectVersionCreationKind",
     "ProjectMember",
     "ProjectMemberRole",
     "ProcessingJob",

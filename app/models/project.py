@@ -4,7 +4,7 @@ import uuid
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, ForeignKeyConstraint, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from app.models.inference import InferenceInputBatch, InferenceRun
     from app.models.processing_job import ProcessingJob
     from app.models.project_member import ProjectMember
+    from app.models.project_version import ProjectVersion
     from app.models.user import User
 
 
@@ -35,6 +36,12 @@ class ProjectStatus(StrEnum):
 class Project(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "projects"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["current_version_id", "id"],
+            ["project_versions.id", "project_versions.project_id"],
+            name="fk_projects_cur_ver_projver",
+            ondelete="RESTRICT",
+        ),
         UniqueConstraint("slug", name="uq_projects_slug"),
         CheckConstraint("char_length(name) BETWEEN 1 AND 100", name="projects_name_length"),
         CheckConstraint("char_length(slug) BETWEEN 3 AND 64", name="projects_slug_length"),
@@ -67,6 +74,10 @@ class Project(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         default=ProjectStatus.ACTIVE.value,
         server_default=ProjectStatus.ACTIVE.value,
     )
+    current_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        index=True,
+    )
     created_by_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
@@ -76,6 +87,19 @@ class Project(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     created_by: Mapped["User"] = relationship(
         back_populates="created_projects",
         foreign_keys=[created_by_id],
+    )
+    current_version: Mapped["ProjectVersion | None"] = relationship(
+        back_populates="current_for_project",
+        foreign_keys=[current_version_id],
+        post_update=True,
+        uselist=False,
+        overlaps="project,project_versions",
+    )
+    project_versions: Mapped[list["ProjectVersion"]] = relationship(
+        back_populates="project",
+        foreign_keys="ProjectVersion.project_id",
+        passive_deletes=True,
+        overlaps="current_version,current_for_project",
     )
     members: Mapped[list["ProjectMember"]] = relationship(
         back_populates="project",

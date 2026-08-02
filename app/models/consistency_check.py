@@ -202,6 +202,13 @@ class ConsistencyCheckApplication(UUIDPrimaryKeyMixin, Base):
             "consistency_application_id",
             name="uq_ccapp_id_srcapp",
         ),
+        UniqueConstraint(
+            "id",
+            "project_id",
+            "orchestration_id",
+            "consistency_application_id",
+            name="uq_ccapp_id_proj_orch_src",
+        ),
         CheckConstraint(
             "source_result_manifest_hash ~ '^[0-9a-f]{64}$'",
             name="src_result_hash_fmt",
