@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -7,6 +8,12 @@ import uuid
 
 import pytest
 
+from app.schemas.bailian_review_tools import (
+    BailianReviewItemDetailResponse,
+    BailianReviewItemsResponse,
+    BailianReviewItemSummary,
+    BailianVersionRecordResponse,
+)
 from app.schemas.dynamic_schema_review_projection import (
     DynamicSchemaReviewProjection,
     DynamicSchemaReviewedFact,
@@ -370,6 +377,55 @@ def _build_project_version_snapshot() -> ProjectVersionSnapshot:
     )
 
 
+def _list_request_identity(
+    projection: DynamicSchemaReviewProjection,
+    *,
+    state: str = "all",
+    limit: int = 10,
+) -> dict[str, object]:
+    return {
+        "project_id": str(projection.project_id),
+        "schema_id": str(projection.schema_id),
+        "schema_version_id": str(projection.schema_version_id),
+        "orchestration_id": str(projection.orchestration_id),
+        "consistency_check_application_id": str(
+            projection.consistency_check_application_id
+        ),
+        "state": state,
+        "limit": limit,
+    }
+
+
+def _detail_request_identity(
+    projection: DynamicSchemaReviewProjection,
+    *,
+    fact_id: uuid.UUID,
+) -> dict[str, object]:
+    return {
+        "project_id": str(projection.project_id),
+        "schema_id": str(projection.schema_id),
+        "schema_version_id": str(projection.schema_version_id),
+        "orchestration_id": str(projection.orchestration_id),
+        "consistency_check_application_id": str(
+            projection.consistency_check_application_id
+        ),
+        "fact_id": str(fact_id),
+    }
+
+
+def _record_request_identity(
+    snapshot: ProjectVersionSnapshot,
+    *,
+    project_version_id: uuid.UUID | None = None,
+    subject_key: str = "alpha",
+) -> dict[str, object]:
+    return {
+        "project_id": str(snapshot.project_id),
+        "project_version_id": str(project_version_id or snapshot.id),
+        "subject_key": subject_key,
+    }
+
+
 def test_list_review_items_deduplicates_filters_sorts_and_hashes(monkeypatch) -> None:
     projection = _build_review_projection()
     build_calls: list[dict[str, object]] = []
@@ -466,6 +522,180 @@ def test_list_review_items_deduplicates_filters_sorts_and_hashes(monkeypatch) ->
     assert changed.payload_hash != response.payload_hash
 
 
+def test_detail_and_record_responses_are_deeply_immutable_and_detached(monkeypatch) -> None:
+    projection = _build_review_projection()
+    snapshot = _build_project_version_snapshot()
+    raw_fact_json = bailian_tools_service.raw_projection_service.serialize_dynamic_schema_ufl_fact(
+        projection.records[0].fields[0].reviewed_facts[0].fact
+    )
+
+    async def fake_build(*args, **kwargs):
+        return projection
+
+    async def fake_get_snapshot(*args, **kwargs):
+        return snapshot
+
+    monkeypatch.setattr(
+        bailian_tools_service.review_projection_service,
+        "project_reviewed_orchestration_ufl_to_dynamic_schema",
+        fake_build,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service.review_projection_service,
+        "authenticate_dynamic_schema_review_projection",
+        lambda value, *, subject_keys: value,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service.raw_projection_service,
+        "serialize_dynamic_schema_ufl_fact",
+        lambda fact: raw_fact_json,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service.project_version_service,
+        "get_project_version_snapshot",
+        fake_get_snapshot,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service.project_version_service,
+        "authenticate_project_version_snapshot",
+        lambda value: value,
+    )
+
+    detail = run_async(
+        bailian_tools_service.get_review_item_detail(
+            object(),
+            project_id=str(projection.project_id),
+            fact_id=str(_uuid("review-fact")),
+            schema_id=str(projection.schema_id),
+            schema_version_id=str(projection.schema_version_id),
+            orchestration_id=str(projection.orchestration_id),
+            consistency_check_application_id=str(
+                projection.consistency_check_application_id
+            ),
+        )
+    )
+    record = run_async(
+        bailian_tools_service.get_version_record(
+            object(),
+            project_id=str(snapshot.project_id),
+            project_version_id=str(snapshot.id),
+            subject_key="alpha",
+        )
+    )
+
+    raw_fact_json["value_groups"][0]["values"][0]["normalized_value_text"] = "mutated"
+    snapshot.snapshot_json["records"][0]["subject_key"] = "mutated"  # type: ignore[index]
+    snapshot.snapshot_json["records"][0]["sections"][0]["fields"][0]["source_field"]["field_key"] = "mutated"  # type: ignore[index]
+
+    assert detail.value_groups[0]["values"][0]["normalized_value_text"] == "Alice"
+    assert record.record_json["subject_key"] == "alpha"
+    assert record.record_json["sections"][0]["fields"][0]["source_field"]["field_key"] == "title"
+    with pytest.raises(TypeError):
+        detail.value_groups[0]["values"][0]["normalized_value_text"] = "blocked"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        record.record_json["subject_key"] = "blocked"  # type: ignore[index]
+
+
+def test_three_public_authenticators_are_called_by_production_services(monkeypatch) -> None:
+    projection = _build_review_projection()
+    snapshot = _build_project_version_snapshot()
+    calls = {"list": 0, "detail": 0, "record": 0}
+    original_list_auth = bailian_tools_service.authenticate_bailian_review_items_response
+    original_detail_auth = bailian_tools_service.authenticate_bailian_review_item_detail_response
+    original_record_auth = bailian_tools_service.authenticate_bailian_version_record_response
+
+    async def fake_build(*args, **kwargs):
+        return projection
+
+    async def fake_get_snapshot(*args, **kwargs):
+        return snapshot
+
+    monkeypatch.setattr(
+        bailian_tools_service.review_projection_service,
+        "project_reviewed_orchestration_ufl_to_dynamic_schema",
+        fake_build,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service.review_projection_service,
+        "authenticate_dynamic_schema_review_projection",
+        lambda value, *, subject_keys: value,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service.project_version_service,
+        "get_project_version_snapshot",
+        fake_get_snapshot,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service.project_version_service,
+        "authenticate_project_version_snapshot",
+        lambda value: value,
+    )
+
+    def tracking_list_auth(response, *, request_identity):
+        calls["list"] += 1
+        return original_list_auth(response, request_identity=request_identity)
+
+    def tracking_detail_auth(response, *, request_identity):
+        calls["detail"] += 1
+        return original_detail_auth(response, request_identity=request_identity)
+
+    def tracking_record_auth(response, *, request_identity):
+        calls["record"] += 1
+        return original_record_auth(response, request_identity=request_identity)
+
+    monkeypatch.setattr(
+        bailian_tools_service,
+        "authenticate_bailian_review_items_response",
+        tracking_list_auth,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service,
+        "authenticate_bailian_review_item_detail_response",
+        tracking_detail_auth,
+    )
+    monkeypatch.setattr(
+        bailian_tools_service,
+        "authenticate_bailian_version_record_response",
+        tracking_record_auth,
+    )
+
+    run_async(
+        bailian_tools_service.list_review_items(
+            object(),
+            project_id=str(projection.project_id),
+            schema_id=str(projection.schema_id),
+            schema_version_id=str(projection.schema_version_id),
+            orchestration_id=str(projection.orchestration_id),
+            consistency_check_application_id=str(
+                projection.consistency_check_application_id
+            ),
+        )
+    )
+    run_async(
+        bailian_tools_service.get_review_item_detail(
+            object(),
+            project_id=str(projection.project_id),
+            fact_id=str(_uuid("review-fact")),
+            schema_id=str(projection.schema_id),
+            schema_version_id=str(projection.schema_version_id),
+            orchestration_id=str(projection.orchestration_id),
+            consistency_check_application_id=str(
+                projection.consistency_check_application_id
+            ),
+        )
+    )
+    run_async(
+        bailian_tools_service.get_version_record(
+            object(),
+            project_id=str(snapshot.project_id),
+            project_version_id=str(snapshot.id),
+            subject_key="alpha",
+        )
+    )
+
+    assert calls == {"list": 1, "detail": 1, "record": 1}
+
+
 def test_get_review_item_detail_preserves_values_and_evidence(monkeypatch) -> None:
     projection = _build_review_projection()
 
@@ -507,6 +737,98 @@ def test_get_review_item_detail_preserves_values_and_evidence(monkeypatch) -> No
     assert detail.value_groups[0]["evidences"][0]["excerpt"] == "alpha evidence"
 
 
+def test_authenticate_bailian_review_items_response_rejects_sort_count_filter_and_duplicate_drift() -> None:
+    projection = _build_review_projection()
+    response = BailianReviewItemsResponse(
+        source_manifest_hash=projection.reviewed_projection_manifest_hash,
+        payload_hash="",
+        project_id=projection.project_id,
+        schema_id=projection.schema_id,
+        schema_version_id=projection.schema_version_id,
+        orchestration_id=projection.orchestration_id,
+        consistency_check_application_id=projection.consistency_check_application_id,
+        reviewed_projection_manifest_hash=projection.reviewed_projection_manifest_hash,
+        state="all",
+        limit=10,
+        item_count=3,
+        items=(
+            BailianReviewItemSummary(
+                fact_id=_uuid("review-fact"),
+                subject_kind="person",
+                subject_key="alpha",
+                predicate_key="title",
+                scope_key=None,
+                matched_field_keys=("title", "alias"),
+                review_state="pending_review",
+                resolution_basis="none",
+                requires_review=True,
+                semantic_value_count=1,
+                fact_value_count=2,
+                evidence_count=1,
+            ),
+            BailianReviewItemSummary(
+                fact_id=_uuid("resolved-fact"),
+                subject_kind="person",
+                subject_key="alpha",
+                predicate_key="status",
+                scope_key="profile",
+                matched_field_keys=("status",),
+                review_state="resolved",
+                resolution_basis="human_selection",
+                requires_review=False,
+                semantic_value_count=1,
+                fact_value_count=1,
+                evidence_count=1,
+            ),
+            BailianReviewItemSummary(
+                fact_id=_uuid("observation-fact"),
+                subject_kind="person",
+                subject_key="beta",
+                predicate_key="alias",
+                scope_key=None,
+                matched_field_keys=("beta_alias",),
+                review_state="no_consistency_candidate",
+                resolution_basis="none",
+                requires_review=False,
+                semantic_value_count=1,
+                fact_value_count=1,
+                evidence_count=1,
+            ),
+        ),
+    )
+    request_identity = _list_request_identity(projection)
+    response = response.model_copy(
+        update={
+            "payload_hash": bailian_tools_service._build_payload_hash(
+                response,
+                tool_name="bailian_review_items",
+                request_identity=request_identity,
+            )
+        }
+    )
+    authenticated = bailian_tools_service.authenticate_bailian_review_items_response(
+        response,
+        request_identity=request_identity,
+    )
+    assert authenticated.payload_hash == response.payload_hash
+
+    invalid_responses = (
+        response.model_copy(update={"item_count": 2}),
+        response.model_copy(update={"state": "review_required", "payload_hash": _hash("fake")}),
+        response.model_copy(update={"items": tuple(reversed(response.items)), "payload_hash": _hash("fake")}),
+        response.model_copy(update={"items": response.items[:2] + (response.items[0],), "item_count": 3, "payload_hash": _hash("fake")}),
+    )
+    for invalid in invalid_responses:
+        with pytest.raises(
+            bailian_tools_service.BailianReviewToolInvariantError,
+            match="bailian_review_tool_payload_invalid",
+        ):
+            bailian_tools_service.authenticate_bailian_review_items_response(
+                invalid,
+                request_identity=request_identity,
+            )
+
+
 def test_get_review_item_detail_rejects_unknown_fact(monkeypatch) -> None:
     projection = _build_review_projection()
 
@@ -541,6 +863,111 @@ def test_get_review_item_detail_rejects_unknown_fact(monkeypatch) -> None:
                 ),
             )
         )
+
+
+def test_authenticate_bailian_review_item_detail_response_rejects_nested_drift() -> None:
+    projection = _build_review_projection()
+    detail = BailianReviewItemDetailResponse(
+        source_manifest_hash=projection.reviewed_projection_manifest_hash,
+        payload_hash="",
+        project_id=projection.project_id,
+        schema_id=projection.schema_id,
+        schema_version_id=projection.schema_version_id,
+        orchestration_id=projection.orchestration_id,
+        extraction_run_id=projection.extraction_run_id,
+        consistency_check_application_id=projection.consistency_check_application_id,
+        source_consistency_application_id=projection.source_consistency_application_id,
+        reviewed_projection_manifest_hash=projection.reviewed_projection_manifest_hash,
+        fact_id=_uuid("review-fact"),
+        identity_hash=_hash("fact-identity"),
+        subject_kind="person",
+        subject_key="alpha",
+        subject_entity_id=None,
+        predicate_key="title",
+        scope_key=None,
+        semantic_value_count=1,
+        fact_value_count=2,
+        matched_field_keys=("title", "alias"),
+        review_state="pending_review",
+        resolution_basis="none",
+        current_decision_id=None,
+        current_decision_kind=None,
+        effective_fact_value_ids=(),
+        requires_review=True,
+        value_groups=(
+            {
+                "semantic_key_hash": _hash("semantic"),
+                "value_type": "string",
+                "value_json": {"texts": ["Alice", "Alicia"]},
+                "referenced_entity_id": None,
+                "fact_value_ids": [str(_uuid("value-1")), str(_uuid("value-2"))],
+                "values": [
+                    {
+                        "fact_value_id": str(_uuid("value-1")),
+                        "normalized_value_text": "Alice",
+                    },
+                    {
+                        "fact_value_id": str(_uuid("value-2")),
+                        "normalized_value_text": "Alicia",
+                    },
+                ],
+                "evidences": [
+                    {"excerpt": "alpha evidence"},
+                ],
+            },
+        ),
+    )
+    request_identity = _detail_request_identity(projection, fact_id=detail.fact_id)
+    detail = detail.model_copy(
+        update={
+            "payload_hash": bailian_tools_service._build_payload_hash(
+                detail,
+                tool_name="bailian_review_item_detail",
+                request_identity=request_identity,
+            )
+        }
+    )
+    authenticated = bailian_tools_service.authenticate_bailian_review_item_detail_response(
+        detail,
+        request_identity=request_identity,
+    )
+    assert isinstance(authenticated.value_groups[0], Mapping)
+
+    invalid_details = (
+        detail.model_copy(update={"semantic_value_count": 2}),
+        detail.model_copy(update={"fact_value_count": 3}),
+        detail.model_copy(
+            update={
+                "effective_fact_value_ids": (_uuid("missing-value"),),
+                "payload_hash": _hash("fake"),
+            }
+        ),
+        detail.model_copy(
+            update={
+                "value_groups": (
+                    {
+                        "semantic_key_hash": _hash("semantic"),
+                        "value_type": "string",
+                        "value_json": {"texts": ["Alice"]},
+                        "referenced_entity_id": None,
+                        "fact_value_ids": [str(_uuid("value-1"))],
+                        "values": {"not": "a-list"},
+                        "evidences": [],
+                    },
+                ),
+                "payload_hash": _hash("fake"),
+            }
+        ),
+    )
+    for invalid in invalid_details:
+        with pytest.raises(
+            bailian_tools_service.BailianReviewToolInvariantError,
+            match="bailian_review_tool_payload_invalid",
+        ):
+            bailian_tools_service.authenticate_bailian_review_item_detail_response(
+                invalid,
+                request_identity=request_identity,
+            )
 
 
 def test_get_version_record_reads_exact_subject_and_hash_changes(monkeypatch) -> None:
@@ -605,6 +1032,57 @@ def test_get_version_record_reads_exact_subject_and_hash_changes(monkeypatch) ->
     assert response.record_json["subject_key"] == "alpha"
     assert response.payload_hash == deterministic.payload_hash
     assert changed.payload_hash != response.payload_hash
+
+
+def test_authenticate_bailian_version_record_response_rejects_subject_mismatch_and_hash_drift() -> None:
+    snapshot = _build_project_version_snapshot()
+    response = BailianVersionRecordResponse(
+        source_manifest_hash=snapshot.knowledge_view_manifest_hash,
+        payload_hash="",
+        project_id=snapshot.project_id,
+        project_version_id=snapshot.id,
+        version_no=snapshot.version_no,
+        is_current=snapshot.is_current,
+        schema_id=snapshot.schema_id,
+        schema_version_id=snapshot.schema_version_id,
+        orchestration_id=snapshot.orchestration_id,
+        extraction_run_id=snapshot.extraction_run_id,
+        consistency_check_application_id=snapshot.consistency_check_application_id,
+        source_consistency_application_id=snapshot.source_consistency_application_id,
+        knowledge_view_manifest_hash=snapshot.knowledge_view_manifest_hash,
+        subject_key="alpha",
+        record_json={"subject_key": "alpha", "sections": []},
+    )
+    request_identity = _record_request_identity(snapshot)
+    response = response.model_copy(
+        update={
+            "payload_hash": bailian_tools_service._build_payload_hash(
+                response,
+                tool_name="bailian_version_record",
+                request_identity=request_identity,
+            )
+        }
+    )
+    authenticated = bailian_tools_service.authenticate_bailian_version_record_response(
+        response,
+        request_identity=request_identity,
+    )
+    assert authenticated.payload_hash == response.payload_hash
+
+    for invalid in (
+        response.model_copy(
+            update={"record_json": {"subject_key": "beta", "sections": []}, "payload_hash": _hash("fake")}
+        ),
+        response.model_copy(update={"payload_hash": _hash("fake")}),
+    ):
+        with pytest.raises(
+            bailian_tools_service.BailianReviewToolInvariantError,
+            match="bailian_review_tool_payload_invalid",
+        ):
+            bailian_tools_service.authenticate_bailian_version_record_response(
+                invalid,
+                request_identity=request_identity,
+            )
 
 
 def test_get_version_record_rejects_missing_subject(monkeypatch) -> None:

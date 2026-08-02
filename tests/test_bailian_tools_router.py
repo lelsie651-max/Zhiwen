@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from types import SimpleNamespace
 import uuid
 
@@ -49,9 +48,9 @@ def _set_tool_token(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
 
 
 def _build_list_response() -> BailianReviewItemsResponse:
-    return BailianReviewItemsResponse(
+    response = BailianReviewItemsResponse(
         source_manifest_hash=_hash("reviewed-manifest"),
-        payload_hash=_hash("payload"),
+        payload_hash="",
         project_id=_uuid("project"),
         schema_id=_uuid("schema"),
         schema_version_id=_uuid("schema-version"),
@@ -77,6 +76,29 @@ def _build_list_response() -> BailianReviewItemsResponse:
                 evidence_count=1,
             ),
         ),
+    )
+    request_identity = {
+        "project_id": str(response.project_id),
+        "schema_id": str(response.schema_id),
+        "schema_version_id": str(response.schema_version_id),
+        "orchestration_id": str(response.orchestration_id),
+        "consistency_check_application_id": str(
+            response.consistency_check_application_id
+        ),
+        "state": response.state,
+        "limit": response.limit,
+    }
+    return bailian_tools_service.authenticate_bailian_review_items_response(
+        response.model_copy(
+            update={
+                "payload_hash": bailian_tools_service._build_payload_hash(
+                    response,
+                    tool_name="bailian_review_items",
+                    request_identity=request_identity,
+                )
+            }
+        ),
+        request_identity=request_identity,
     )
 
 
@@ -155,9 +177,9 @@ def _build_detail_response() -> BailianReviewItemDetailResponse:
 
 
 def _build_record_response() -> BailianVersionRecordResponse:
-    return BailianVersionRecordResponse(
+    response = BailianVersionRecordResponse(
         source_manifest_hash=_hash("knowledge-manifest"),
-        payload_hash=_hash("record-payload"),
+        payload_hash="",
         project_id=_uuid("project"),
         project_version_id=_uuid("project-version"),
         version_no=2,
@@ -177,6 +199,23 @@ def _build_record_response() -> BailianVersionRecordResponse:
             "issue_count": 0,
             "sections": [],
         },
+    )
+    request_identity = {
+        "project_id": str(response.project_id),
+        "project_version_id": str(response.project_version_id),
+        "subject_key": response.subject_key,
+    }
+    return bailian_tools_service.authenticate_bailian_version_record_response(
+        response.model_copy(
+            update={
+                "payload_hash": bailian_tools_service._build_payload_hash(
+                    response,
+                    tool_name="bailian_version_record",
+                    request_identity=request_identity,
+                )
+            }
+        ),
+        request_identity=request_identity,
     )
 
 
@@ -255,6 +294,66 @@ def test_bailian_router_accepts_correct_token_and_calls_services(monkeypatch) ->
     assert detail_response.status_code == 200
     assert record_response.status_code == 200
     assert calls == {"list": 1, "detail": 1, "record": 1}
+
+
+def test_bailian_router_serializes_frozen_detail_and_record_json(monkeypatch) -> None:
+    _set_tool_token(monkeypatch, "server-secret")
+
+    async def fake_detail(*args, **kwargs):
+        return _build_detail_response()
+
+    async def fake_record(*args, **kwargs):
+        return _build_record_response()
+
+    monkeypatch.setattr(bailian_tools_service, "get_review_item_detail", fake_detail)
+    monkeypatch.setattr(bailian_tools_service, "get_version_record", fake_record)
+    headers = {"X-Zhiwen-Tool-Token": "server-secret"}
+    with TestClient(app) as client:
+        detail_response = client.get(
+            f"/api/v1/integrations/bailian/projects/{_uuid('project')}/review-items/{_uuid('fact')}",
+            params={
+                "schema_id": str(_uuid("schema")),
+                "schema_version_id": str(_uuid("schema-version")),
+                "orchestration_id": str(_uuid("orchestration")),
+                "consistency_check_application_id": str(_uuid("consistency-app")),
+            },
+            headers=headers,
+        )
+        record_response = client.get(
+            f"/api/v1/integrations/bailian/projects/{_uuid('project')}/versions/{_uuid('project-version')}/records/alpha",
+            headers=headers,
+        )
+
+    detail_json = detail_response.json()
+    record_json = record_response.json()
+    assert isinstance(detail_json["value_groups"], list)
+    assert isinstance(detail_json["value_groups"][0], dict)
+    assert isinstance(detail_json["value_groups"][0]["values"], list)
+    assert isinstance(record_json["record_json"], dict)
+    assert isinstance(record_json["record_json"]["sections"], list)
+
+
+def test_bailian_router_supports_subject_key_path_segments(monkeypatch) -> None:
+    _set_tool_token(monkeypatch, "server-secret")
+    captured: list[str] = []
+
+    async def fake_record(*args, **kwargs):
+        captured.append(kwargs["subject_key"])
+        return _build_record_response().model_copy(
+            update={"subject_key": kwargs["subject_key"], "record_json": {"subject_key": kwargs["subject_key"], "sections": []}}
+        )
+
+    monkeypatch.setattr(bailian_tools_service, "get_version_record", fake_record)
+    headers = {"X-Zhiwen-Tool-Token": "server-secret"}
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/integrations/bailian/projects/{_uuid('project')}/versions/{_uuid('project-version')}/records/%E7%A0%94%E5%8F%91%E9%83%A8/%E5%9F%BA%E7%A1%80%E5%B9%B3%E5%8F%B0%E7%BB%84",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert captured == ["研发部/基础平台组"]
+    assert response.json()["subject_key"] == "研发部/基础平台组"
 
 
 @pytest.mark.parametrize(

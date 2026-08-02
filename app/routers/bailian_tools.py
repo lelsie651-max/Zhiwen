@@ -96,7 +96,7 @@ async def get_review_item_detail(
 
 
 @router.get(
-    "/projects/{project_id}/versions/{project_version_id}/records/{subject_key}",
+    "/projects/{project_id}/versions/{project_version_id}/records/{subject_key:path}",
     response_model=BailianVersionRecordResponse,
     operation_id="bailianGetVersionRecord",
 )

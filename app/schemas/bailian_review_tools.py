@@ -1,13 +1,30 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from datetime import date, datetime, time
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 BAILIAN_READ_TOOL_PAYLOAD_ALGORITHM_NAME = "bailian_read_tool_payload"
 BAILIAN_READ_TOOL_PAYLOAD_ALGORITHM_VERSION = "1.0.0"
+
+
+def _serialize_frozen_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _serialize_frozen_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_serialize_frozen_json(item) for item in value]
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    return value
 
 
 class BailianToolPayloadBase(BaseModel):
@@ -76,7 +93,11 @@ class BailianReviewItemDetailResponse(BailianToolPayloadBase):
     current_decision_kind: str | None
     effective_fact_value_ids: tuple[uuid.UUID, ...]
     requires_review: bool
-    value_groups: tuple[dict[str, Any], ...]
+    value_groups: tuple[Mapping[str, Any], ...]
+
+    @field_serializer("value_groups", when_used="json")
+    def serialize_value_groups(self, value: tuple[Mapping[str, Any], ...]) -> object:
+        return _serialize_frozen_json(value)
 
 
 class BailianVersionRecordResponse(BailianToolPayloadBase):
@@ -92,4 +113,8 @@ class BailianVersionRecordResponse(BailianToolPayloadBase):
     source_consistency_application_id: uuid.UUID
     knowledge_view_manifest_hash: str
     subject_key: str
-    record_json: dict[str, Any]
+    record_json: Mapping[str, Any]
+
+    @field_serializer("record_json", when_used="json")
+    def serialize_record_json(self, value: Mapping[str, Any]) -> object:
+        return _serialize_frozen_json(value)
