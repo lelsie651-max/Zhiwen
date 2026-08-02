@@ -71,6 +71,14 @@ def _require_projection_count(value: object) -> int:
     return value
 
 
+def _require_projection_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    return value
+
+
 def _normalize_subject_keys(subject_keys: object) -> list[str] | None:
     try:
         return raw_projection_service.normalize_dynamic_schema_ufl_subject_keys(
@@ -287,6 +295,7 @@ def _validate_reviewed_fact_shape(
     reviewed_fact: DynamicSchemaReviewedFact,
 ) -> frozenset[uuid.UUID]:
     fact_value_ids = _collect_fact_value_ids(reviewed_fact.fact)
+    requires_review = _require_projection_bool(reviewed_fact.requires_review)
     if reviewed_fact.review_state == "no_consistency_candidate":
         if (
             reviewed_fact.candidate_id is not None
@@ -305,7 +314,7 @@ def _validate_reviewed_fact_shape(
             raise DynamicSchemaReviewProjectionInvariantError(
                 "dynamic_schema_review_projection_projection_invalid"
             )
-        if reviewed_fact.requires_review:
+        if requires_review:
             raise DynamicSchemaReviewProjectionInvariantError(
                 "dynamic_schema_review_projection_projection_invalid"
             )
@@ -315,7 +324,7 @@ def _validate_reviewed_fact_shape(
     _require_projection_uuid(reviewed_fact.assessment_id)
     if reviewed_fact.review_state == "resolved":
         _require_projection_uuid(reviewed_fact.current_decision_id)
-        if reviewed_fact.requires_review:
+        if requires_review:
             raise DynamicSchemaReviewProjectionInvariantError(
                 "dynamic_schema_review_projection_projection_invalid"
             )
@@ -365,7 +374,7 @@ def _validate_reviewed_fact_shape(
             raise DynamicSchemaReviewProjectionInvariantError(
                 "dynamic_schema_review_projection_projection_invalid"
             )
-        if not reviewed_fact.requires_review:
+        if not requires_review:
             raise DynamicSchemaReviewProjectionInvariantError(
                 "dynamic_schema_review_projection_projection_invalid"
             )
@@ -385,7 +394,7 @@ def _validate_reviewed_fact_shape(
             raise DynamicSchemaReviewProjectionInvariantError(
                 "dynamic_schema_review_projection_projection_invalid"
             )
-        if not reviewed_fact.requires_review:
+        if not requires_review:
             raise DynamicSchemaReviewProjectionInvariantError(
                 "dynamic_schema_review_projection_projection_invalid"
             )
@@ -548,6 +557,75 @@ def _build_manifest_hash(
     )
 
 
+def authenticate_dynamic_schema_reviewed_field(
+    field: DynamicSchemaReviewedField,
+    *,
+    record_subject_key: str,
+    subject_kind: str | None,
+) -> DynamicSchemaReviewedField:
+    try:
+        raw_projection_service.authenticate_dynamic_schema_ufl_projected_field(
+            field.source_field,
+            record_subject_key=record_subject_key,
+            subject_kind=subject_kind,
+        )
+    except raw_projection_service.DynamicSchemaUFLProjectionInvariantError:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        ) from None
+
+    review_required = _require_projection_bool(field.review_required)
+    resolved_fact_count = _require_projection_count(field.resolved_fact_count)
+    review_required_fact_count = _require_projection_count(
+        field.review_required_fact_count
+    )
+    if len(field.reviewed_facts) != len(field.source_field.matched_facts):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if tuple(reviewed_fact.fact for reviewed_fact in field.reviewed_facts) != field.source_field.matched_facts:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+
+    seen_field_fact_ids: set[uuid.UUID] = set()
+    recomputed_effective_fact_value_ids: list[uuid.UUID] = []
+    recomputed_resolved_fact_count = 0
+    recomputed_review_required_fact_count = 0
+    for reviewed_fact in field.reviewed_facts:
+        _validate_reviewed_fact_shape(reviewed_fact)
+        if reviewed_fact.fact.fact_id in seen_field_fact_ids:
+            raise DynamicSchemaReviewProjectionInvariantError(
+                "dynamic_schema_review_projection_projection_invalid"
+            )
+        seen_field_fact_ids.add(reviewed_fact.fact.fact_id)
+        if reviewed_fact.review_state == "resolved":
+            recomputed_resolved_fact_count += 1
+            recomputed_effective_fact_value_ids.extend(
+                reviewed_fact.effective_fact_value_ids
+            )
+        if reviewed_fact.requires_review:
+            recomputed_review_required_fact_count += 1
+
+    if resolved_fact_count != recomputed_resolved_fact_count:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if review_required_fact_count != recomputed_review_required_fact_count:
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if review_required != (recomputed_review_required_fact_count > 0):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    if field.effective_fact_value_ids != tuple(recomputed_effective_fact_value_ids):
+        raise DynamicSchemaReviewProjectionInvariantError(
+            "dynamic_schema_review_projection_projection_invalid"
+        )
+    return field
+
+
 def authenticate_dynamic_schema_review_projection(
     projection: DynamicSchemaReviewProjection,
     *,
@@ -655,39 +733,12 @@ def authenticate_dynamic_schema_review_projection(
                 raise DynamicSchemaReviewProjectionInvariantError(
                     "dynamic_schema_review_projection_projection_invalid"
                 )
-            try:
-                raw_projection_service.authenticate_dynamic_schema_ufl_projected_field(
-                    field.source_field,
-                    record_subject_key=record.subject_key,
-                    subject_kind=next(iter(subject_kinds), None),
-                )
-            except raw_projection_service.DynamicSchemaUFLProjectionInvariantError:
-                raise DynamicSchemaReviewProjectionInvariantError(
-                    "dynamic_schema_review_projection_projection_invalid"
-                ) from None
-            if len(field.reviewed_facts) != len(field.source_field.matched_facts):
-                raise DynamicSchemaReviewProjectionInvariantError(
-                    "dynamic_schema_review_projection_projection_invalid"
-                )
-            if tuple(reviewed_fact.fact for reviewed_fact in field.reviewed_facts) != field.source_field.matched_facts:
-                raise DynamicSchemaReviewProjectionInvariantError(
-                    "dynamic_schema_review_projection_projection_invalid"
-                )
-            resolved_fact_field_count = _require_projection_count(field.resolved_fact_count)
-            review_required_fact_field_count = _require_projection_count(
-                field.review_required_fact_count
+            authenticated_field = authenticate_dynamic_schema_reviewed_field(
+                field,
+                record_subject_key=record.subject_key,
+                subject_kind=next(iter(subject_kinds), None),
             )
-            seen_field_fact_ids: set[uuid.UUID] = set()
-            recomputed_effective_fact_value_ids: list[uuid.UUID] = []
-            recomputed_resolved_fact_count = 0
-            recomputed_review_required_fact_count = 0
-            for reviewed_fact in field.reviewed_facts:
-                _validate_reviewed_fact_shape(reviewed_fact)
-                if reviewed_fact.fact.fact_id in seen_field_fact_ids:
-                    raise DynamicSchemaReviewProjectionInvariantError(
-                        "dynamic_schema_review_projection_projection_invalid"
-                    )
-                seen_field_fact_ids.add(reviewed_fact.fact.fact_id)
+            for reviewed_fact in authenticated_field.reviewed_facts:
                 prior_reviewed_fact = unique_reviewed_facts.get(reviewed_fact.fact.fact_id)
                 if prior_reviewed_fact is None:
                     unique_reviewed_facts[reviewed_fact.fact.fact_id] = reviewed_fact
@@ -695,33 +746,12 @@ def authenticate_dynamic_schema_review_projection(
                     raise DynamicSchemaReviewProjectionInvariantError(
                         "dynamic_schema_review_projection_projection_invalid"
                     )
-                if reviewed_fact.review_state == "resolved":
-                    recomputed_resolved_fact_count += 1
-                    recomputed_effective_fact_value_ids.extend(
-                        reviewed_fact.effective_fact_value_ids
-                    )
-                if reviewed_fact.requires_review:
-                    recomputed_review_required_fact_count += 1
-            if resolved_fact_field_count != recomputed_resolved_fact_count:
-                raise DynamicSchemaReviewProjectionInvariantError(
-                    "dynamic_schema_review_projection_projection_invalid"
+            recomputed_record_issue_count += len(authenticated_field.source_field.issues)
+            if "required_missing" in authenticated_field.source_field.issues:
+                recomputed_required_missing_field_keys.append(
+                    authenticated_field.source_field.field_key
                 )
-            if review_required_fact_field_count != recomputed_review_required_fact_count:
-                raise DynamicSchemaReviewProjectionInvariantError(
-                    "dynamic_schema_review_projection_projection_invalid"
-                )
-            if field.review_required != (recomputed_review_required_fact_count > 0):
-                raise DynamicSchemaReviewProjectionInvariantError(
-                    "dynamic_schema_review_projection_projection_invalid"
-                )
-            if field.effective_fact_value_ids != tuple(recomputed_effective_fact_value_ids):
-                raise DynamicSchemaReviewProjectionInvariantError(
-                    "dynamic_schema_review_projection_projection_invalid"
-                )
-            recomputed_record_issue_count += len(field.source_field.issues)
-            if "required_missing" in field.source_field.issues:
-                recomputed_required_missing_field_keys.append(field.source_field.field_key)
-            if field.review_required:
+            if authenticated_field.review_required:
                 recomputed_field_review_required_count += 1
         if record.required_missing_field_keys != tuple(
             recomputed_required_missing_field_keys

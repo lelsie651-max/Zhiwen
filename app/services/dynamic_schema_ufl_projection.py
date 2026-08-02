@@ -83,6 +83,14 @@ def _require_projection_count(value: object) -> int:
     return value
 
 
+def _require_projection_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise DynamicSchemaUFLProjectionInvariantError(
+            "dynamic_schema_ufl_projection_projection_invalid"
+        )
+    return value
+
+
 def _normalize_subject_key(value: object) -> str:
     if not isinstance(value, str):
         raise DynamicSchemaUFLProjectionStateError(
@@ -418,6 +426,12 @@ def authenticate_dynamic_schema_ufl_projected_field(
 ) -> DynamicSchemaUFLProjectedField:
     _require_projection_uuid(field.field_id)
     _require_projection_uuid(field.schema_version_id)
+    is_required = _require_projection_bool(field.is_required)
+    is_title = _require_projection_bool(field.is_title)
+    is_summary = _require_projection_bool(field.is_summary)
+    is_hidden = _require_projection_bool(field.is_hidden)
+    is_missing = _require_projection_bool(field.is_missing)
+    type_compatible = _require_projection_bool(field.type_compatible)
     if isinstance(field.display_order, bool) or not isinstance(field.display_order, int):
         raise DynamicSchemaUFLProjectionInvariantError(
             "dynamic_schema_ufl_projection_projection_invalid"
@@ -447,10 +461,10 @@ def authenticate_dynamic_schema_ufl_projected_field(
         scope_key=field.scope_key,
         expected_value_type=field.expected_value_type,
         cardinality=field.cardinality,
-        is_required=field.is_required,
-        is_title=field.is_title,
-        is_summary=field.is_summary,
-        is_hidden=field.is_hidden,
+        is_required=is_required,
+        is_title=is_title,
+        is_summary=is_summary,
+        is_hidden=is_hidden,
         group_key=field.group_key,
         display_order=field.display_order,
         display_config=field.display_config,
@@ -489,11 +503,11 @@ def authenticate_dynamic_schema_ufl_projected_field(
         raise DynamicSchemaUFLProjectionInvariantError(
             "dynamic_schema_ufl_projection_projection_invalid"
         )
-    if expected_field.is_missing != field.is_missing:
+    if expected_field.is_missing != is_missing:
         raise DynamicSchemaUFLProjectionInvariantError(
             "dynamic_schema_ufl_projection_projection_invalid"
         )
-    if expected_field.type_compatible != field.type_compatible:
+    if expected_field.type_compatible != type_compatible:
         raise DynamicSchemaUFLProjectionInvariantError(
             "dynamic_schema_ufl_projection_projection_invalid"
         )

@@ -71,6 +71,14 @@ def _require_projection_count(value: object) -> int:
     return value
 
 
+def _require_projection_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise DynamicSchemaKnowledgeViewInvariantError(
+            "dynamic_schema_knowledge_view_projection_invalid"
+        )
+    return value
+
+
 def _normalize_subject_keys(subject_keys: object) -> list[str] | None:
     try:
         return review_projection_service.raw_projection_service.normalize_dynamic_schema_ufl_subject_keys(
@@ -259,7 +267,7 @@ def _build_manifest_hash(
     )
 
 
-def _authenticate_knowledge_view(
+def authenticate_dynamic_schema_knowledge_view(
     view: DynamicSchemaKnowledgeView,
     *,
     subject_keys: object,
@@ -318,6 +326,7 @@ def _authenticate_knowledge_view(
     recomputed_resolved_field_count = 0
     recomputed_observation_only_field_count = 0
     recomputed_mixed_field_count = 0
+    unique_reviewed_facts: dict[uuid.UUID, DynamicSchemaReviewedFact] = {}
     for record in view.records:
         normalized_subject_key = review_projection_service.raw_projection_service.normalize_dynamic_schema_ufl_subject_keys(
             [record.subject_key]
@@ -333,6 +342,7 @@ def _authenticate_knowledge_view(
         seen_subject_keys.add(normalized_subject_key)
         record_subject_keys.append(normalized_subject_key)
         record_issue_count = _require_projection_count(record.issue_count)
+        has_review_required = _require_projection_bool(record.has_review_required)
         title_field_keys = [
             field.source_field.field_key
             for section in record.sections
@@ -350,8 +360,6 @@ def _authenticate_knowledge_view(
         section_group_keys_seen: set[str | None] = set()
         record_has_review_required = False
         recomputed_record_issue_count = 0
-        recomputed_section_order: list[tuple[str | None, int]] = []
-        recomputed_section_fields: dict[str | None, tuple[DynamicSchemaKnowledgeField, ...]] = {}
         flat_fields: list[DynamicSchemaKnowledgeField] = []
         for section in record.sections:
             recomputed_section_count += 1
@@ -366,31 +374,63 @@ def _authenticate_knowledge_view(
                     raise DynamicSchemaKnowledgeViewInvariantError(
                         "dynamic_schema_knowledge_view_projection_invalid"
                     )
-            recomputed_section_order.append((section.group_key, section_display_order))
-            recomputed_section_fields[section.group_key] = section.fields
             for field in section.fields:
                 flat_fields.append(field)
                 recomputed_field_count += 1
+                has_schema_issues = _require_projection_bool(field.has_schema_issues)
                 observed_fact_value_count = _require_projection_count(
                     field.observed_fact_value_count
                 )
                 semantic_value_count = _require_projection_count(field.semantic_value_count)
-                if field.reviewed_facts != field.reviewed_facts:
-                    raise DynamicSchemaKnowledgeViewInvariantError(
-                        "dynamic_schema_knowledge_view_projection_invalid"
+                authenticated_reviewed_field = (
+                    review_projection_service.authenticate_dynamic_schema_reviewed_field(
+                        DynamicSchemaReviewedField(
+                            source_field=field.source_field,
+                            reviewed_facts=field.reviewed_facts,
+                            review_required=any(
+                                reviewed_fact.requires_review
+                                for reviewed_fact in field.reviewed_facts
+                            ),
+                            resolved_fact_count=sum(
+                                1
+                                for reviewed_fact in field.reviewed_facts
+                                if reviewed_fact.review_state == "resolved"
+                            ),
+                            review_required_fact_count=sum(
+                                1
+                                for reviewed_fact in field.reviewed_facts
+                                if reviewed_fact.requires_review
+                            ),
+                            effective_fact_value_ids=field.effective_fact_value_ids,
+                        ),
+                        record_subject_key=record.subject_key,
+                        subject_kind=next(
+                            iter(
+                                {
+                                    reviewed_fact.fact.subject_kind
+                                    for reviewed_fact in field.reviewed_facts
+                                }
+                            ),
+                            None,
+                        ),
                     )
-                if field.reviewed_facts != tuple(field.reviewed_facts):
-                    raise DynamicSchemaKnowledgeViewInvariantError(
-                        "dynamic_schema_knowledge_view_projection_invalid"
-                    )
+                )
+                for reviewed_fact in authenticated_reviewed_field.reviewed_facts:
+                    prior_reviewed_fact = unique_reviewed_facts.get(reviewed_fact.fact.fact_id)
+                    if prior_reviewed_fact is None:
+                        unique_reviewed_facts[reviewed_fact.fact.fact_id] = reviewed_fact
+                    elif prior_reviewed_fact != reviewed_fact:
+                        raise DynamicSchemaKnowledgeViewInvariantError(
+                            "dynamic_schema_knowledge_view_projection_invalid"
+                        )
                 recomputed_observed_fact_value_count = sum(
                     len(value_group.fact_value_ids)
-                    for reviewed_fact in field.reviewed_facts
+                    for reviewed_fact in authenticated_reviewed_field.reviewed_facts
                     for value_group in reviewed_fact.fact.value_groups
                 )
                 recomputed_semantic_value_count = sum(
                     len(reviewed_fact.fact.value_groups)
-                    for reviewed_fact in field.reviewed_facts
+                    for reviewed_fact in authenticated_reviewed_field.reviewed_facts
                 )
                 if observed_fact_value_count != recomputed_observed_fact_value_count:
                     raise DynamicSchemaKnowledgeViewInvariantError(
@@ -400,54 +440,29 @@ def _authenticate_knowledge_view(
                     raise DynamicSchemaKnowledgeViewInvariantError(
                         "dynamic_schema_knowledge_view_projection_invalid"
                     )
-                if field.semantic_value_count != field.source_field.semantic_value_count:
+                if semantic_value_count != authenticated_reviewed_field.source_field.semantic_value_count:
                     raise DynamicSchemaKnowledgeViewInvariantError(
                         "dynamic_schema_knowledge_view_projection_invalid"
                     )
-                if field.has_schema_issues != bool(field.source_field.issues):
+                if has_schema_issues != bool(authenticated_reviewed_field.source_field.issues):
                     raise DynamicSchemaKnowledgeViewInvariantError(
                         "dynamic_schema_knowledge_view_projection_invalid"
                     )
-                recomputed_state = _build_knowledge_state(
-                    DynamicSchemaReviewedField(
-                        source_field=field.source_field,
-                        reviewed_facts=field.reviewed_facts,
-                        review_required=any(
-                            reviewed_fact.requires_review
-                            for reviewed_fact in field.reviewed_facts
-                        ),
-                        resolved_fact_count=sum(
-                            1
-                            for reviewed_fact in field.reviewed_facts
-                            if reviewed_fact.review_state == "resolved"
-                        ),
-                        review_required_fact_count=sum(
-                            1
-                            for reviewed_fact in field.reviewed_facts
-                            if reviewed_fact.requires_review
-                        ),
-                        effective_fact_value_ids=tuple(
-                            fact_value_id
-                            for reviewed_fact in field.reviewed_facts
-                            if reviewed_fact.review_state == "resolved"
-                            for fact_value_id in reviewed_fact.effective_fact_value_ids
-                        ),
-                    )
-                )
+                recomputed_state = _build_knowledge_state(authenticated_reviewed_field)
                 if field.knowledge_state != recomputed_state:
                     raise DynamicSchemaKnowledgeViewInvariantError(
                         "dynamic_schema_knowledge_view_projection_invalid"
                     )
                 if field.effective_fact_value_ids != tuple(
                     fact_value_id
-                    for reviewed_fact in field.reviewed_facts
+                    for reviewed_fact in authenticated_reviewed_field.reviewed_facts
                     if reviewed_fact.review_state == "resolved"
                     for fact_value_id in reviewed_fact.effective_fact_value_ids
                 ):
                     raise DynamicSchemaKnowledgeViewInvariantError(
                         "dynamic_schema_knowledge_view_projection_invalid"
                     )
-                recomputed_record_issue_count += len(field.source_field.issues)
+                recomputed_record_issue_count += len(authenticated_reviewed_field.source_field.issues)
                 if field.knowledge_state == "missing":
                     recomputed_missing_field_count += 1
                 elif field.knowledge_state == "review_required":
@@ -499,7 +514,7 @@ def _authenticate_knowledge_view(
             raise DynamicSchemaKnowledgeViewInvariantError(
                 "dynamic_schema_knowledge_view_projection_invalid"
             )
-        if record.has_review_required != record_has_review_required:
+        if has_review_required != record_has_review_required:
             raise DynamicSchemaKnowledgeViewInvariantError(
                 "dynamic_schema_knowledge_view_projection_invalid"
             )
@@ -665,7 +680,7 @@ async def build_dynamic_schema_knowledge_view(
         records=records,
         knowledge_view_manifest_hash="",
     )
-    return _authenticate_knowledge_view(
+    return authenticate_dynamic_schema_knowledge_view(
         DynamicSchemaKnowledgeView(
             project_id=view.project_id,
             schema_id=view.schema_id,

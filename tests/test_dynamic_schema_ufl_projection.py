@@ -918,6 +918,90 @@ def test_project_orchestration_ufl_to_dynamic_schema_uses_only_public_snapshots_
     assert isinstance(projection.records[0].fields[0].display_config, MappingProxyType)
 
 
+@pytest.mark.parametrize("field_name", ["is_required", "is_title", "is_summary", "is_hidden", "is_missing", "type_compatible"])
+@pytest.mark.parametrize("bad_value", [0, 1, "false"])
+def test_authenticate_dynamic_schema_ufl_projected_field_rejects_non_bool_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    bad_value: object,
+) -> None:
+    schema_snapshot = _schema_snapshot()
+    ufl_snapshot = _ufl_snapshot()
+    _install_sources(
+        monkeypatch,
+        schema_snapshot=schema_snapshot,
+        ufl_snapshot=ufl_snapshot,
+    )
+    projection = run_async(
+        projection_service.project_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=schema_snapshot.project_id,
+            schema_id=schema_snapshot.schema_id,
+            schema_version_id=schema_snapshot.schema_version_id,
+            orchestration_id=ufl_snapshot.orchestration_id,
+        )
+    )
+    field = replace(projection.records[0].fields[0], **{field_name: bad_value})
+
+    with pytest.raises(
+        projection_service.DynamicSchemaUFLProjectionInvariantError,
+        match="dynamic_schema_ufl_projection_projection_invalid",
+    ):
+        projection_service.authenticate_dynamic_schema_ufl_projected_field(
+            field,
+            record_subject_key=projection.records[0].subject_key,
+            subject_kind=projection.subject_kind,
+        )
+
+
+def test_authenticate_dynamic_schema_ufl_projection_rejects_resigned_non_bool_field_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema_snapshot = _schema_snapshot()
+    ufl_snapshot = _ufl_snapshot()
+    _install_sources(
+        monkeypatch,
+        schema_snapshot=schema_snapshot,
+        ufl_snapshot=ufl_snapshot,
+    )
+    projection = run_async(
+        projection_service.project_orchestration_ufl_to_dynamic_schema(
+            SessionFactory(),
+            project_id=schema_snapshot.project_id,
+            schema_id=schema_snapshot.schema_id,
+            schema_version_id=schema_snapshot.schema_version_id,
+            orchestration_id=ufl_snapshot.orchestration_id,
+        )
+    )
+    mutated_projection = replace(
+        projection,
+        records=(
+            replace(
+                projection.records[0],
+                fields=(
+                    replace(projection.records[0].fields[0], is_hidden=1),
+                )
+                + projection.records[0].fields[1:],
+            ),
+            projection.records[1],
+        ),
+        projection_manifest_hash="",
+    )
+    resigned_projection = replace(
+        mutated_projection,
+        projection_manifest_hash=_recompute_projection_manifest(mutated_projection),
+    )
+
+    with pytest.raises(
+        projection_service.DynamicSchemaUFLProjectionInvariantError,
+        match="dynamic_schema_ufl_projection_projection_invalid",
+    ):
+        projection_service.authenticate_dynamic_schema_ufl_projection(
+            resigned_projection,
+            subject_keys=None,
+        )
+
+
 @pytest.mark.parametrize(
     "mutate_projection",
     [

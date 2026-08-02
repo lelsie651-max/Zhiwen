@@ -174,6 +174,7 @@ def __getattr__(name: str):
         "DynamicSchemaReviewProjectionError",
         "DynamicSchemaReviewProjectionStateError",
         "DynamicSchemaReviewProjectionInvariantError",
+        "authenticate_dynamic_schema_reviewed_field",
         "authenticate_dynamic_schema_review_projection",
         "project_reviewed_orchestration_ufl_to_dynamic_schema",
         "EffectiveFactValueProjectionError",
@@ -184,6 +185,7 @@ def __getattr__(name: str):
         "DynamicSchemaKnowledgeViewError",
         "DynamicSchemaKnowledgeViewStateError",
         "DynamicSchemaKnowledgeViewInvariantError",
+        "authenticate_dynamic_schema_knowledge_view",
         "build_dynamic_schema_knowledge_view",
     }:
         exported = {}
@@ -191,6 +193,7 @@ def __getattr__(name: str):
             "DynamicSchemaReviewProjectionError",
             "DynamicSchemaReviewProjectionStateError",
             "DynamicSchemaReviewProjectionInvariantError",
+            "authenticate_dynamic_schema_reviewed_field",
             "authenticate_dynamic_schema_review_projection",
             "project_reviewed_orchestration_ufl_to_dynamic_schema",
         }:
@@ -198,6 +201,7 @@ def __getattr__(name: str):
                 DynamicSchemaReviewProjectionError,
                 DynamicSchemaReviewProjectionInvariantError,
                 DynamicSchemaReviewProjectionStateError,
+                authenticate_dynamic_schema_reviewed_field,
                 authenticate_dynamic_schema_review_projection,
                 project_reviewed_orchestration_ufl_to_dynamic_schema,
             )
@@ -212,6 +216,9 @@ def __getattr__(name: str):
                     ),
                     "DynamicSchemaReviewProjectionInvariantError": (
                         DynamicSchemaReviewProjectionInvariantError
+                    ),
+                    "authenticate_dynamic_schema_reviewed_field": (
+                        authenticate_dynamic_schema_reviewed_field
                     ),
                     "authenticate_dynamic_schema_review_projection": (
                         authenticate_dynamic_schema_review_projection
@@ -259,12 +266,14 @@ def __getattr__(name: str):
             "DynamicSchemaKnowledgeViewError",
             "DynamicSchemaKnowledgeViewStateError",
             "DynamicSchemaKnowledgeViewInvariantError",
+            "authenticate_dynamic_schema_knowledge_view",
             "build_dynamic_schema_knowledge_view",
         }:
             from app.services.dynamic_schema_knowledge_view import (
                 DynamicSchemaKnowledgeViewError,
                 DynamicSchemaKnowledgeViewInvariantError,
                 DynamicSchemaKnowledgeViewStateError,
+                authenticate_dynamic_schema_knowledge_view,
                 build_dynamic_schema_knowledge_view,
             )
 
@@ -278,6 +287,9 @@ def __getattr__(name: str):
                     ),
                     "DynamicSchemaKnowledgeViewInvariantError": (
                         DynamicSchemaKnowledgeViewInvariantError
+                    ),
+                    "authenticate_dynamic_schema_knowledge_view": (
+                        authenticate_dynamic_schema_knowledge_view
                     ),
                     "build_dynamic_schema_knowledge_view": (
                         build_dynamic_schema_knowledge_view
@@ -316,6 +328,7 @@ __all__ = [
     "DynamicSchemaReviewProjectionError",
     "DynamicSchemaReviewProjectionStateError",
     "DynamicSchemaReviewProjectionInvariantError",
+    "authenticate_dynamic_schema_reviewed_field",
     "DynamicSchemaPermissionError",
     "DynamicSchemaProjectNotFoundError",
     "DynamicSchemaIdentityMismatchError",
@@ -350,8 +363,10 @@ __all__ = [
     "serialize_dynamic_schema_ufl_projected_record",
     "get_effective_fact_value_projection",
     "authenticate_effective_fact_value_projection",
+    "authenticate_dynamic_schema_reviewed_field",
     "authenticate_dynamic_schema_review_projection",
     "project_reviewed_orchestration_ufl_to_dynamic_schema",
+    "authenticate_dynamic_schema_knowledge_view",
     "build_dynamic_schema_knowledge_view",
     "create_human_schema_draft",
     "propose_ai_schema_version",

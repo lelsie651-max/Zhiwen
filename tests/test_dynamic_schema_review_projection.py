@@ -1286,6 +1286,106 @@ def test_authenticate_dynamic_schema_review_projection_accepts_valid_projection_
     assert authenticated == projection
 
 
+@pytest.mark.parametrize("field_name", ["requires_review", "review_required"])
+@pytest.mark.parametrize("bad_value", [0, 1])
+def test_authenticate_dynamic_schema_reviewed_field_rejects_non_bool_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    bad_value: int,
+) -> None:
+    projection = _build_valid_review_projection(monkeypatch)
+    valid_field = projection.records[0].fields[1]
+    mutated_field = (
+        replace(
+            valid_field,
+            reviewed_facts=(
+                replace(valid_field.reviewed_facts[0], requires_review=bad_value),
+            ),
+        )
+        if field_name == "requires_review"
+        else replace(valid_field, review_required=bad_value)
+    )
+
+    with pytest.raises(
+        review_projection_service.DynamicSchemaReviewProjectionInvariantError,
+        match="dynamic_schema_review_projection_projection_invalid",
+    ):
+        review_projection_service.authenticate_dynamic_schema_reviewed_field(
+            mutated_field,
+            record_subject_key=projection.records[0].subject_key,
+            subject_kind="person",
+        )
+
+
+def test_authenticate_dynamic_schema_review_projection_rejects_resigned_non_bool_field_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = _build_valid_review_projection(monkeypatch)
+    mutated_projection = replace(
+        projection,
+        records=(
+            replace(
+                projection.records[0],
+                fields=projection.records[0].fields[:1]
+                + (
+                    replace(projection.records[0].fields[1], review_required=1),
+                )
+                + projection.records[0].fields[2:],
+            ),
+            projection.records[1],
+        ),
+        reviewed_projection_manifest_hash="",
+    )
+    resigned_projection = replace(
+        mutated_projection,
+        reviewed_projection_manifest_hash=review_projection_service._build_manifest_hash(
+            projection=mutated_projection,
+            subject_keys_filter=None,
+        ),
+    )
+
+    with pytest.raises(
+        review_projection_service.DynamicSchemaReviewProjectionInvariantError,
+        match="dynamic_schema_review_projection_projection_invalid",
+    ):
+        review_projection_service.authenticate_dynamic_schema_review_projection(
+            resigned_projection,
+            subject_keys=None,
+        )
+
+
+def test_authenticate_dynamic_schema_review_projection_calls_public_reviewed_field_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = _build_valid_review_projection(monkeypatch)
+    original_authenticate = (
+        review_projection_service.authenticate_dynamic_schema_reviewed_field
+    )
+    calls: list[str] = []
+
+    def tracking_authenticate(field, *, record_subject_key, subject_kind):
+        calls.append(field.source_field.field_key)
+        return original_authenticate(
+            field,
+            record_subject_key=record_subject_key,
+            subject_kind=subject_kind,
+        )
+
+    monkeypatch.setattr(
+        review_projection_service,
+        "authenticate_dynamic_schema_reviewed_field",
+        tracking_authenticate,
+    )
+
+    authenticated = review_projection_service.authenticate_dynamic_schema_review_projection(
+        projection,
+        subject_keys=None,
+    )
+
+    assert authenticated == projection
+    assert calls == [field.source_field.field_key for field in projection.records[0].fields]
+
+
 @pytest.mark.parametrize(
     "mutate_projection",
     [

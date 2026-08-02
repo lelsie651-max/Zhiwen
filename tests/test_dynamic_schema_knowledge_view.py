@@ -24,6 +24,7 @@ from app.schemas.ufl_fact_snapshot import (
     UFLFactValueGroupSnapshot,
     UFLFactValueSnapshot,
 )
+import app.services as services_package
 from app.services import dynamic_schema_knowledge_view as knowledge_view_service
 from app.services import dynamic_schema_review_projection as review_projection_service
 from app.utils.deterministic_json import freeze_deterministic_json_value
@@ -611,6 +612,204 @@ def test_build_dynamic_schema_knowledge_view_rejects_replaced_review_child_even_
         )
 
 
+@pytest.mark.parametrize("record_bad_value", [0, 1])
+def test_authenticate_dynamic_schema_knowledge_view_rejects_non_bool_record_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    record_bad_value: int,
+) -> None:
+    review_projection = _valid_review_projection()
+    _install_review_source(
+        monkeypatch,
+        review_projection_factory=lambda _subject_keys: review_projection,
+    )
+    view = run_async(
+        knowledge_view_service.build_dynamic_schema_knowledge_view(
+            SessionFactory(),
+            project_id=review_projection.project_id,
+            schema_id=review_projection.schema_id,
+            schema_version_id=review_projection.schema_version_id,
+            orchestration_id=review_projection.orchestration_id,
+            consistency_check_application_id=review_projection.consistency_check_application_id,
+        )
+    )
+    mutated_view = replace(
+        view,
+        records=(
+            replace(view.records[0], has_review_required=record_bad_value),
+            view.records[1],
+        ),
+    )
+
+    with pytest.raises(
+        knowledge_view_service.DynamicSchemaKnowledgeViewInvariantError,
+        match="dynamic_schema_knowledge_view_projection_invalid",
+    ):
+        knowledge_view_service.authenticate_dynamic_schema_knowledge_view(
+            mutated_view,
+            subject_keys=None,
+        )
+
+
+@pytest.mark.parametrize("field_bad_value", [0, 1])
+def test_authenticate_dynamic_schema_knowledge_view_rejects_non_bool_field_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    field_bad_value: int,
+) -> None:
+    review_projection = _valid_review_projection()
+    _install_review_source(
+        monkeypatch,
+        review_projection_factory=lambda _subject_keys: review_projection,
+    )
+    view = run_async(
+        knowledge_view_service.build_dynamic_schema_knowledge_view(
+            SessionFactory(),
+            project_id=review_projection.project_id,
+            schema_id=review_projection.schema_id,
+            schema_version_id=review_projection.schema_version_id,
+            orchestration_id=review_projection.orchestration_id,
+            consistency_check_application_id=review_projection.consistency_check_application_id,
+        )
+    )
+    mutated_view = replace(
+        view,
+        records=(
+            replace(
+                view.records[0],
+                sections=(
+                    replace(
+                        view.records[0].sections[0],
+                        fields=(
+                            replace(
+                                view.records[0].sections[0].fields[0],
+                                has_schema_issues=field_bad_value,
+                            ),
+                            view.records[0].sections[0].fields[1],
+                        ),
+                    ),
+                    view.records[0].sections[1],
+                    view.records[0].sections[2],
+                ),
+            ),
+            view.records[1],
+        ),
+    )
+
+    with pytest.raises(
+        knowledge_view_service.DynamicSchemaKnowledgeViewInvariantError,
+        match="dynamic_schema_knowledge_view_projection_invalid",
+    ):
+        knowledge_view_service.authenticate_dynamic_schema_knowledge_view(
+            mutated_view,
+            subject_keys=None,
+        )
+
+
+def test_authenticate_dynamic_schema_knowledge_view_rejects_resigned_non_bool_field_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_projection = _valid_review_projection()
+    _install_review_source(
+        monkeypatch,
+        review_projection_factory=lambda _subject_keys: review_projection,
+    )
+    view = run_async(
+        knowledge_view_service.build_dynamic_schema_knowledge_view(
+            SessionFactory(),
+            project_id=review_projection.project_id,
+            schema_id=review_projection.schema_id,
+            schema_version_id=review_projection.schema_version_id,
+            orchestration_id=review_projection.orchestration_id,
+            consistency_check_application_id=review_projection.consistency_check_application_id,
+        )
+    )
+    mutated_view = replace(
+        view,
+        records=(
+            replace(
+                view.records[0],
+                sections=(
+                    replace(
+                        view.records[0].sections[0],
+                        fields=(
+                            replace(
+                                view.records[0].sections[0].fields[0],
+                                has_schema_issues=1,
+                            ),
+                            view.records[0].sections[0].fields[1],
+                        ),
+                    ),
+                    view.records[0].sections[1],
+                    view.records[0].sections[2],
+                ),
+            ),
+            view.records[1],
+        ),
+        knowledge_view_manifest_hash="",
+    )
+    resigned_view = replace(
+        mutated_view,
+        knowledge_view_manifest_hash=knowledge_view_service._build_manifest_hash(
+            view=mutated_view,
+            subject_keys_filter=None,
+        ),
+    )
+
+    with pytest.raises(
+        knowledge_view_service.DynamicSchemaKnowledgeViewInvariantError,
+        match="dynamic_schema_knowledge_view_projection_invalid",
+    ):
+        knowledge_view_service.authenticate_dynamic_schema_knowledge_view(
+            resigned_view,
+            subject_keys=None,
+        )
+
+
+def test_authenticate_dynamic_schema_knowledge_view_calls_public_reviewed_field_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_projection = _valid_review_projection()
+    _install_review_source(
+        monkeypatch,
+        review_projection_factory=lambda _subject_keys: review_projection,
+    )
+    view = run_async(
+        knowledge_view_service.build_dynamic_schema_knowledge_view(
+            SessionFactory(),
+            project_id=review_projection.project_id,
+            schema_id=review_projection.schema_id,
+            schema_version_id=review_projection.schema_version_id,
+            orchestration_id=review_projection.orchestration_id,
+            consistency_check_application_id=review_projection.consistency_check_application_id,
+        )
+    )
+    original_authenticate = (
+        knowledge_view_service.review_projection_service.authenticate_dynamic_schema_reviewed_field
+    )
+    calls: list[str] = []
+
+    def tracking_authenticate(field, *, record_subject_key, subject_kind):
+        calls.append(field.source_field.field_key)
+        return original_authenticate(
+            field,
+            record_subject_key=record_subject_key,
+            subject_kind=subject_kind,
+        )
+
+    monkeypatch.setattr(
+        knowledge_view_service.review_projection_service,
+        "authenticate_dynamic_schema_reviewed_field",
+        tracking_authenticate,
+    )
+
+    authenticated = knowledge_view_service.authenticate_dynamic_schema_knowledge_view(
+        view,
+        subject_keys=None,
+    )
+
+    assert authenticated == view
+    assert calls == ["title", "missing", "review", "resolved", "mixed"]
+
+
 def test_build_dynamic_schema_knowledge_view_calls_public_review_authentication_and_stays_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -650,4 +849,46 @@ def test_build_dynamic_schema_knowledge_view_calls_public_review_authentication_
     assert calls == [1]
     assert factory.calls == 0
     assert "current_value_id" not in source
+    assert isinstance(view, DynamicSchemaKnowledgeView)
+
+
+def test_build_dynamic_schema_knowledge_view_calls_public_knowledge_authentication_and_exports_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_projection = _valid_review_projection()
+    factory = SessionFactory()
+    _install_review_source(
+        monkeypatch,
+        review_projection_factory=lambda _subject_keys: review_projection,
+    )
+    original_authenticate = knowledge_view_service.authenticate_dynamic_schema_knowledge_view
+    calls: list[int] = []
+
+    def tracking_authenticate(view, *, subject_keys):
+        calls.append(1)
+        return original_authenticate(view, subject_keys=subject_keys)
+
+    monkeypatch.setattr(
+        knowledge_view_service,
+        "authenticate_dynamic_schema_knowledge_view",
+        tracking_authenticate,
+    )
+
+    view = run_async(
+        knowledge_view_service.build_dynamic_schema_knowledge_view(
+            factory,
+            project_id=review_projection.project_id,
+            schema_id=review_projection.schema_id,
+            schema_version_id=review_projection.schema_version_id,
+            orchestration_id=review_projection.orchestration_id,
+            consistency_check_application_id=review_projection.consistency_check_application_id,
+        )
+    )
+
+    assert calls == [1]
+    assert factory.calls == 0
+    assert (
+        services_package.authenticate_dynamic_schema_knowledge_view
+        is knowledge_view_service.authenticate_dynamic_schema_knowledge_view
+    )
     assert isinstance(view, DynamicSchemaKnowledgeView)
