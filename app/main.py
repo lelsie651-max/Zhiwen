@@ -3,12 +3,14 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.routers.app import router as app_router
 from app.routers.bailian_tools import router as bailian_tools_router
+from app.routers.frontend_api import router as frontend_api_router
 from app.routers.health import router as health_router
 from app.routers.projects import router as projects_router
 from app.routers.web import router as web_router
@@ -44,12 +46,21 @@ def create_app() -> FastAPI:
         same_site="lax",
         https_only=settings.is_production,
     )
+    if settings.frontend_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.frontend_origins),
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Content-Type", "X-CSRF-Token"],
+        )
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     app.include_router(web_router)
     app.include_router(health_router)
     app.include_router(app_router)
     app.include_router(projects_router)
+    app.include_router(frontend_api_router)
     app.include_router(bailian_tools_router)
 
     return app

@@ -1,11 +1,13 @@
 import uuid
+from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
 from app.models.user import User
 from app.services import identity as identity_service
+from app.utils.csrf import verify_csrf_token
 
 
 async def get_optional_current_user(
@@ -28,3 +30,18 @@ async def get_optional_current_user(
         return None
 
     return user
+
+
+async def require_current_user(
+    current_user: User | None = Depends(get_optional_current_user),
+) -> User:
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="authentication_required")
+    return current_user
+
+
+def verify_api_csrf_token(
+    request: Request,
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> None:
+    verify_csrf_token(request, csrf_token)

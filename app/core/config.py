@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     upload_chunk_bytes: int = Field(default=1048576, gt=0)
     processing_stale_minutes: int = Field(default=30, gt=0)
     bailian_tool_token: SecretStr = SecretStr("")
+    frontend_origins: tuple[str, ...] = ()
 
     # LLM (OpenAI-compatible) settings. Works with DeepSeek official API,
     # Alibaba Cloud Bailian (DashScope compatible-mode), or any compatible host.
@@ -71,6 +72,37 @@ class Settings(BaseSettings):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("LLM base URL must be a valid http/https URL")
         return stripped
+
+    @field_validator("frontend_origins", mode="before")
+    @classmethod
+    def validate_frontend_origins(cls, value: object) -> tuple[str, ...]:
+        if value is None or value == "":
+            return ()
+        if isinstance(value, str):
+            raw_origins = [item.strip() for item in value.split(",")]
+        elif isinstance(value, (list, tuple)):
+            raw_origins = [str(item).strip() for item in value]
+        else:
+            raise ValueError("FRONTEND_ORIGINS must be a comma-separated string or list")
+
+        normalized_origins: list[str] = []
+        seen: set[str] = set()
+        for origin in raw_origins:
+            if not origin:
+                continue
+            if origin == "*":
+                raise ValueError("FRONTEND_ORIGINS must not contain '*'.")
+            parsed = urlparse(origin.rstrip("/"))
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("FRONTEND_ORIGINS entries must be valid http/https origins")
+            if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+                raise ValueError("FRONTEND_ORIGINS entries must not include paths, queries, or fragments")
+            normalized = f"{parsed.scheme}://{parsed.netloc}"
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_origins.append(normalized)
+        return tuple(normalized_origins)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

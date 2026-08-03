@@ -6,6 +6,11 @@ from app.schemas.dynamic_schema import (
     DynamicSchemaVersionInput,
     DynamicSchemaVersionRead,
 )
+from app.schemas.frontend_api import (
+    FrontendCurrentUserResponse,
+    FrontendReviewDecisionWriteRequest,
+    FrontendReviewDecisionWriteResponse,
+)
 from app.schemas.entity import (
     EntityAliasCreateInput,
     EntityAliasRead,
@@ -193,6 +198,9 @@ __all__ = [
     "DynamicSchemaKnowledgeSection",
     "DynamicSchemaKnowledgeRecord",
     "DynamicSchemaKnowledgeView",
+    "FrontendCurrentUserResponse",
+    "FrontendReviewDecisionWriteRequest",
+    "FrontendReviewDecisionWriteResponse",
     "DocumentCreate",
     "DocumentRead",
     "ExtractionRunRead",

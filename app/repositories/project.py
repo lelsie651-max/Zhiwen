@@ -50,6 +50,21 @@ async def get_project_member_for_user_by_slug(
     return result.scalar_one_or_none()
 
 
+async def get_project_member_for_user_by_project_id(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> ProjectMember | None:
+    result = await session.execute(
+        select(ProjectMember)
+        .join(Project, ProjectMember.project_id == Project.id)
+        .where(ProjectMember.user_id == user_id, Project.id == project_id)
+        .options(joinedload(ProjectMember.project))
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_project(session: AsyncSession, project: Project) -> Project:
     session.add(project)
     await session.flush()
