@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
-import inspect
 import json
-from pathlib import Path
 from typing import Any
 import uuid
-from unittest.mock import patch
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,8 +61,8 @@ from app.utils.document_blocks import build_document_block_anchor_hash
 
 
 _SEED_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "zhiwen:bailian-demo-seed")
+_DEMO_SCENARIO_NAME = "single_revision_cross_batch_plugin_demo"
 _PRIMARY_DOCUMENT_TITLE = "织文产品说明（演示）"
-_SECONDARY_DOCUMENT_TITLE = "织文评审备忘（演示）"
 _PROJECT_NAME = "织文百炼联调演示"
 _PROJECT_SLUG = "zhiwen-bailian-demo"
 _SUBJECT_KIND = "product"
@@ -99,36 +95,12 @@ def _seed_uuid(seed_id: str, name: str) -> uuid.UUID:
     return uuid.uuid5(_SEED_NAMESPACE, f"{seed_id}:{name}")
 
 
-def _seed_phase(seed_id: str, phase: str) -> str:
-    return f"{seed_id}:{phase}"
-
-
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _json_string(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-class _DeterministicUUID4:
-    def __init__(self, seed_id: str) -> None:
-        self._namespace = _seed_uuid(seed_id, "uuid4")
-        self._counts: dict[str, int] = {}
-
-    def __call__(self) -> uuid.UUID:
-        frame = inspect.stack(context=0)[1]
-        location = f"{Path(frame.filename).name}:{frame.function}:{frame.lineno}"
-        index = self._counts.get(location, 0)
-        self._counts[location] = index + 1
-        return uuid.uuid5(self._namespace, f"{location}:{index}")
-
-
-@contextmanager
-def _patch_deterministic_uuid4(seed_id: str):
-    generator = _DeterministicUUID4(seed_id)
-    with patch("uuid.uuid4", generator):
-        yield
 
 
 def _build_primary_block_texts() -> tuple[str, ...]:
@@ -176,7 +148,10 @@ def _build_extracted_document() -> ExtractedDocument:
         block_count=len(blocks),
         blocks=blocks,
         warnings=[],
-        metadata={"seed": "bailian-demo"},
+        metadata={
+            "seed": "bailian-demo",
+            "scenario": _DEMO_SCENARIO_NAME,
+        },
     )
 
 
@@ -297,11 +272,14 @@ def _build_human_schema_input() -> HumanSchemaDraftInput:
             schema_key=_SCHEMA_KEY,
             name=_SCHEMA_NAME,
             subject_kind=_SUBJECT_KIND,
-            description="百炼联调演示动态 Schema",
+            description=f"{_DEMO_SCENARIO_NAME} 动态 Schema",
         ),
         version=DynamicSchemaVersionInput(
             summary=_SCHEMA_SUMMARY,
-            layout_config={"seed": "bailian-demo"},
+            layout_config={
+                "seed": "bailian-demo",
+                "scenario": _DEMO_SCENARIO_NAME,
+            },
             fields=[
                 DynamicSchemaFieldInput(
                     field_key="release_date",
@@ -391,6 +369,47 @@ async def _get_blocks_for_run(session: AsyncSession, extraction_run_id: uuid.UUI
     return list(result.scalars().all())
 
 
+async def _get_documents_for_project(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[Document]:
+    result = await session.execute(
+        select(Document)
+        .where(Document.project_id == project_id)
+        .order_by(Document.logical_order_index.asc(), Document.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def _get_project_versions(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[ProjectVersion]:
+    result = await session.execute(
+        select(ProjectVersion)
+        .where(ProjectVersion.project_id == project_id)
+        .order_by(ProjectVersion.version_no.asc(), ProjectVersion.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def _get_orchestrations_for_extraction(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    extraction_run_id: uuid.UUID,
+) -> list[FactExtractionOrchestration]:
+    result = await session.execute(
+        select(FactExtractionOrchestration)
+        .where(
+            FactExtractionOrchestration.project_id == project_id,
+            FactExtractionOrchestration.extraction_run_id == extraction_run_id,
+        )
+        .order_by(FactExtractionOrchestration.attempt_no.asc(), FactExtractionOrchestration.id.asc())
+    )
+    return list(result.scalars().all())
+
+
 async def _create_base_objects(session_factory, seed_id: str) -> None:
     async with session_factory() as session:
         user = User(
@@ -404,7 +423,7 @@ async def _create_base_objects(session_factory, seed_id: str) -> None:
             id=_seed_uuid(seed_id, "project"),
             name=_PROJECT_NAME,
             slug=_PROJECT_SLUG,
-            description="用于百炼插件联调的本地演示项目",
+            description=f"用于百炼插件联调的 {_DEMO_SCENARIO_NAME} 本地演示项目",
             visibility=ProjectVisibility.PRIVATE.value,
             status=ProjectStatus.ACTIVE.value,
             current_version_id=None,
@@ -428,20 +447,7 @@ async def _create_base_objects(session_factory, seed_id: str) -> None:
             logical_order_value="1",
             logical_order_index=Decimal("1"),
         )
-        secondary_document = Document(
-            id=_seed_uuid(seed_id, "document-secondary"),
-            project_id=project.id,
-            title=_SECONDARY_DOCUMENT_TITLE,
-            description="附加演示文档",
-            status=DocumentStatus.ACTIVE.value,
-            created_by_id=user.id,
-            current_revision_id=None,
-            logical_order_kind="manual",
-            logical_order_value="2",
-            logical_order_index=Decimal("2"),
-        )
         primary_content = "\n".join(_build_primary_block_texts())
-        secondary_content = "这是一份额外的演示备忘，仅用于本地联调对象完整性。"
         primary_revision = DocumentRevision(
             id=_seed_uuid(seed_id, "revision-primary"),
             document_id=primary_document.id,
@@ -459,29 +465,11 @@ async def _create_base_objects(session_factory, seed_id: str) -> None:
             status=DocumentRevisionStatus.COMPLETED.value,
             uploaded_by_id=user.id,
         )
-        secondary_revision = DocumentRevision(
-            id=_seed_uuid(seed_id, "revision-secondary"),
-            document_id=secondary_document.id,
-            revision_no=1,
-            upload_intent=UploadIntent.NEW_DOCUMENT.value,
-            supersedes_revision_id=None,
-            original_filename="zhiwen-demo-secondary.md",
-            storage_key="demo/zhiwen-demo-secondary.md",
-            mime_type="text/markdown",
-            file_size_bytes=len(secondary_content.encode("utf-8")),
-            sha256=_sha256_text(secondary_content),
-            detected_language="zh-CN",
-            language_confidence=1.0,
-            source_authority=SourceAuthority.REFERENCE.value,
-            status=DocumentRevisionStatus.COMPLETED.value,
-            uploaded_by_id=user.id,
-        )
-        session.add_all([user, project, member, primary_document, secondary_document])
+        session.add_all([user, project, member, primary_document])
         await session.flush()
-        session.add_all([primary_revision, secondary_revision])
+        session.add(primary_revision)
         await session.flush()
         primary_document.current_revision_id = primary_revision.id
-        secondary_document.current_revision_id = secondary_revision.id
         await session.commit()
 
 
@@ -490,16 +478,15 @@ async def _persist_primary_extraction(session_factory, seed_id: str) -> Extracti
         revision = await session.get(DocumentRevision, _seed_uuid(seed_id, "revision-primary"))
         if revision is None:
             raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
-        with _patch_deterministic_uuid4(_seed_phase(seed_id, "primary-extraction")):
-            run = await document_content_service.persist_extraction_result(
-                session,
-                revision_id=revision.id,
-                extracted_document=_build_extracted_document(),
-                extractor_name=_EXTRACTOR_NAME,
-                extractor_version=_EXTRACTOR_VERSION,
-                started_at=datetime(2026, 8, 3, 8, 0, tzinfo=timezone.utc),
-                completed_at=datetime(2026, 8, 3, 8, 1, tzinfo=timezone.utc),
-            )
+        run = await document_content_service.persist_extraction_result(
+            session,
+            revision_id=revision.id,
+            extracted_document=_build_extracted_document(),
+            extractor_name=_EXTRACTOR_NAME,
+            extractor_version=_EXTRACTOR_VERSION,
+            started_at=datetime(2026, 8, 3, 8, 0, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 8, 3, 8, 1, tzinfo=timezone.utc),
+        )
         return run
 
 
@@ -536,26 +523,25 @@ async def _run_fact_pipeline(session_factory, seed_id: str) -> tuple[uuid.UUID, 
     if len(plan.batches) != 2:
         raise BailianDemoSeedError("expected exactly two extraction batches")
 
-    with _patch_deterministic_uuid4(_seed_phase(seed_id, "fact-orchestration")):
-        orchestration = await fact_extraction_orchestration.execute_fact_extraction_orchestration(
-            session_factory,
-            project_id=project.id,
-            extraction_run_id=extraction_run.id,
-            plan=plan,
-            prompt=fact_prompt,
-            llm_client=MockLLMClient(_build_fact_extraction_responses()),
-            provider=_PROVIDER,
-            requested_model=_REQUESTED_MODEL,
-            worker_token=_seed_uuid(seed_id, "worker-token"),
-        )
-        duplicate_result = await fact_value_duplicate_grouping.ensure_cross_batch_duplicate_grouping(
-            session_factory,
-            orchestration_id=orchestration.orchestration_id,
-        )
-        candidate_result = await fact_value_duplicate_grouping.ensure_cross_batch_multi_value_consistency_candidates(
-            session_factory,
-            duplicate_grouping_application_id=duplicate_result.grouping_application_id,
-        )
+    orchestration = await fact_extraction_orchestration.execute_fact_extraction_orchestration(
+        session_factory,
+        project_id=project.id,
+        extraction_run_id=extraction_run.id,
+        plan=plan,
+        prompt=fact_prompt,
+        llm_client=MockLLMClient(_build_fact_extraction_responses()),
+        provider=_PROVIDER,
+        requested_model=_REQUESTED_MODEL,
+        worker_token=_seed_uuid(seed_id, "worker-token"),
+    )
+    duplicate_result = await fact_value_duplicate_grouping.ensure_cross_batch_duplicate_grouping(
+        session_factory,
+        orchestration_id=orchestration.orchestration_id,
+    )
+    candidate_result = await fact_value_duplicate_grouping.ensure_cross_batch_multi_value_consistency_candidates(
+        session_factory,
+        duplicate_grouping_application_id=duplicate_result.grouping_application_id,
+    )
 
     consistency_prompt = get_prompt("agent2_consistency_check", "1.0.0")
     plan_result = await consistency_check_service.build_consistency_check_plan(
@@ -587,24 +573,23 @@ async def _run_fact_pipeline(session_factory, seed_id: str) -> tuple[uuid.UUID, 
             for candidate in batch.candidates
         ]
     }
-    with _patch_deterministic_uuid4(_seed_phase(seed_id, "consistency-check")):
-        execution = await consistency_check_execution.execute_consistency_check_plan(
-            session_factory,
-            project_id=plan_result.project_id,
-            plan=plan_result,
-            prompt=consistency_prompt,
-            llm_client=MockLLMClient([_json_string(response)]),
-            provider=_PROVIDER,
-            requested_model=_REQUESTED_MODEL,
-        )
-        persisted = await consistency_check_persistence.persist_consistency_check_plan_result(
-            session_factory,
-            plan=plan_result,
-            execution_result=execution,
-            prompt=consistency_prompt,
-            provider=_PROVIDER,
-            requested_model=_REQUESTED_MODEL,
-        )
+    execution = await consistency_check_execution.execute_consistency_check_plan(
+        session_factory,
+        project_id=plan_result.project_id,
+        plan=plan_result,
+        prompt=consistency_prompt,
+        llm_client=MockLLMClient([_json_string(response)]),
+        provider=_PROVIDER,
+        requested_model=_REQUESTED_MODEL,
+    )
+    persisted = await consistency_check_persistence.persist_consistency_check_plan_result(
+        session_factory,
+        plan=plan_result,
+        execution_result=execution,
+        prompt=consistency_prompt,
+        provider=_PROVIDER,
+        requested_model=_REQUESTED_MODEL,
+    )
 
     auth = await consistency_check_persistence.authenticate_persisted_consistency_check_application(
         session_factory,
@@ -653,156 +638,146 @@ async def _run_fact_pipeline(session_factory, seed_id: str) -> tuple[uuid.UUID, 
     if assessment_id is None:
         raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
 
-    with _patch_deterministic_uuid4(_seed_phase(seed_id, "consistency-review")):
-        await consistency_review.append_consistency_review_decision(
-            session_factory,
-            project_id=project.id,
-            consistency_check_application_id=persisted.consistency_check_application_id,
-            assessment_id=assessment_id,
-            actor_id=_seed_uuid(seed_id, "user"),
-            expected_current_decision_id=None,
-            decision_kind="select_one",
-            selected_fact_value_ids=(chosen,),
-            comment="演示场景中人工确认华北2（北京）为生效值。",
-        )
+    await consistency_review.append_consistency_review_decision(
+        session_factory,
+        project_id=project.id,
+        consistency_check_application_id=persisted.consistency_check_application_id,
+        assessment_id=assessment_id,
+        actor_id=_seed_uuid(seed_id, "user"),
+        expected_current_decision_id=None,
+        decision_kind="select_one",
+        selected_fact_value_ids=(chosen,),
+        comment="演示场景中人工确认华北2（北京）为生效值。",
+    )
 
     return orchestration.orchestration_id, persisted.consistency_check_application_id
 
 
 async def _create_schema(session_factory, seed_id: str) -> tuple[uuid.UUID, uuid.UUID]:
     async with session_factory() as session:
-        with _patch_deterministic_uuid4(_seed_phase(seed_id, "schema-draft")):
-            version = await dynamic_schema_service.create_human_schema_draft(
-                session,
-                project_id=_seed_uuid(seed_id, "project"),
-                actor_id=_seed_uuid(seed_id, "user"),
-                payload=_build_human_schema_input(),
-            )
+        version = await dynamic_schema_service.create_human_schema_draft(
+            session,
+            project_id=_seed_uuid(seed_id, "project"),
+            actor_id=_seed_uuid(seed_id, "user"),
+            payload=_build_human_schema_input(),
+        )
     async with session_factory() as session:
-        with _patch_deterministic_uuid4(_seed_phase(seed_id, "schema-activate")):
-            active = await dynamic_schema_service.activate_dynamic_schema_version(
-                session,
-                project_id=_seed_uuid(seed_id, "project"),
-                actor_id=_seed_uuid(seed_id, "user"),
-                schema_id=version.schema_id,
-                version_id=version.id,
-            )
+        active = await dynamic_schema_service.activate_dynamic_schema_version(
+            session,
+            project_id=_seed_uuid(seed_id, "project"),
+            actor_id=_seed_uuid(seed_id, "user"),
+            schema_id=version.schema_id,
+            version_id=version.id,
+        )
     return active.schema_id, active.id
-
-
-async def _create_project_version(session_factory, seed_id: str, schema_id: uuid.UUID, schema_version_id: uuid.UUID) -> uuid.UUID:
-    async with session_factory() as session:
-        project = await session.get(Project, _seed_uuid(seed_id, "project"))
-        if project is None:
-            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
-        result = await session.execute(
-            select(FactExtractionOrchestration)
-            .where(FactExtractionOrchestration.project_id == project.id)
-            .order_by(FactExtractionOrchestration.attempt_no.asc())
-        )
-        orchestrations = list(result.scalars().all())
-        if len(orchestrations) != 1:
-            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
-        orchestration_id = orchestrations[0].id
-    review_projection = await dynamic_schema_review_projection.project_reviewed_orchestration_ufl_to_dynamic_schema(
-        session_factory,
-        project_id=_seed_uuid(seed_id, "project"),
-        schema_id=schema_id,
-        schema_version_id=schema_version_id,
-        orchestration_id=orchestration_id,
-        consistency_check_application_id=_lookup_consistency_check_application_id(session_factory, seed_id),
-    )
-    dynamic_schema_review_projection.authenticate_dynamic_schema_review_projection(
-        review_projection,
-        subject_keys=None,
-    )
-    knowledge_view = await dynamic_schema_knowledge_view.build_dynamic_schema_knowledge_view(
-        session_factory,
-        project_id=_seed_uuid(seed_id, "project"),
-        schema_id=schema_id,
-        schema_version_id=schema_version_id,
-        orchestration_id=orchestration_id,
-        consistency_check_application_id=_lookup_consistency_check_application_id(session_factory, seed_id),
-        subject_keys=None,
-    )
-    dynamic_schema_knowledge_view.authenticate_dynamic_schema_knowledge_view(
-        knowledge_view,
-        subject_keys=None,
-    )
-    created = await project_version_service.create_project_version(
-        session_factory,
-        project_version_id=_seed_uuid(seed_id, "project-version"),
-        project_id=_seed_uuid(seed_id, "project"),
-        schema_id=schema_id,
-        schema_version_id=schema_version_id,
-        orchestration_id=orchestration_id,
-        consistency_check_application_id=_lookup_consistency_check_application_id(session_factory, seed_id),
-        created_by_id=_seed_uuid(seed_id, "user"),
-        creation_kind="manual",
-        reason=_VERSION_REASON,
-    )
-    return created.id
-
-
-def _lookup_consistency_check_application_id(session_factory, seed_id: str) -> uuid.UUID:
-    # This helper is only called after the consistency ledger has been created and
-    # its ID is stable in the database.
-    return _seed_uuid(seed_id, "consistency-check-app-placeholder")
-
-
-async def _load_consistency_check_application_id(session_factory, seed_id: str) -> uuid.UUID:
-    async with session_factory() as session:
-        project = await session.get(Project, _seed_uuid(seed_id, "project"))
-        if project is None:
-            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
-        schema = await _get_schema(session, project.id)
-        if schema is None or project.current_version_id is None:
-            result = await session.execute(
-                select(ProjectVersion)
-                .where(ProjectVersion.project_id == project.id)
-                .order_by(ProjectVersion.version_no.asc())
-            )
-            rows = list(result.scalars().all())
-            if rows:
-                return rows[-1].consistency_check_application_id
-        result = await session.execute(
-            select(ProjectVersion)
-            .where(ProjectVersion.project_id == project.id)
-            .order_by(ProjectVersion.version_no.asc())
-        )
-        rows = list(result.scalars().all())
-        if rows:
-            return rows[-1].consistency_check_application_id
-    raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
 
 
 async def _verify_and_build_result(session_factory, seed_id: str, *, created_new: bool) -> BailianDemoSeedResult:
     async with session_factory() as session:
+        expected_user_id = _seed_uuid(seed_id, "user")
+        expected_project_id = _seed_uuid(seed_id, "project")
+        expected_member_id = _seed_uuid(seed_id, "project-member")
+        expected_document_id = _seed_uuid(seed_id, "document-primary")
+        expected_revision_id = _seed_uuid(seed_id, "revision-primary")
+        expected_project_version_id = _seed_uuid(seed_id, "project-version")
         user = await _get_user_by_handle(session)
         project = await _get_project_by_slug(session)
-        if user is None or project is None:
+        if (
+            user is None
+            or project is None
+            or user.id != expected_user_id
+            or project.id != expected_project_id
+            or project.created_by_id != user.id
+        ):
+            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+        member = await session.get(ProjectMember, expected_member_id)
+        if (
+            member is None
+            or member.project_id != project.id
+            or member.user_id != user.id
+            or member.role != ProjectMemberRole.OWNER.value
+        ):
             raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
         schema = await _get_schema(session, project.id)
         if schema is None or schema.current_version_id is None:
             raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
-        primary_document = await _get_document_by_title(session, project.id, _PRIMARY_DOCUMENT_TITLE)
-        if primary_document is None or primary_document.current_revision_id is None:
+        documents = await _get_documents_for_project(session, project.id)
+        if len(documents) != 1:
             raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
-        extraction_run = await _get_single_extraction_run(session, primary_document.current_revision_id)
-        if extraction_run is None:
+        primary_document = documents[0]
+        primary_revision = await session.get(DocumentRevision, expected_revision_id)
+        if (
+            primary_document.id != expected_document_id
+            or primary_document.title != _PRIMARY_DOCUMENT_TITLE
+            or primary_document.current_revision_id != expected_revision_id
+            or primary_revision is None
+            or primary_revision.document_id != primary_document.id
+            or primary_revision.status != DocumentRevisionStatus.COMPLETED.value
+        ):
             raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
-        result = await session.execute(
-            select(FactExtractionOrchestration)
-            .where(FactExtractionOrchestration.project_id == project.id)
-            .order_by(FactExtractionOrchestration.attempt_no.asc())
+        extraction_run = await _get_single_extraction_run(session, primary_revision.id)
+        if extraction_run is None or extraction_run.revision_id != primary_revision.id:
+            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+        blocks = await _get_blocks_for_run(session, extraction_run.id)
+        if len(blocks) != 4 or [block.source_order for block in blocks] != [0, 1, 2, 3]:
+            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+        orchestrations = await _get_orchestrations_for_extraction(
+            session,
+            project_id=project.id,
+            extraction_run_id=extraction_run.id,
         )
-        orchestrations = list(result.scalars().all())
         if len(orchestrations) != 1:
             raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
         orchestration = orchestrations[0]
-        version = await session.get(ProjectVersion, project.current_version_id)
-        if version is None:
+        if orchestration.project_id != project.id or orchestration.extraction_run_id != extraction_run.id:
             raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+        versions = await _get_project_versions(session, project.id)
+        if len(versions) != 1:
+            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+        version = versions[0]
+        if (
+            version.id != expected_project_version_id
+            or project.current_version_id != version.id
+            or version.project_id != project.id
+            or version.schema_id != schema.id
+            or version.schema_version_id != schema.current_version_id
+            or version.orchestration_id != orchestration.id
+            or version.extraction_run_id != extraction_run.id
+            or version.created_by_id != user.id
+        ):
+            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+        facts = list(
+            (
+                await session.execute(
+                    select(Fact)
+                    .where(Fact.project_id == project.id)
+                    .order_by(Fact.predicate_key.asc(), Fact.id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if len(facts) != 3:
+            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+        fact_by_predicate = {fact.predicate_key: fact for fact in facts}
+        if set(fact_by_predicate) != {"deployment_region", "release_date", "support_channel"}:
+            raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+
+    authenticated_consistency = (
+        await consistency_check_persistence.authenticate_persisted_consistency_check_application(
+            session_factory,
+            project_id=project.id,
+            consistency_check_application_id=version.consistency_check_application_id,
+        )
+    )
+    if (
+        authenticated_consistency.application.id != version.consistency_check_application_id
+        or authenticated_consistency.application.project_id != project.id
+        or authenticated_consistency.application.orchestration_id != orchestration.id
+        or authenticated_consistency.application.consistency_application_id
+        != version.source_consistency_application_id
+    ):
+        raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
 
     reviewed = await dynamic_schema_review_projection.project_reviewed_orchestration_ufl_to_dynamic_schema(
         session_factory,
@@ -836,16 +811,26 @@ async def _verify_and_build_result(session_factory, seed_id: str, *, created_new
     )
     snapshot = project_version_service.authenticate_project_version_snapshot(snapshot)
 
-    facts_by_predicate: dict[str, Any] = {}
+    reviewed_facts_by_predicate: dict[str, Any] = {}
     for record in reviewed.records:
         for field in record.fields:
             for fact in field.reviewed_facts:
-                facts_by_predicate.setdefault(fact.fact.predicate_key, fact)
+                predicate_key = fact.fact.predicate_key
+                if predicate_key in reviewed_facts_by_predicate:
+                    raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+                reviewed_facts_by_predicate[predicate_key] = fact
 
-    pending_fact = facts_by_predicate.get("release_date")
-    resolved_fact = facts_by_predicate.get("deployment_region")
-    observation_fact = facts_by_predicate.get("support_channel")
-    if pending_fact is None or resolved_fact is None or observation_fact is None:
+    pending_fact = reviewed_facts_by_predicate.get("release_date")
+    resolved_fact = reviewed_facts_by_predicate.get("deployment_region")
+    observation_fact = reviewed_facts_by_predicate.get("support_channel")
+    if (
+        pending_fact is None
+        or resolved_fact is None
+        or observation_fact is None
+        or fact_by_predicate["release_date"].id != pending_fact.fact.fact_id
+        or fact_by_predicate["deployment_region"].id != resolved_fact.fact.fact_id
+        or fact_by_predicate["support_channel"].id != observation_fact.fact.fact_id
+    ):
         raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
     if pending_fact.review_state != "pending_review":
         raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
@@ -902,6 +887,24 @@ async def _verify_and_build_result(session_factory, seed_id: str, *, created_new
     )
     if detail.semantic_value_count != 2 or len(detail.value_groups) != 2:
         raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+    if any(not value_group.get("evidences") for value_group in detail.value_groups):
+        raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
+
+    resolved_detail = await bailian_review_tools.get_review_item_detail(
+        session_factory,
+        project_id=str(project.id),
+        fact_id=str(resolved_fact.fact.fact_id),
+        schema_id=str(schema.id),
+        schema_version_id=str(schema.current_version_id),
+        orchestration_id=str(orchestration.id),
+        consistency_check_application_id=str(version.consistency_check_application_id),
+    )
+    if (
+        resolved_detail.review_state != "resolved"
+        or resolved_detail.current_decision_kind != "select_one"
+        or len(resolved_detail.effective_fact_value_ids) != 1
+    ):
+        raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
 
     record = await bailian_review_tools.get_version_record(
         session_factory,
@@ -909,7 +912,7 @@ async def _verify_and_build_result(session_factory, seed_id: str, *, created_new
         project_version_id=str(version.id),
         subject_key=_SUBJECT_KEY,
     )
-    if record.subject_key != _SUBJECT_KEY:
+    if record.subject_key != _SUBJECT_KEY or record.record_json.get("subject_key") != _SUBJECT_KEY:
         raise BailianDemoSeedInconsistentError("bailian_demo_seed_inconsistent")
 
     return BailianDemoSeedResult(

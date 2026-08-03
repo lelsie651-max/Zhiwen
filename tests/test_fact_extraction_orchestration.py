@@ -2310,12 +2310,12 @@ def test_terminal_consistency_postprocessing_grouping_idempotent_hit_still_runs_
 
 def test_terminal_consistency_postprocessing_grouping_failure_keeps_terminal_result_and_skips_candidates(
     monkeypatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     session_factory = SessionFactory()
     orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.PARTIAL)
     sentinel = "SENSITIVE_DUPLICATE_GROUPING_SENTINEL"
     candidate_called = False
+    warnings: list[tuple[str, dict[str, object]]] = []
 
     async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
         raise duplicate_grouping_service.CrossBatchDuplicateGroupingInvariantError(sentinel)
@@ -2335,6 +2335,11 @@ def test_terminal_consistency_postprocessing_grouping_failure_keeps_terminal_res
         "ensure_cross_batch_multi_value_consistency_candidates",
         fake_candidates,
     )
+    monkeypatch.setattr(
+        orchestration_service.logger,
+        "warning",
+        lambda message, *, extra: warnings.append((message, extra)),
+    )
 
     result = run_async(
         orchestration_service._maybe_run_terminal_consistency_postprocessing(
@@ -2345,20 +2350,28 @@ def test_terminal_consistency_postprocessing_grouping_failure_keeps_terminal_res
 
     assert result == orchestration_result
     assert candidate_called is False
-    assert "Terminal orchestration consistency postprocessing step failed" in caplog.text
-    assert any(getattr(record, "stage", None) == "duplicate_grouping" for record in caplog.records)
-    assert any(getattr(record, "error_type", None) == "CrossBatchDuplicateGroupingInvariantError" for record in caplog.records)
-    assert sentinel not in caplog.text
+    assert warnings == [
+        (
+            "Terminal orchestration consistency postprocessing step failed",
+            {
+                "stage": "duplicate_grouping",
+                "orchestration_id": str(orchestration_result.orchestration_id),
+                "orchestration_status": orchestration_result.status.value,
+                "error_type": "CrossBatchDuplicateGroupingInvariantError",
+            },
+        )
+    ]
+    assert sentinel not in repr(warnings)
 
 
 def test_terminal_consistency_postprocessing_candidate_failure_keeps_terminal_result(
     monkeypatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     session_factory = SessionFactory()
     orchestration_result = _make_orchestration_result(status=FactExtractionOrchestrationStatus.COMPLETED)
     grouping_application_id = uuid.uuid4()
     sentinel = "SENSITIVE_CONSISTENCY_CANDIDATE_SENTINEL"
+    warnings: list[tuple[str, dict[str, object]]] = []
 
     async def fake_grouping(_session_factory, *, orchestration_id, algorithm_version="cross_batch_exact_v2"):
         return duplicate_grouping_service.DuplicateGroupingResult(
@@ -2383,6 +2396,11 @@ def test_terminal_consistency_postprocessing_candidate_failure_keeps_terminal_re
         "ensure_cross_batch_multi_value_consistency_candidates",
         fake_candidates,
     )
+    monkeypatch.setattr(
+        orchestration_service.logger,
+        "warning",
+        lambda message, *, extra: warnings.append((message, extra)),
+    )
 
     result = run_async(
         orchestration_service._maybe_run_terminal_consistency_postprocessing(
@@ -2392,17 +2410,19 @@ def test_terminal_consistency_postprocessing_candidate_failure_keeps_terminal_re
     )
 
     assert result == orchestration_result
-    assert "Terminal orchestration consistency postprocessing step failed" in caplog.text
-    assert any(getattr(record, "stage", None) == "consistency_candidates" for record in caplog.records)
-    assert any(
-        getattr(record, "grouping_application_id", None) == str(grouping_application_id)
-        for record in caplog.records
-    )
-    assert any(
-        getattr(record, "error_type", None) == "FactValueConsistencyCandidateInvariantError"
-        for record in caplog.records
-    )
-    assert sentinel not in caplog.text
+    assert warnings == [
+        (
+            "Terminal orchestration consistency postprocessing step failed",
+            {
+                "stage": "consistency_candidates",
+                "orchestration_id": str(orchestration_result.orchestration_id),
+                "orchestration_status": orchestration_result.status.value,
+                "grouping_application_id": str(grouping_application_id),
+                "error_type": "FactValueConsistencyCandidateInvariantError",
+            },
+        )
+    ]
+    assert sentinel not in repr(warnings)
 
 
 def test_terminal_consistency_postprocessing_grouping_cancelled_error_propagates(

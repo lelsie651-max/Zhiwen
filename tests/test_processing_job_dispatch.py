@@ -44,7 +44,9 @@ def test_dispatch_calls_executor(monkeypatch) -> None:
     }
 
 
-def test_dispatch_swallows_ordinary_exception_with_safe_logging(monkeypatch, caplog) -> None:
+def test_dispatch_swallows_ordinary_exception_with_safe_logging(monkeypatch) -> None:
+    warnings: list[tuple[str, uuid.UUID]] = []
+
     async def fake_execute_revision_extraction_job(session_factory, *, job_id, storage):
         raise RuntimeError("lease_token=secret storage_key=hidden body text")
 
@@ -53,20 +55,30 @@ def test_dispatch_swallows_ordinary_exception_with_safe_logging(monkeypatch, cap
         "execute_revision_extraction_job",
         fake_execute_revision_extraction_job,
     )
+    monkeypatch.setattr(
+        processing_job_dispatch_service.logger,
+        "warning",
+        lambda message, job_id: warnings.append((message, job_id)),
+    )
 
-    with caplog.at_level("WARNING"):
-        run_async(
-            processing_job_dispatch_service.dispatch_revision_extraction_job(
-                job_id=uuid.uuid4(),
-                session_factory=object(),  # type: ignore[arg-type]
-                storage=object(),  # type: ignore[arg-type]
-            )
+    job_id = uuid.uuid4()
+    run_async(
+        processing_job_dispatch_service.dispatch_revision_extraction_job(
+            job_id=job_id,
+            session_factory=object(),  # type: ignore[arg-type]
+            storage=object(),  # type: ignore[arg-type]
         )
+    )
 
-    assert "dispatch_failed" in caplog.text
-    assert "lease_token" not in caplog.text
-    assert "storage_key" not in caplog.text
-    assert "body text" not in caplog.text
+    assert warnings == [
+        (
+            "Background extraction dispatch failed safely: job_id=%s status=dispatch_failed",
+            job_id,
+        )
+    ]
+    assert "lease_token" not in repr(warnings)
+    assert "storage_key" not in repr(warnings)
+    assert "body text" not in repr(warnings)
 
 
 def test_dispatch_propagates_cancelled_error(monkeypatch) -> None:
