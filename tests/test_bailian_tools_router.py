@@ -47,6 +47,10 @@ def _set_tool_token(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
     )
 
 
+def _bearer_headers(token: str, *, scheme: str = "Bearer") -> dict[str, str]:
+    return {"Authorization": f"{scheme} {token}"}
+
+
 def _build_list_response() -> BailianReviewItemsResponse:
     response = BailianReviewItemsResponse(
         source_manifest_hash=_hash("reviewed-manifest"),
@@ -219,7 +223,7 @@ def _build_record_response() -> BailianVersionRecordResponse:
     )
 
 
-def test_bailian_router_rejects_unconfigured_and_unauthorized_tokens(monkeypatch) -> None:
+def test_bailian_router_rejects_unconfigured_token(monkeypatch) -> None:
     _set_tool_token(monkeypatch, "")
     with TestClient(app) as client:
         response = client.get(
@@ -228,19 +232,33 @@ def test_bailian_router_rejects_unconfigured_and_unauthorized_tokens(monkeypatch
     assert response.status_code == 503
     assert response.json() == {"detail": "bailian_tool_unconfigured"}
 
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"X-Zhiwen-Tool-Token": "server-secret"},
+        {"Authorization": "Basic server-secret"},
+        {"Authorization": "AppCode server-secret"},
+        {"Authorization": "Bearer"},
+        {"Authorization": "Bearer "},
+        {"Authorization": "Bearer wrong-token"},
+        {"Authorization": "malformed"},
+    ],
+)
+def test_bailian_router_rejects_missing_or_invalid_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+    headers: dict[str, str],
+) -> None:
     _set_tool_token(monkeypatch, "server-secret")
     with TestClient(app) as client:
-        missing = client.get(
-            f"/api/v1/integrations/bailian/projects/{_uuid('project')}/review-items"
-        )
-        wrong = client.get(
+        response = client.get(
             f"/api/v1/integrations/bailian/projects/{_uuid('project')}/review-items",
-            headers={"X-Zhiwen-Tool-Token": "wrong-token"},
+            headers=headers,
         )
-    assert missing.status_code == 401
-    assert missing.json() == {"detail": "bailian_tool_unauthorized"}
-    assert wrong.status_code == 401
-    assert wrong.json() == {"detail": "bailian_tool_unauthorized"}
+    assert response.status_code == 401
+    assert response.json() == {"detail": "bailian_tool_unauthorized"}
+    assert "server-secret" not in response.text
 
 
 def test_bailian_router_accepts_correct_token_and_calls_services(monkeypatch) -> None:
@@ -263,7 +281,7 @@ def test_bailian_router_accepts_correct_token_and_calls_services(monkeypatch) ->
     monkeypatch.setattr(bailian_tools_service, "get_review_item_detail", fake_detail)
     monkeypatch.setattr(bailian_tools_service, "get_version_record", fake_record)
 
-    headers = {"X-Zhiwen-Tool-Token": "server-secret"}
+    headers = _bearer_headers("server-secret")
     with TestClient(app) as client:
         list_response = client.get(
             f"/api/v1/integrations/bailian/projects/{_uuid('project')}/review-items",
@@ -296,6 +314,33 @@ def test_bailian_router_accepts_correct_token_and_calls_services(monkeypatch) ->
     assert calls == {"list": 1, "detail": 1, "record": 1}
 
 
+@pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER"])
+def test_bailian_router_accepts_case_insensitive_bearer_scheme(
+    monkeypatch: pytest.MonkeyPatch,
+    scheme: str,
+) -> None:
+    _set_tool_token(monkeypatch, "server-secret")
+
+    async def fake_list(*args, **kwargs):
+        return _build_list_response()
+
+    monkeypatch.setattr(bailian_tools_service, "list_review_items", fake_list)
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/integrations/bailian/projects/{_uuid('project')}/review-items",
+            params={
+                "schema_id": str(_uuid("schema")),
+                "schema_version_id": str(_uuid("schema-version")),
+                "orchestration_id": str(_uuid("orchestration")),
+                "consistency_check_application_id": str(_uuid("consistency-app")),
+            },
+            headers=_bearer_headers("server-secret", scheme=scheme),
+        )
+
+    assert response.status_code == 200
+
+
 def test_bailian_router_serializes_frozen_detail_and_record_json(monkeypatch) -> None:
     _set_tool_token(monkeypatch, "server-secret")
 
@@ -307,7 +352,7 @@ def test_bailian_router_serializes_frozen_detail_and_record_json(monkeypatch) ->
 
     monkeypatch.setattr(bailian_tools_service, "get_review_item_detail", fake_detail)
     monkeypatch.setattr(bailian_tools_service, "get_version_record", fake_record)
-    headers = {"X-Zhiwen-Tool-Token": "server-secret"}
+    headers = _bearer_headers("server-secret")
     with TestClient(app) as client:
         detail_response = client.get(
             f"/api/v1/integrations/bailian/projects/{_uuid('project')}/review-items/{_uuid('fact')}",
@@ -344,7 +389,7 @@ def test_bailian_router_supports_subject_key_path_segments(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(bailian_tools_service, "get_version_record", fake_record)
-    headers = {"X-Zhiwen-Tool-Token": "server-secret"}
+    headers = _bearer_headers("server-secret")
     with TestClient(app) as client:
         response = client.get(
             f"/api/v1/integrations/bailian/projects/{_uuid('project')}/versions/{_uuid('project-version')}/records/%E7%A0%94%E5%8F%91%E9%83%A8/%E5%9F%BA%E7%A1%80%E5%B9%B3%E5%8F%B0%E7%BB%84",
@@ -398,7 +443,7 @@ def test_bailian_router_maps_domain_errors(
         raise error
 
     monkeypatch.setattr(bailian_tools_service, service_name, fake_service)
-    headers = {"X-Zhiwen-Tool-Token": "server-secret"}
+    headers = _bearer_headers("server-secret")
     with TestClient(app) as client:
         if service_name == "list_review_items":
             response = client.get(
@@ -436,17 +481,18 @@ def test_bailian_router_maps_domain_errors(
     assert response.json() == {"detail": detail}
 
 
-def test_bailian_router_openapi_exposes_api_key_security_and_operation_ids(monkeypatch) -> None:
+def test_bailian_router_openapi_exposes_bearer_security_and_operation_ids(monkeypatch) -> None:
     secret = "server-secret"
     _set_tool_token(monkeypatch, secret)
 
     with TestClient(app) as client:
         openapi = client.get("/openapi.json").json()
 
-    security_scheme = openapi["components"]["securitySchemes"]["BailianToolToken"]
-    assert security_scheme["type"] == "apiKey"
-    assert security_scheme["in"] == "header"
-    assert security_scheme["name"] == "X-Zhiwen-Tool-Token"
+    security_scheme = openapi["components"]["securitySchemes"]["BailianToolBearer"]
+    assert security_scheme["type"] == "http"
+    assert security_scheme["scheme"] == "bearer"
+    assert security_scheme["bearerFormat"] == "opaque shared token"
+    assert "BailianToolToken" not in openapi["components"]["securitySchemes"]
     assert (
         openapi["paths"]["/api/v1/integrations/bailian/projects/{project_id}/review-items"]["get"]["operationId"]
         == "bailianListReviewItems"
@@ -460,6 +506,7 @@ def test_bailian_router_openapi_exposes_api_key_security_and_operation_ids(monke
         == "bailianGetVersionRecord"
     )
     assert openapi["paths"]["/api/v1/integrations/bailian/projects/{project_id}/review-items"]["get"]["security"] == [
-        {"BailianToolToken": []}
+        {"BailianToolBearer": []}
     ]
     assert secret not in str(openapi)
+    assert "X-Zhiwen-Tool-Token" not in str(openapi)
