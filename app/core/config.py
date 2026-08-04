@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(default=26214400, gt=0)
     upload_chunk_bytes: int = Field(default=1048576, gt=0)
     processing_stale_minutes: int = Field(default=30, gt=0)
+    bailian_integration_enabled: bool = False
     bailian_tool_token: SecretStr = SecretStr("")
     frontend_origins: tuple[str, ...] = ()
 

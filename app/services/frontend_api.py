@@ -6,15 +6,15 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.schemas.bailian_review_tools import (
-    BailianReviewItemDetailResponse,
-    BailianReviewItemsResponse,
-    BailianVersionRecordResponse,
+from app.schemas.frontend_api import (
+    FrontendReviewDecisionWriteResponse,
+    FrontendReviewItemDetailResponse,
+    FrontendReviewItemsResponse,
+    FrontendVersionRecordResponse,
 )
-from app.schemas.frontend_api import FrontendReviewDecisionWriteResponse
-import app.services.bailian_review_tools as bailian_review_tools_service
 import app.services.consistency_review as consistency_review_service
 import app.services.dynamic_schema_review_projection as review_projection_service
+import app.services.review_query as review_query_service
 
 
 class FrontendAPIError(Exception):
@@ -50,8 +50,8 @@ async def list_review_items(
     consistency_check_application_id: uuid.UUID,
     state: str,
     limit: int,
-) -> BailianReviewItemsResponse:
-    return await bailian_review_tools_service.list_review_items(
+) -> FrontendReviewItemsResponse:
+    return await review_query_service.list_review_items(
         session_factory,
         project_id=project_id,
         schema_id=schema_id,
@@ -72,8 +72,8 @@ async def get_review_item_detail(
     schema_version_id: uuid.UUID,
     orchestration_id: uuid.UUID,
     consistency_check_application_id: uuid.UUID,
-) -> BailianReviewItemDetailResponse:
-    return await bailian_review_tools_service.get_review_item_detail(
+) -> FrontendReviewItemDetailResponse:
+    return await review_query_service.get_review_item_detail(
         session_factory,
         project_id=project_id,
         fact_id=fact_id,
@@ -151,8 +151,8 @@ async def get_version_record(
     project_id: uuid.UUID,
     project_version_id: uuid.UUID,
     subject_key: str,
-) -> BailianVersionRecordResponse:
-    return await bailian_review_tools_service.get_version_record(
+) -> FrontendVersionRecordResponse:
+    return await review_query_service.get_version_record(
         session_factory,
         project_id=project_id,
         project_version_id=project_version_id,

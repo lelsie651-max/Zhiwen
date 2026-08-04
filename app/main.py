@@ -61,7 +61,8 @@ def create_app() -> FastAPI:
     app.include_router(app_router)
     app.include_router(projects_router)
     app.include_router(frontend_api_router)
-    app.include_router(bailian_tools_router)
+    if settings.bailian_integration_enabled:
+        app.include_router(bailian_tools_router)
 
     return app
 

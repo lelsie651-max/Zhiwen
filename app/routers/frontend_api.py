@@ -12,20 +12,18 @@ from app.dependencies.auth import require_current_user, verify_api_csrf_token
 from app.models.project_member import ProjectMember
 from app.models.user import User
 from app.repositories import project as project_repository
-from app.schemas.bailian_review_tools import (
-    BailianReviewItemDetailResponse,
-    BailianReviewItemsResponse,
-    BailianVersionRecordResponse,
-)
 from app.schemas.frontend_api import (
     FrontendCurrentUserResponse,
+    FrontendReviewItemDetailResponse,
+    FrontendReviewItemsResponse,
     FrontendReviewDecisionWriteRequest,
     FrontendReviewDecisionWriteResponse,
+    FrontendVersionRecordResponse,
 )
 from app.schemas.user import UserRead
-from app.services import bailian_review_tools as bailian_review_tools_service
 from app.services import consistency_review as consistency_review_service
 from app.services import frontend_api as frontend_api_service
+import app.services.review_query as review_query_service
 from app.utils.csrf import ensure_csrf_token
 
 
@@ -53,13 +51,13 @@ async def require_project_access(
     return ProjectAccessContext(current_user=current_user, membership=membership)
 
 
-def _map_bailian_review_tool_error(error: Exception) -> HTTPException:
+def _map_review_query_error(error: Exception) -> HTTPException:
     detail = str(error)
-    if isinstance(error, bailian_review_tools_service.BailianReviewToolStateError):
+    if isinstance(error, review_query_service.ReviewQueryStateError):
         return HTTPException(status_code=422, detail=detail)
-    if isinstance(error, bailian_review_tools_service.BailianReviewToolNotFoundError):
+    if isinstance(error, review_query_service.ReviewQueryNotFoundError):
         return HTTPException(status_code=404, detail=detail)
-    if isinstance(error, bailian_review_tools_service.BailianReviewToolInvariantError):
+    if isinstance(error, review_query_service.ReviewQueryInvariantError):
         return HTTPException(status_code=409, detail="frontend_api_source_invalid")
     raise TypeError("unsupported error type")
 
@@ -117,7 +115,7 @@ async def get_current_user(
 
 @router.get(
     "/projects/{project_id}/review-items",
-    response_model=BailianReviewItemsResponse,
+    response_model=FrontendReviewItemsResponse,
     operation_id="frontendListReviewItems",
 )
 async def list_review_items(
@@ -132,7 +130,7 @@ async def list_review_items(
     limit: int = Query(default=50, ge=1, le=100),
     _access: ProjectAccessContext = Depends(require_project_access),
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_async_session_factory),
-) -> BailianReviewItemsResponse:
+) -> FrontendReviewItemsResponse:
     try:
         return await frontend_api_service.list_review_items(
             session_factory,
@@ -144,13 +142,13 @@ async def list_review_items(
             state=state,
             limit=limit,
         )
-    except bailian_review_tools_service.BailianReviewToolError as exc:
-        raise _map_bailian_review_tool_error(exc) from None
+    except review_query_service.ReviewQueryError as exc:
+        raise _map_review_query_error(exc) from None
 
 
 @router.get(
     "/projects/{project_id}/review-items/{fact_id}",
-    response_model=BailianReviewItemDetailResponse,
+    response_model=FrontendReviewItemDetailResponse,
     operation_id="frontendGetReviewItemDetail",
 )
 async def get_review_item_detail(
@@ -162,7 +160,7 @@ async def get_review_item_detail(
     consistency_check_application_id: uuid.UUID,
     _access: ProjectAccessContext = Depends(require_project_access),
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_async_session_factory),
-) -> BailianReviewItemDetailResponse:
+) -> FrontendReviewItemDetailResponse:
     try:
         return await frontend_api_service.get_review_item_detail(
             session_factory,
@@ -173,8 +171,8 @@ async def get_review_item_detail(
             orchestration_id=orchestration_id,
             consistency_check_application_id=consistency_check_application_id,
         )
-    except bailian_review_tools_service.BailianReviewToolError as exc:
-        raise _map_bailian_review_tool_error(exc) from None
+    except review_query_service.ReviewQueryError as exc:
+        raise _map_review_query_error(exc) from None
 
 
 @router.post(
@@ -210,13 +208,13 @@ async def append_review_decision(
         raise _map_frontend_api_error(exc) from None
     except consistency_review_service.ConsistencyReviewError as exc:
         raise _map_consistency_review_error(exc) from None
-    except bailian_review_tools_service.BailianReviewToolError as exc:
-        raise _map_bailian_review_tool_error(exc) from None
+    except review_query_service.ReviewQueryError as exc:
+        raise _map_review_query_error(exc) from None
 
 
 @router.get(
     "/projects/{project_id}/versions/{project_version_id}/records/{subject_key:path}",
-    response_model=BailianVersionRecordResponse,
+    response_model=FrontendVersionRecordResponse,
     operation_id="frontendGetVersionRecord",
 )
 async def get_version_record(
@@ -225,7 +223,7 @@ async def get_version_record(
     subject_key: str,
     _access: ProjectAccessContext = Depends(require_project_access),
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_async_session_factory),
-) -> BailianVersionRecordResponse:
+) -> FrontendVersionRecordResponse:
     try:
         return await frontend_api_service.get_version_record(
             session_factory,
@@ -233,5 +231,5 @@ async def get_version_record(
             project_version_id=project_version_id,
             subject_key=subject_key,
         )
-    except bailian_review_tools_service.BailianReviewToolError as exc:
-        raise _map_bailian_review_tool_error(exc) from None
+    except review_query_service.ReviewQueryError as exc:
+        raise _map_review_query_error(exc) from None

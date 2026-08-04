@@ -5,7 +5,11 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.consistency_review import ConsistencyReviewDecisionKind
-from app.schemas.bailian_review_tools import BailianReviewItemDetailResponse
+from app.schemas.review_query import (
+    ReviewQueryItemDetailResult as FrontendReviewItemDetailResponse,
+    ReviewQueryItemsResult as FrontendReviewItemsResponse,
+    VersionRecordQueryResult as FrontendVersionRecordResponse,
+)
 from app.schemas.user import UserRead
 
 
@@ -37,6 +41,6 @@ class FrontendReviewDecisionWriteResponse(BaseModel):
     decision_manifest_hash: str = Field(min_length=64, max_length=64)
     selected_fact_value_ids: tuple[uuid.UUID, ...]
     created_new: bool
-    current_state: BailianReviewItemDetailResponse
+    current_state: FrontendReviewItemDetailResponse
 
     model_config = ConfigDict(extra="forbid", frozen=True)

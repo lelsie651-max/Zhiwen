@@ -6,30 +6,28 @@ import re
 from types import SimpleNamespace
 import uuid
 
-from pydantic import SecretStr, ValidationError
+from pydantic import ValidationError
 import pytest
 from starlette.testclient import TestClient
 
 from app.core.config import Settings
 from app.core.database import get_async_session_factory, get_db_session
-import app.dependencies.bailian_tools as bailian_tools_dependency
 from app.main import app, create_app
 from app.models.project import Project, ProjectStatus, ProjectVisibility
 from app.models.project_member import ProjectMember, ProjectMemberRole
 from app.models.user import User, UserStatus
 from app.repositories import project as project_repository
-from app.schemas.bailian_review_tools import (
-    BailianReviewItemDetailResponse,
-    BailianReviewItemsResponse,
-    BailianReviewItemSummary,
-    BailianVersionRecordResponse,
+from app.schemas.frontend_api import (
+    FrontendReviewDecisionWriteResponse,
+    FrontendReviewItemDetailResponse,
+    FrontendReviewItemsResponse,
+    FrontendVersionRecordResponse,
 )
-from app.schemas.frontend_api import FrontendReviewDecisionWriteResponse
-from app.services import bailian_review_tools as bailian_tools_service
 from app.services import consistency_review as consistency_review_service
 from app.services import frontend_api as frontend_api_service
 from app.services import identity as identity_service
 import app.main as main_module
+import app.services.review_query as review_query_service
 
 
 def extract_csrf_token(html: str) -> str:
@@ -43,7 +41,7 @@ def _uuid(seed: str) -> uuid.UUID:
 
 
 def _hash(seed: str) -> str:
-    return bailian_tools_service.duplicate_grouping_service.hash_deterministic_payload(
+    return review_query_service.duplicate_grouping_service.hash_deterministic_payload(
         {"seed": seed}
     )
 
@@ -92,8 +90,8 @@ def build_membership(project: Project, user: User) -> ProjectMember:
     return membership
 
 
-def _build_list_response() -> BailianReviewItemsResponse:
-    response = BailianReviewItemsResponse(
+def _build_list_response() -> FrontendReviewItemsResponse:
+    response = FrontendReviewItemsResponse(
         source_manifest_hash=_hash("review-manifest"),
         payload_hash="",
         project_id=_uuid("project"),
@@ -106,7 +104,7 @@ def _build_list_response() -> BailianReviewItemsResponse:
         limit=20,
         item_count=1,
         items=(
-            BailianReviewItemSummary(
+            review_query_service.ReviewQueryItemSummary(
                 fact_id=_uuid("fact"),
                 subject_kind="person",
                 subject_key="alpha",
@@ -133,12 +131,12 @@ def _build_list_response() -> BailianReviewItemsResponse:
         "state": response.state,
         "limit": response.limit,
     }
-    return bailian_tools_service.authenticate_bailian_review_items_response(
+    return review_query_service.authenticate_review_items_result(
         response.model_copy(
             update={
-                "payload_hash": bailian_tools_service._build_payload_hash(
+                "payload_hash": review_query_service._build_payload_hash(
                     response,
-                    tool_name="bailian_review_items",
+                    tool_name="review_items_query",
                     request_identity=request_identity,
                 )
             }
@@ -147,8 +145,8 @@ def _build_list_response() -> BailianReviewItemsResponse:
     )
 
 
-def _build_detail_response() -> BailianReviewItemDetailResponse:
-    return BailianReviewItemDetailResponse(
+def _build_detail_response() -> FrontendReviewItemDetailResponse:
+    return FrontendReviewItemDetailResponse(
         source_manifest_hash=_hash("review-manifest"),
         payload_hash=_hash("detail-payload"),
         project_id=_uuid("project"),
@@ -272,8 +270,8 @@ def _build_detail_response() -> BailianReviewItemDetailResponse:
     )
 
 
-def _build_record_response() -> BailianVersionRecordResponse:
-    response = BailianVersionRecordResponse(
+def _build_record_response() -> FrontendVersionRecordResponse:
+    response = FrontendVersionRecordResponse(
         source_manifest_hash=_hash("knowledge-manifest"),
         payload_hash="",
         project_id=_uuid("project"),
@@ -301,12 +299,12 @@ def _build_record_response() -> BailianVersionRecordResponse:
         "project_version_id": str(response.project_version_id),
         "subject_key": response.subject_key,
     }
-    return bailian_tools_service.authenticate_bailian_version_record_response(
+    return review_query_service.authenticate_version_record_response(
         response.model_copy(
             update={
-                "payload_hash": bailian_tools_service._build_payload_hash(
+                "payload_hash": review_query_service._build_payload_hash(
                     response,
-                    tool_name="bailian_version_record",
+                    tool_name="version_record_query",
                     request_identity=request_identity,
                 )
             }
@@ -704,7 +702,7 @@ def test_frontend_version_record_masks_invariant_error(monkeypatch: pytest.Monke
         return membership
 
     async def fake_record(*args, **kwargs):
-        raise bailian_tools_service.BailianReviewToolInvariantError(
+        raise review_query_service.ReviewQueryInvariantError(
             "sensitive-sentinel-should-not-leak"
         )
 
@@ -725,7 +723,7 @@ def test_frontend_version_record_masks_invariant_error(monkeypatch: pytest.Monke
     assert response.json() == {"detail": "frontend_api_source_invalid"}
 
 
-def test_openapi_operation_ids_are_unique_and_bailian_ids_unchanged() -> None:
+def test_openapi_operation_ids_are_unique_and_exclude_bailian_when_disabled() -> None:
     openapi = app.openapi()
     operation_ids: list[str] = []
     for path_item in openapi["paths"].values():
@@ -733,9 +731,7 @@ def test_openapi_operation_ids_are_unique_and_bailian_ids_unchanged() -> None:
             operation_ids.append(operation["operationId"])
 
     assert len(operation_ids) == len(set(operation_ids))
-    assert openapi["paths"]["/api/v1/integrations/bailian/projects/{project_id}/review-items"]["get"][
-        "operationId"
-    ] == "bailianListReviewItems"
+    assert "bailianListReviewItems" not in operation_ids
     assert openapi["paths"]["/api/v1/projects/{project_id}/review-items"]["get"][
         "operationId"
     ] == "frontendListReviewItems"
